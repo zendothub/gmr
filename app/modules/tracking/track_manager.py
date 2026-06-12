@@ -1,0 +1,193 @@
+"""Track manager - maintains active track state in memory."""
+
+import uuid
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
+
+from loguru import logger
+
+from app.utils.geometry import bbox_center, bbox_height, point_in_polygon, polygon_from_json
+from app.utils.time_utils import utc_now, seconds_since
+
+
+@dataclass
+class ActiveTrack:
+    """In-memory representation of an active track."""
+    local_track_id: int
+    track_session_id: Optional[uuid.UUID] = None
+    camera_id: Optional[uuid.UUID] = None
+    person_identity_id: Optional[uuid.UUID] = None
+    started_at: datetime = field(default_factory=utc_now)
+    last_seen_at: datetime = field(default_factory=utc_now)
+    bbox: Optional[dict] = None
+    prev_bbox: Optional[dict] = None
+    bbox_history: List[dict] = field(default_factory=list)
+    current_zones: Set[str] = field(default_factory=set)
+    zone_enter_times: Dict[str, datetime] = field(default_factory=dict)
+    dwell_seconds: Dict[str, float] = field(default_factory=dict)
+    total_frames: int = 0
+    confidence_sum: float = 0.0
+    stability_score: float = 0.0
+    last_reid_time: Optional[datetime] = None
+    reid_attempted: bool = False
+
+    @property
+    def track_age_seconds(self) -> float:
+        return seconds_since(self.started_at)
+
+    @property
+    def avg_confidence(self) -> float:
+        return self.confidence_sum / self.total_frames if self.total_frames > 0 else 0.0
+
+    def should_run_reid(self) -> bool:
+        """Check if ReID should be triggered for this track."""
+        if not self.bbox:
+            return False
+        # Track age > 1.5 seconds
+        if self.track_age_seconds < 1.5:
+            return False
+        # Bbox height > 120 pixels
+        if bbox_height(self.bbox) < 120:
+            return False
+        # Stability > 0.65
+        if self.stability_score < 0.65:
+            return False
+        # Last ReID > 3 seconds ago (or never)
+        if self.last_reid_time and seconds_since(self.last_reid_time) < 3.0:
+            return False
+        return True
+
+
+class TrackManager:
+    """Manages active tracks in memory for a single camera."""
+
+    def __init__(self, camera_id: uuid.UUID):
+        self.camera_id = camera_id
+        self.tracks: Dict[int, ActiveTrack] = {}  # local_track_id -> ActiveTrack
+        self._stale_threshold = 5.0  # seconds before removing stale tracks
+
+    def update_track(self, local_track_id: int, bbox: dict, confidence: float) -> ActiveTrack:
+        """Update or create a track with new detection data."""
+        now = utc_now()
+
+        if local_track_id in self.tracks:
+            track = self.tracks[local_track_id]
+            track.prev_bbox = track.bbox
+            track.bbox = bbox
+            track.last_seen_at = now
+            track.total_frames += 1
+            track.confidence_sum += confidence
+
+            # Keep limited bbox history
+            track.bbox_history.append(bbox)
+            if len(track.bbox_history) > 30:
+                track.bbox_history = track.bbox_history[-30:]
+
+            # Update stability score
+            track.stability_score = self._compute_stability(track)
+        else:
+            track = ActiveTrack(
+                local_track_id=local_track_id,
+                camera_id=self.camera_id,
+                started_at=now,
+                last_seen_at=now,
+                bbox=bbox,
+                total_frames=1,
+                confidence_sum=confidence,
+            )
+            track.bbox_history.append(bbox)
+            self.tracks[local_track_id] = track
+
+        return track
+
+    def update_zones(self, track: ActiveTrack, zones_data: List[dict]):
+        """
+        Update which zones a track is currently in.
+
+        Args:
+            track: The active track
+            zones_data: List of zone dicts with id, polygon, zone_type, etc.
+        """
+        now = utc_now()
+        if not track.bbox:
+            return
+
+        center = bbox_center(track.bbox)
+        current_zone_ids = set()
+
+        for zone in zones_data:
+            zone_id = str(zone["id"])
+            poly_points = polygon_from_json(zone.get("polygon"))
+
+            if poly_points and point_in_polygon(center, poly_points):
+                current_zone_ids.add(zone_id)
+
+                # Track zone entry time
+                if zone_id not in track.zone_enter_times:
+                    track.zone_enter_times[zone_id] = now
+
+                # Update dwell time
+                enter_time = track.zone_enter_times[zone_id]
+                track.dwell_seconds[zone_id] = seconds_since(enter_time)
+            else:
+                # Exited zone
+                if zone_id in track.zone_enter_times:
+                    del track.zone_enter_times[zone_id]
+
+        track.current_zones = current_zone_ids
+
+    def get_active_tracks(self) -> List[ActiveTrack]:
+        """Get all active tracks."""
+        return list(self.tracks.values())
+
+    def get_track(self, local_track_id: int) -> Optional[ActiveTrack]:
+        """Get a specific track."""
+        return self.tracks.get(local_track_id)
+
+    def cleanup_stale_tracks(self) -> List[ActiveTrack]:
+        """Remove tracks that haven't been seen recently. Returns removed tracks."""
+        stale = []
+        to_remove = []
+
+        for tid, track in self.tracks.items():
+            if seconds_since(track.last_seen_at) > self._stale_threshold:
+                stale.append(track)
+                to_remove.append(tid)
+
+        for tid in to_remove:
+            del self.tracks[tid]
+
+        if stale:
+            logger.debug(f"Cleaned up {len(stale)} stale tracks for camera {self.camera_id}")
+
+        return stale
+
+    def _compute_stability(self, track: ActiveTrack) -> float:
+        """Compute track stability based on bbox consistency."""
+        if len(track.bbox_history) < 3:
+            return 0.0
+
+        # Compute variance of bbox centers
+        centers = [bbox_center(b) for b in track.bbox_history[-10:]]
+        if len(centers) < 2:
+            return 0.0
+
+        x_coords = [c[0] for c in centers]
+        y_coords = [c[1] for c in centers]
+
+        x_var = max(x_coords) - min(x_coords)
+        y_var = max(y_coords) - min(y_coords)
+
+        # Lower variance = higher stability (normalized 0-1)
+        max_var = 200.0  # pixels
+        stability = max(0.0, 1.0 - ((x_var + y_var) / (2 * max_var)))
+
+        # Factor in track age
+        age_factor = min(1.0, track.track_age_seconds / 3.0)
+
+        return stability * 0.7 + age_factor * 0.3
+
+    def reset(self):
+        """Clear all tracks."""
+        self.tracks.clear()

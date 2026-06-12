@@ -1,0 +1,52 @@
+# Production compose for EC2 (api.gmr.zendot.in)
+# Usage:
+#   cp deployment/.env.production .env   # then edit secrets
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Nginx on the host terminates TLS and proxies to 127.0.0.1:8000.
+# Postgres is NOT exposed to the internet (internal docker network only).
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: retail_ai_postgres
+    environment:
+      POSTGRES_USER: retail_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_DB_PASSWORD}
+      POSTGRES_DB: retail_ai_db
+    expose:
+      - "5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retail_user -d retail_ai_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: retail_ai_app
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"   # local only; nginx proxies the public domain
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  pgdata:

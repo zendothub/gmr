@@ -1,0 +1,116 @@
+# ============================
+# Environment / Secrets
+# ============================
+.env
+.env.local
+.env.*.local
+deployment/.env.production
+
+# ============================
+# Python
+# ============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.so
+.eggs/
+*.manifest
+*.spec
+
+# ============================
+# Virtual Environment
+# ============================
+.venv/
+venv/
+env/
+.venv
+
+# ============================
+# IDE / Editor
+# ============================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ============================
+# OS generated files
+# ============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ============================
+# Docker
+# ============================
+.docker/
+*.pid
+
+# ============================
+# Logs
+# ============================
+*.log
+logs/
+
+# ============================
+# Storage (runtime generated)
+# ============================
+storage/clips/
+storage/crops/
+storage/snapshots/
+storage/reports/
+
+# Keep storage/.gitkeep tracked but ignore everything else
+!storage/.gitkeep
+
+# ============================
+# Models (large binary files)
+# ============================
+models/*
+!models/.gitkeep
+
+# ============================
+# Testing / Coverage
+# ============================
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# ============================
+# Jupyter Notebooks
+# ============================
+.ipynb_checkpoints/
+*.ipynb
+
+# ============================
+# Alembic
+# ============================
+alembic/versions/*.pyc
+
+# ============================
+# Certificates / Keys
+# ============================
+*.pem
+*.key
+*.crt
+*.cer

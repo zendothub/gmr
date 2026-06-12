@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: retail_ai_postgres
+    environment:
+      POSTGRES_USER: retail_user
+      POSTGRES_PASSWORD: retail_pass
+      POSTGRES_DB: retail_ai_db
+    ports:
+      - "5433:5432"  # host 5433 -> container 5432 (avoids clashing with a local PostgreSQL)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retail_user -d retail_ai_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: retail_ai_app
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: postgresql+asyncpg://retail_user:retail_pass@postgres:5432/retail_ai_db
+      DATABASE_SYNC_URL: postgresql://retail_user:retail_pass@postgres:5432/retail_ai_db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

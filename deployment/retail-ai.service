@@ -1,0 +1,23 @@
+# systemd unit for on-prem bare-metal deployment (alternative to docker-compose).
+# Copy to /etc/systemd/system/retail-ai.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now retail-ai
+
+[Unit]
+Description=Retail AI Platform (FastAPI)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=retailai
+Group=retailai
+WorkingDirectory=/opt/retail-ai-platform
+EnvironmentFile=/opt/retail-ai-platform/.env
+ExecStartPre=/opt/retail-ai-platform/.venv/bin/alembic upgrade head
+ExecStart=/opt/retail-ai-platform/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
