@@ -17,6 +17,21 @@ services:
       timeout: 5s
       retries: 5
 
+  # MediaMTX media server: ingests RTSP (pushed by the app via ffmpeg) and
+  # serves it back to browsers as WebRTC (WHEP) / HLS for the zone-binding UI.
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: retail_ai_mediamtx
+    environment:
+      MTX_PROTOCOLS: tcp
+      MTX_WEBRTCADDITIONALHOSTS: 127.0.0.1
+    ports:
+      - "8554:8554"   # RTSP (ingest + playback)
+      - "8889:8889"   # WebRTC / WHEP
+      - "8888:8888"   # HLS
+      - "9997:9997"   # API
+    restart: unless-stopped
+
   app:
     build:
       context: .
@@ -27,6 +42,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://retail_user:retail_pass@postgres:5432/retail_ai_db
       DATABASE_SYNC_URL: postgresql://retail_user:retail_pass@postgres:5432/retail_ai_db
+      # Backend talks to MediaMTX by its compose service name.
+      MEDIAMTX_HOST: mediamtx
+      # Browser reaches WebRTC/HLS via the host - override per deployment.
+      MEDIAMTX_PUBLIC_URL: ""
     ports:
       - "8000:8000"
     volumes:
@@ -35,7 +54,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      mediamtx:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   pgdata:
+

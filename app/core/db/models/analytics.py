@@ -14,10 +14,9 @@ from app.core.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 class DailyAnalyticsSummary(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "daily_analytics_summary"
 
-    store_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False, index=True
-    )
-    summary_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    # Single-pharmacy deployment: analytics are aggregated globally (one row per day).
+    summary_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+
     total_footfall: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unique_visitors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     returning_visitors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -30,4 +29,3 @@ class DailyAnalyticsSummary(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     hourly_footfall: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
-    store: Mapped["Store"] = relationship("Store")

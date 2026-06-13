@@ -1,4 +1,4 @@
-"""Zone service - CRUD for zones inside camera views."""
+"""Zone service - CRUD for zones bound to a camera (camera -> many zones)."""
 
 from typing import List
 from uuid import UUID
@@ -8,39 +8,51 @@ from sqlalchemy import select
 from fastapi import HTTPException
 from loguru import logger
 
-from app.core.db.models.camera import Zone
+from app.core.db.models.camera import Zone, Camera
 from app.modules.zones.schemas import ZoneCreate, ZoneUpdate
 
 
 class ZoneService:
 
     @staticmethod
-    async def create_zone(db: AsyncSession, view_id: UUID, data: ZoneCreate) -> Zone:
-        """Create a zone inside a camera view."""
+    async def _ensure_camera(db: AsyncSession, camera_id: UUID) -> Camera:
+        result = await db.execute(select(Camera).where(Camera.id == camera_id))
+        camera = result.scalar_one_or_none()
+        if not camera:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        return camera
+
+    @staticmethod
+    async def create_zone(db: AsyncSession, camera_id: UUID, data: ZoneCreate) -> Zone:
+        """Create a new zone bound to a camera after selecting polygon on its stream."""
+        await ZoneService._ensure_camera(db, camera_id)
         zone = Zone(
-            camera_view_id=view_id,
+            camera_id=camera_id,
             name=data.name,
             zone_type=data.zone_type,
             shape=data.shape,
             polygon=data.polygon,
-            line_config=data.line_config,
-            color=data.color,
             is_active=data.is_active,
         )
+
         db.add(zone)
         await db.flush()
         await db.refresh(zone)
-        logger.info(f"Zone created: {zone.name} (type={zone.zone_type}) in view {view_id}")
+        logger.info(f"Zone created: {zone.name} (type={zone.zone_type}) on camera {camera_id}")
         return zone
 
     @staticmethod
-    async def get_zones_for_view(db: AsyncSession, view_id: UUID) -> List[Zone]:
-        """Get all zones for a camera view."""
+    async def get_zones_for_camera(db: AsyncSession, camera_id: UUID) -> List[Zone]:
+        """Get all zones bound to a camera."""
         result = await db.execute(
-            select(Zone)
-            .where(Zone.camera_view_id == view_id)
-            .order_by(Zone.created_at)
+            select(Zone).where(Zone.camera_id == camera_id).order_by(Zone.created_at)
         )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_all_zones(db: AsyncSession) -> List[Zone]:
+        """Get all zones across all cameras."""
+        result = await db.execute(select(Zone).order_by(Zone.created_at))
         return list(result.scalars().all())
 
     @staticmethod
@@ -56,11 +68,8 @@ class ZoneService:
     async def update_zone(db: AsyncSession, zone_id: UUID, data: ZoneUpdate) -> Zone:
         """Update a zone."""
         zone = await ZoneService.get_zone(db, zone_id)
-        update_data = data.model_dump(exclude_unset=True)
-
-        for key, value in update_data.items():
+        for key, value in data.model_dump(exclude_unset=True).items():
             setattr(zone, key, value)
-
         await db.flush()
         await db.refresh(zone)
         logger.info(f"Zone updated: {zone.name} (id={zone_id})")

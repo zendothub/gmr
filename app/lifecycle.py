@@ -66,4 +66,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error shutting down inference executor: {e}")
 
+    # Stop all live stream publishers (ffmpeg -> MediaMTX)
+    try:
+        from app.modules.streaming.manager import StreamManager
+        StreamManager.get_instance().shutdown()
+    except Exception as e:
+        logger.warning(f"Error shutting down stream publishers: {e}")
+
     logger.info("Application shutdown complete")
+

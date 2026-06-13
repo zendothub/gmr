@@ -19,8 +19,11 @@ from app.lifecycle import lifespan
 from app.modules.auth.router import router as auth_router
 from app.modules.users.router import router as users_router
 from app.modules.cameras.router import router as cameras_router
-from app.modules.camera_views.router import router as camera_views_router
+from app.modules.areas.router import router as areas_router
+
 from app.modules.zones.router import router as zones_router
+from app.modules.streaming.router import router as streaming_router
+
 from app.modules.rules.router import router as rules_router
 from app.modules.ai_runtime.router import router as runtime_router
 from app.modules.events.router import router as events_router
@@ -44,8 +47,9 @@ app = FastAPI(
     version=settings.APP_VERSION,
     description=(
         "On-prem AI CCTV retail analytics platform for pharmacies. "
-        "Cameras, ROI views, zones, rules, AI runtime (YOLO + ByteTrack + OSNet ReID "
+        "Cameras, zones, rules, AI runtime (YOLO + ByteTrack + OSNet ReID "
         "with pgvector), events, billing interactions and analytics."
+
     ),
     lifespan=lifespan,
     docs_url="/docs",
@@ -83,9 +87,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(cameras_router)
-app.include_router(camera_views_router)
+app.include_router(areas_router)
+
 app.include_router(zones_router)
+app.include_router(streaming_router)
 app.include_router(rules_router)
+
 app.include_router(runtime_router)
 app.include_router(events_router)
 app.include_router(billing_router)

@@ -23,20 +23,14 @@ class UserService:
         if result.scalar_one_or_none():
             raise HTTPException(status.HTTP_409_CONFLICT, "Username already exists")
 
-        if data.email:
-            result = await db.execute(select(User).where(User.email == data.email))
-            if result.scalar_one_or_none():
-                raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
-
         user = User(
             username=data.username,
             hashed_password=hash_password(data.password),
-            email=data.email,
             full_name=data.full_name,
-            is_active=True,
             is_superuser=data.is_superuser,
-            store_id=data.store_id,
         )
+
+
 
         # Attach roles if provided
         if data.role_names:

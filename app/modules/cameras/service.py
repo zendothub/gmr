@@ -13,11 +13,35 @@ from app.core.db.models.camera import Camera, CameraStatus
 from app.modules.cameras.schemas import (
     CameraCreate, CameraUpdate, CameraResponse, RTSPTestResponse, CameraHealthResponse
 )
+from app.modules.streaming.mediamtx import MediaMTXManager, camera_path
+from app.modules.streaming.manager import StreamManager
+import anyio
 
 
 class CameraService:
 
     @staticmethod
+    def build_response(camera: Camera, public_host: Optional[str] = None) -> CameraResponse:
+        """Serialize a camera + attach its MediaMTX feed URLs (WebRTC/HLS).
+
+        Feed URLs are derived from the camera's stream_path so the frontend can
+        play the MediaMTX-published stream without an extra round-trip.
+
+        ``public_host`` is the host the API request arrived on (e.g. the LAN IP
+        ``192.168.1.158``); the WebRTC/HLS feed is built on that same host so it
+        works for remote browsers instead of resolving to ``localhost``.
+        """
+        resp = CameraResponse.model_validate(camera)
+        endpoints = MediaMTXManager().endpoints(camera.id, public_host=public_host)
+        resp.stream_path = camera.stream_path or endpoints.path
+        resp.webrtc_url = endpoints.webrtc_url
+        resp.hls_url = endpoints.hls_url
+        return resp
+
+
+    @staticmethod
+
+
     def test_rtsp_stream(rtsp_url: str, timeout: int = 10) -> RTSPTestResponse:
         """
         Test RTSP stream connectivity using OpenCV.
@@ -66,44 +90,45 @@ class CameraService:
 
     @staticmethod
     async def create_camera(db: AsyncSession, data: CameraCreate) -> Camera:
-        """Create a new camera after RTSP validation."""
-        # Test RTSP first
-        test_result = CameraService.test_rtsp_stream(data.rtsp_url)
-        if not test_result.success:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"RTSP stream test failed: {test_result.message}",
-            )
+        """Create a new camera (name + rtsp_url + area). RTSP probe is optional."""
+        resolution = None
+        if not data.skip_rtsp_test:
+            test_result = CameraService.test_rtsp_stream(data.rtsp_url)
+            if not test_result.success:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"RTSP stream test failed: {test_result.message}",
+                )
+            resolution = test_result.resolution
 
+        # Only name + rtsp_url + area are provided on the add form. Every other AI-config
+        # field falls back to the model default and runs internally.
         camera = Camera(
             name=data.name,
             rtsp_url=data.rtsp_url,
-            store_id=data.store_id,
-            role=data.role,
-            fps_target=data.fps_target,
-            resolution=test_result.resolution or data.resolution,
-            detection_model=data.detection_model,
-            reid_enabled=data.reid_enabled,
-            demographic_enabled=data.demographic_enabled,
-            location_description=data.location_description,
+            area_id=data.area_id,
+            resolution=resolution,
             status=CameraStatus.INACTIVE,
             is_active=True,
         )
+
         db.add(camera)
         await db.flush()
+        # Persist the deterministic MediaMTX feed path now that we have the id.
+        camera.stream_path = camera_path(camera.id)
+        await db.flush()
         await db.refresh(camera)
+
         logger.info(f"Camera created: {camera.name} (id={camera.id})")
         return camera
 
     @staticmethod
-    async def get_cameras(db: AsyncSession, store_id: Optional[UUID] = None) -> List[Camera]:
-        """List all cameras, optionally filtered by store."""
-        query = select(Camera)
-        if store_id:
-            query = query.where(Camera.store_id == store_id)
-        query = query.order_by(Camera.created_at.desc())
+    async def get_cameras(db: AsyncSession) -> List[Camera]:
+        """List all cameras."""
+        query = select(Camera).order_by(Camera.created_at.desc())
         result = await db.execute(query)
         return list(result.scalars().all())
+
 
     @staticmethod
     async def get_camera(db: AsyncSession, camera_id: UUID) -> Camera:
@@ -162,6 +187,17 @@ class CameraService:
         except Exception as e:
             logger.warning(f"Could not start camera worker: {e}")
 
+        # Start MediaMTX stream publisher so WHEP/HLS endpoints resolve.
+        # The ffmpeg subprocess is spawned off the event loop since it is blocking.
+        try:
+            manager = StreamManager.get_instance()
+            await anyio.to_thread.run_sync(
+                manager.add_viewer, camera.id, camera.rtsp_url
+            )
+            logger.info(f"Stream publisher started for camera {camera_id}")
+        except Exception as e:
+            logger.warning(f"Could not start stream publisher: {e}")
+
         logger.info(f"Camera started: {camera.name}")
         return camera
 
@@ -181,6 +217,14 @@ class CameraService:
                 await supervisor.stop_camera(camera_id)
         except Exception as e:
             logger.warning(f"Could not stop camera worker: {e}")
+
+        # Stop MediaMTX stream publisher (force-stop so the WHEP path is released).
+        try:
+            manager = StreamManager.get_instance()
+            manager.stop_stream(camera_id)
+            logger.info(f"Stream publisher stopped for camera {camera_id}")
+        except Exception as e:
+            logger.warning(f"Could not stop stream publisher: {e}")
 
         logger.info(f"Camera stopped: {camera.name}")
         return camera

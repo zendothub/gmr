@@ -26,7 +26,7 @@ torchreid==0.2.5
 numpy>=1.24.0
 opencv-python-headless==4.10.0.84
 scipy>=1.11.0
-lap==0.4.0
+lap>=0.5.0
 
 # Background Jobs
 apscheduler==3.10.4

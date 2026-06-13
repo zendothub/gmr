@@ -1,8 +1,9 @@
 """Camera worker - per-camera AI processing pipeline.
 
 Pipeline per sampled frame:
-  RTSP (latest-frame buffer) -> YOLO detection -> camera-view filter
+  RTSP (latest-frame buffer) -> YOLO detection (full frame; cameras are static)
   -> ByteTrack tracking -> track state update -> zone update
+
   -> ReID (when stable) -> rule evaluation -> event persistence.
 
 Frames are sampled at the camera's fps_target, NOT at the native stream FPS.
@@ -35,8 +36,8 @@ from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
-from app.modules.rule_engine.camera_view_engine import CameraViewEngine
 from app.utils.image_utils import extract_crop, save_image
+
 from app.utils.time_utils import utc_now
 
 # How often to sample a track_observation row per track
@@ -63,13 +64,14 @@ class CameraWorker:
         )
         self.tracker = ByteTrackAdapter()
         self.track_manager = TrackManager(self.camera_id)
-        self.view_engine = CameraViewEngine()
         self.rule_evaluator = RuleEvaluator()
+
         self.reid_extractor = get_shared_extractor(self.settings.OSNET_MODEL_PATH) if self.reid_enabled else None
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
 
-        # Runtime config (views/zones/rules)
+        # Runtime config (zones/rules). Cameras are static -> no ROI/views.
         self.zones: List[dict] = []
+
         self.apply_runtime_config(runtime_config)
 
         # Observation sampling state: local_track_id -> last sample monotonic time
@@ -121,8 +123,8 @@ class CameraWorker:
     def apply_runtime_config(self, runtime_config: dict):
         """Apply (or re-apply) runtime configuration loaded from PostgreSQL."""
         self.zones = runtime_config.get("zones", [])
-        self.view_engine.load_views(runtime_config.get("views", []))
         self.rule_evaluator.cache.load(
+
             runtime_config.get("rules", []),
             runtime_config.get("zones_by_id", {}),
         )
@@ -191,14 +193,12 @@ class CameraWorker:
         """Run the full pipeline on a single frame."""
         frame_shape = frame.shape
 
-        # 1) Detection on the shared capped inference pool
+        # 1) Detection on the shared capped inference pool (full frame -
+        #    cameras are static, so there is no ROI/view to pre-filter against).
         detections = await run_inference(self.detector.detect, frame)
 
-        # 2) Camera-view (ROI) filter: only accept detections whose center
-        #    point is inside an active camera view (ignore_area excluded).
-        detections = [d for d in detections if self.view_engine.is_detection_in_view(self._det_bbox(d))]
+        # 2) Tracking (cheap; run inline)
 
-        # 3) Tracking (cheap; run inline)
         track_outputs = self.tracker.update(detections, frame_shape)
 
         # 4) Update in-memory track state and zones; collect pending DB work

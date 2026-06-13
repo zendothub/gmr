@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender-dev \
     libpq-dev \
     gcc \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
