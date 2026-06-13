@@ -23,13 +23,19 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: retail_ai_mediamtx
     environment:
-      MTX_PROTOCOLS: tcp
-      MTX_WEBRTCADDITIONALHOSTS: 127.0.0.1
+      MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
+      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.123,127.0.0.1
+      MTX_RTSPTIMEOUT: 1h                    # Keep path alive 1 hour with zero readers (Go duration format)
+      MTX_READTIMEOUT: 24h                   # TCP read timeout: 24h (Go duration format, must include unit)
+      MTX_RUNONREADY: ""
+      MTX_RUNONREADYRESTART: "yes"
+      MTX_RUNONDEMAND: ""
     ports:
-      - "8554:8554"   # RTSP (ingest + playback)
-      - "8889:8889"   # WebRTC / WHEP
-      - "8888:8888"   # HLS
-      - "9997:9997"   # API
+      - "8554:8554"      # RTSP (ingest + playback)
+      - "8889:8889"      # WebRTC / WHEP (TCP signaling)
+      - "8189:8189/udp"  # WebRTC / ICE (UDP media transport)
+      - "8888:8888"      # HLS
+      - "9997:9997"      # API
     restart: unless-stopped
 
   app:
@@ -60,4 +66,3 @@ services:
 
 volumes:
   pgdata:
-

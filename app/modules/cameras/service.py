@@ -92,6 +92,7 @@ class CameraService:
     async def create_camera(db: AsyncSession, data: CameraCreate) -> Camera:
         """Create a new camera (name + rtsp_url + area). RTSP probe is optional."""
         resolution = None
+        test_result = None
         if not data.skip_rtsp_test:
             test_result = CameraService.test_rtsp_stream(data.rtsp_url)
             if not test_result.success:
@@ -101,25 +102,20 @@ class CameraService:
                 )
             resolution = test_result.resolution
 
-        # Only name + rtsp_url + area are provided on the add form. Every other AI-config
-        # field falls back to the model default and runs internally.
-        camera = Camera(
-            name=data.name,
-            rtsp_url=data.rtsp_url,
-            store_id=data.store_id,
-            role=data.role,
-            fps_target=data.fps_target,
-            resolution=test_result.resolution or data.resolution,
-            detection_model=data.detection_model,
-            reid_enabled=data.reid_enabled,
-            demographic_enabled=data.demographic_enabled,
-            frame_rotation=data.frame_rotation,
-            location_description=data.location_description,
-            area_id=data.area_id,
-            resolution=resolution,
-            status=CameraStatus.INACTIVE,
-            is_active=True,
-        )
+        # Only name + rtsp_url + area are sent by the frontend.
+        # All AI-config fields (fps_target, detection_model, reid_enabled, ...)
+        # use the model's column defaults — never exposed to the client.
+        camera_kwargs: dict = {
+            "name": data.name,
+            "rtsp_url": data.rtsp_url,
+            "area_id": data.area_id,
+            "status": CameraStatus.INACTIVE,
+            "is_active": True,
+        }
+        # Auto-detected resolution from RTSP probe (overrides model default).
+        if resolution:
+            camera_kwargs["resolution"] = resolution
+        camera = Camera(**camera_kwargs)
 
         db.add(camera)
         await db.flush()
@@ -129,6 +125,20 @@ class CameraService:
         await db.refresh(camera)
 
         logger.info(f"Camera created: {camera.name} (id={camera.id})")
+
+        # Auto-start the stream publisher (ffmpeg → MediaMTX) so the WebRTC URL
+        # returned in the response works immediately — the frontend can play the
+        # live feed right after "Add Camera" without an extra start call.
+        try:
+            manager = StreamManager.get_instance()
+            import anyio
+            await anyio.to_thread.run_sync(
+                manager.add_viewer, camera.id, camera.rtsp_url
+            )
+            logger.info(f"Stream publisher auto-started for new camera {camera.id}")
+        except Exception as e:
+            logger.warning(f"Could not auto-start stream publisher for new camera: {e}")
+
         return camera
 
     @staticmethod

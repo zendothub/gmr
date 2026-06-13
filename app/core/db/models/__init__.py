@@ -7,7 +7,6 @@ from app.core.db.models.area import Area
 from app.core.db.models.camera import (
     Camera,
     Zone,
-    CameraRole,
     CameraStatus,
     ZoneType,
     ZoneShape,
@@ -29,7 +28,6 @@ __all__ = [
 
     "Camera",
     "Zone",
-    "CameraRole",
     "CameraStatus",
     "ZoneType",
 

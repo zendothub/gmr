@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     MEDIAMTX_PUBLIC_URL: str = ""
     # Transcode preset for the republish step. "copy" = no re-encode (cheapest,
     # requires H.264). Use "lowlatency" to re-encode for browser-friendly output.
-    STREAM_PUBLISH_MODE: str = "copy"  # copy | lowlatency
+    STREAM_PUBLISH_MODE: str = "lowlatency"  # copy | lowlatency
     # Auto-stop a published stream after this many seconds with no viewers.
     STREAM_IDLE_TIMEOUT_SECONDS: int = 120
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.

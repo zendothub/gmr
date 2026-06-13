@@ -9,7 +9,7 @@ Zone-binding flow (per camera):
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
@@ -22,12 +22,18 @@ router = APIRouter(prefix="/api/cameras", tags=["Streaming"])
 
 @router.post("/{camera_id}/stream/start", response_model=StreamEndpointsResponse)
 async def start_stream(
+    request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Start the live WebRTC/HLS preview (republishes RTSP via MediaMTX)."""
-    return await StreamingService.start_stream(db, camera_id)
+    """Start the live WebRTC/HLS preview (republishes RTSP via MediaMTX).
+    
+    Returns URLs built against the requesting host so the frontend on another
+    LAN laptop gets the correct IP (e.g. ``http://10.251.39.75:8889/...``)
+    instead of ``localhost``.
+    """
+    return await StreamingService.start_stream(db, camera_id, public_host=request.url.hostname)
 
 
 @router.post("/{camera_id}/stream/stop")
@@ -43,12 +49,16 @@ async def stop_stream(
 
 @router.get("/{camera_id}/stream/status", response_model=StreamStatusResponse)
 async def stream_status(
+    request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get publish status and playback URLs for a camera's preview."""
-    return await StreamingService.get_status(db, camera_id)
+    """Get publish status and playback URLs for a camera's preview.
+    
+    URLs are built against the requesting host so LAN clients see the correct IP.
+    """
+    return await StreamingService.get_status(db, camera_id, public_host=request.url.hostname)
 
 
 @router.get(

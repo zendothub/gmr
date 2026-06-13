@@ -67,7 +67,9 @@ class StreamManager:
 
     # -- public API --------------------------------------------------------
 
-    def start_stream(self, camera_id: uuid.UUID, rtsp_url: str) -> StreamEndpoints:
+    def start_stream(
+        self, camera_id: uuid.UUID, rtsp_url: str, public_host: str | None = None,
+    ) -> StreamEndpoints:
         """Ensure a publisher is running for this camera; returns playback URLs."""
         key = str(camera_id)
         with self._lock:
@@ -77,7 +79,7 @@ class StreamManager:
                 publisher.start()
                 handle = _StreamHandle(
                     publisher=publisher,
-                    endpoints=self.mtx.endpoints(camera_id),
+                    endpoints=self.mtx.endpoints(camera_id, public_host=public_host),
                 )
                 self._streams[key] = handle
                 logger.info(f"Stream started for camera {key}")
@@ -86,9 +88,19 @@ class StreamManager:
             handle.last_active_at = time.time()
             return handle.endpoints
 
-    def add_viewer(self, camera_id: uuid.UUID, rtsp_url: str) -> StreamEndpoints:
-        """Register a viewer (starts the stream if needed)."""
-        endpoints = self.start_stream(camera_id, rtsp_url)
+    def add_viewer(
+        self,
+        camera_id: uuid.UUID,
+        rtsp_url: str,
+        _unused: object = None,
+        public_host: str | None = None,
+    ) -> StreamEndpoints:
+        """Register a viewer (starts the stream if needed).
+        
+        ``public_host`` is the LAN IP/hostname the browser used to reach the API.
+        When set, WebRTC/HLS URLs are built against that host instead of localhost.
+        """
+        endpoints = self.start_stream(camera_id, rtsp_url, public_host=public_host)
         with self._lock:
             handle = self._streams.get(str(camera_id))
             if handle:
@@ -115,11 +127,16 @@ class StreamManager:
             return True
         return False
 
-    def get_status(self, camera_id: uuid.UUID) -> Optional[dict]:
+    def get_status(
+        self, camera_id: uuid.UUID, public_host: str | None = None,
+    ) -> Optional[dict]:
         with self._lock:
             handle = self._streams.get(str(camera_id))
             if not handle:
                 return None
+            # Rebuild endpoints with the caller's host so LAN clients get the
+            # correct IP even if the stream was started by a different request.
+            endpoints = self.mtx.endpoints(camera_id, public_host=public_host)
             return {
                 "camera_id": str(camera_id),
                 "is_publishing": handle.publisher.is_alive(),
@@ -127,9 +144,9 @@ class StreamManager:
                 "uptime_seconds": round(time.time() - handle.started_at, 1),
                 "last_error": handle.publisher.last_error,
                 "endpoints": {
-                    "webrtc_url": handle.endpoints.webrtc_url,
-                    "hls_url": handle.endpoints.hls_url,
-                    "rtsp_url": handle.endpoints.rtsp_url,
+                    "webrtc_url": endpoints.webrtc_url,
+                    "hls_url": endpoints.hls_url,
+                    "rtsp_url": endpoints.rtsp_url,
                 },
             }
 

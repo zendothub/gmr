@@ -2,6 +2,10 @@
 
 Cameras are statically mounted (no PTZ / moving), so there is no per-camera
 ROI/"view" concept - detection runs on the full frame and is filtered by zones.
+
+A camera has NO role/type of its own - the role belongs at the *zone* level
+because one camera can cover multiple areas (entry + billing + exit can all be
+visible in the same frame, each drawn as a separate zone with its own ZoneType).
 """
 
 
@@ -15,14 +19,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
 
 from app.core.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-
-
-class CameraRole(str, enum.Enum):
-    ENTRY_GATE = "entry_gate"
-    BILLING_COUNTER = "billing_counter"
-    QUEUE = "queue"
-    PRODUCT_SHELF = "product_shelf"
-    GENERAL = "general"
 
 
 class CameraStatus(str, enum.Enum):
@@ -61,13 +57,6 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # (WebRTC/HLS) from this path. Stable & deterministic per camera id.
     stream_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    role: Mapped[str] = mapped_column(
-
-
-        SAEnum(CameraRole, name="camera_role_enum", create_constraint=True),
-        nullable=False,
-        default=CameraRole.GENERAL,
-    )
     status: Mapped[str] = mapped_column(
         SAEnum(CameraStatus, name="camera_status_enum", create_constraint=True),
         nullable=False,

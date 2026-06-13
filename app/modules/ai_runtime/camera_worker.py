@@ -28,7 +28,6 @@ from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
-from app.modules.rule_engine.camera_view_engine import CameraViewEngine
 from app.utils.image_utils import extract_crop, save_image
 
 from app.utils.time_utils import utc_now
@@ -71,6 +70,9 @@ class CameraWorker:
         self.zones: List[dict] = []
 
         self.apply_runtime_config(runtime_config)
+
+        # view_engine placeholder — cameras are static, no ROI filtering needed.
+        self.view_engine = None
 
         # Observation sampling state: local_track_id -> last sample monotonic time
         self._last_obs_time: Dict[int, float] = {}
@@ -231,14 +233,8 @@ class CameraWorker:
         # 1) Unified YOLO Detection & Tracking on the shared inference pool
         tracked_detections = await run_inference(self.detector.track, frame)
 
-        # 2) Camera-view (ROI) filter: only accept tracks whose center
-        #    point is inside an active camera view (ignore_area excluded).
-        tracked_detections = [
-            td for td in tracked_detections 
-            if self.view_engine.is_detection_in_view(self._det_bbox(td))
-        ]
-
-        # 3) Update in-memory track state and zones; collect pending DB work
+        # 2) Update in-memory track state and zones; collect pending DB work
+        #    (Cameras are static — no ROI filtering needed; detection runs on full frame)
         now_mono = time.monotonic()
         active_tracks: List[ActiveTrack] = []
         new_tracks: List[ActiveTrack] = []
