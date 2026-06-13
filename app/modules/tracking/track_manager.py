@@ -125,7 +125,8 @@ class TrackManager:
         if not track.bbox:
             return
 
-        center = bbox_center(track.bbox)
+        from app.utils.geometry import bbox_bottom_center
+        center = bbox_bottom_center(track.bbox)
         current_zone_ids = set()
 
         for zone in zones_data:
