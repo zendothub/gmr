@@ -29,6 +29,8 @@ class WorkerSupervisor:
         self.settings = get_settings()
         self.workers: Dict[str, CameraWorker] = {}  # camera_id (str) -> worker
         self._lock = asyncio.Lock()
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._crash_retries: Dict[str, int] = {}  # camera_id (str) -> retry_count
 
     @classmethod
     def get_instance(cls) -> "WorkerSupervisor":
@@ -64,6 +66,14 @@ class WorkerSupervisor:
             worker = CameraWorker(camera_config, runtime_config)
             await worker.start()
             self.workers[key] = worker
+            
+            # Reset crash retry count when started explicitly via API
+            self._crash_retries[key] = 0
+            
+            # Start background monitoring task if not already running
+            if self._monitor_task is None or self._monitor_task.done():
+                self._monitor_task = asyncio.create_task(self._monitor_workers_loop())
+                
             logger.info(f"Worker supervisor: camera {camera_id} started")
             return worker.get_status()
 
@@ -72,6 +82,7 @@ class WorkerSupervisor:
         async with self._lock:
             key = str(camera_id)
             worker = self.workers.pop(key, None)
+            self._crash_retries.pop(key, None)
 
         if not worker:
             logger.info(f"No running worker for camera {camera_id}")
@@ -104,6 +115,10 @@ class WorkerSupervisor:
         async with self._lock:
             workers = list(self.workers.values())
             self.workers.clear()
+            self._crash_retries.clear()
+            if self._monitor_task:
+                self._monitor_task.cancel()
+                self._monitor_task = None
 
         for worker in workers:
             try:
@@ -133,6 +148,84 @@ class WorkerSupervisor:
 
         logger.info(f"Runtime config reloaded for {len(reloaded)} workers")
         return {"reloaded": reloaded, "failed": failed}
+
+    # ------------------------------------------------------------------
+    # Monitoring & Crash Recovery
+    # ------------------------------------------------------------------
+
+    async def _monitor_workers_loop(self):
+        """Periodically check if workers crashed and restart them if needed."""
+        while True:
+            try:
+                await asyncio.sleep(5.0)  # check every 5 seconds
+                async with self._lock:
+                    for key, worker in list(self.workers.items()):
+                        crashed = False
+                        if worker.is_running:
+                            if worker._task is None or worker._task.done():
+                                crashed = True
+
+                        if crashed:
+                            logger.error(f"Camera worker for camera {key} has crashed!")
+                            retries = self._crash_retries.get(key, 0)
+                            max_retries = self.settings.WORKER_MAX_CRASH_RETRIES
+
+                            if retries < max_retries:
+                                self._crash_retries[key] = retries + 1
+                                logger.info(f"Attempting restart {retries + 1}/{max_retries} for camera {key} in 10s...")
+                                asyncio.create_task(self._restart_worker_after_delay(key))
+                            else:
+                                logger.critical(f"Camera worker for camera {key} exceeded max crash retries ({max_retries}). Marking as error.")
+                                worker.is_running = False
+                                worker.error_message = "Crashed and exceeded maximum auto-restart attempts."
+                                asyncio.create_task(self._mark_camera_error(key))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in worker monitor loop: {e}")
+
+    async def _restart_worker_after_delay(self, key: str):
+        """Wait 10 seconds and restart the camera worker."""
+        await asyncio.sleep(10.0)
+        async with self._lock:
+            # Verify if worker is still managed and requires a restart
+            worker = self.workers.get(key)
+            if not worker or not worker.is_running or (worker._task and not worker._task.done()):
+                return
+
+            logger.info(f"Restarting camera worker {key} now...")
+            try:
+                # Stop cleanly first
+                await worker.stop()
+
+                # Reload configuration parameters
+                async with AsyncSessionLocal() as db:
+                    camera_config = await load_camera_config(db, uuid.UUID(key))
+                    runtime_config = await load_runtime_config(db, uuid.UUID(key))
+
+                # Replace with new worker instance
+                new_worker = CameraWorker(camera_config, runtime_config)
+                await new_worker.start()
+                self.workers[key] = new_worker
+                logger.info(f"Camera worker {key} restarted successfully.")
+            except Exception as e:
+                logger.error(f"Failed to restart camera worker {key}: {e}")
+
+    async def _mark_camera_error(self, key: str):
+        """Update camera status to ERROR in PostgreSQL."""
+        try:
+            from app.core.db.models.camera import Camera, CameraStatus
+            from sqlalchemy import update
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    update(Camera)
+                    .where(Camera.id == uuid.UUID(key))
+                    .values(status=CameraStatus.ERROR)
+                )
+                await db.commit()
+            logger.info(f"Camera {key} status set to ERROR in database.")
+        except Exception as e:
+            logger.error(f"Failed to set camera {key} status to ERROR: {e}")
 
     # ------------------------------------------------------------------
     # Status

@@ -6,6 +6,12 @@ recent frame, so processing latency never causes a growing backlog of
 stale frames (which is what happens with a naive cv2 read loop).
 """
 
+import os
+# Set OpenCV FFMPEG timeout option (10,000,000 microseconds = 10 seconds)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;10000000"
+# Silence FFmpeg standard error output logs in OpenCV
+os.environ["OPENCV_FFMPEG_LOG_LEVEL"] = "-8"
+
 import threading
 import time
 from typing import Optional, Tuple
@@ -18,10 +24,17 @@ from loguru import logger
 class LatestFrameBuffer:
     """Thread-safe holder for the most recent frame of an RTSP stream."""
 
-    def __init__(self, rtsp_url: str, reconnect_delay: float = 5.0, max_reconnect_delay: float = 60.0):
+    def __init__(
+        self,
+        rtsp_url: str,
+        reconnect_delay: float = 5.0,
+        max_reconnect_delay: float = 60.0,
+        frame_rotation: Optional[int] = None,
+    ):
         self.rtsp_url = rtsp_url
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
+        self.frame_rotation = frame_rotation  # None, 90, 180, 270 (degrees)
 
         self._frame: Optional[np.ndarray] = None
         self._frame_ts: float = 0.0
@@ -32,6 +45,7 @@ class LatestFrameBuffer:
         self.is_connected: bool = False
         self.last_error: Optional[str] = None
         self.frames_captured: int = 0
+        self.reconnect_count: int = 0
 
     def start(self):
         """Start the background capture thread."""
@@ -50,6 +64,14 @@ class LatestFrameBuffer:
             self._thread = None
         self.is_connected = False
         logger.info(f"Frame buffer capture thread stopped for {self.rtsp_url}")
+
+    def reset(self):
+        """Reset the frame buffer: stop and restart the capture thread."""
+        logger.warning(f"Resetting frame buffer for stream {self.rtsp_url}")
+        self.stop()
+        self._frame = None
+        self._frame_ts = 0.0
+        self.start()
 
     def get_latest(self) -> Tuple[Optional[np.ndarray], float]:
         """Get the most recent frame and its capture timestamp."""
@@ -87,6 +109,18 @@ class LatestFrameBuffer:
                         time.sleep(0.05)
                         continue
 
+                    # Apply rotation if specified in camera configuration
+                    if self.frame_rotation:
+                        try:
+                            if self.frame_rotation == 90:
+                                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                            elif self.frame_rotation == 180:
+                                frame = cv2.rotate(frame, cv2.ROTATE_180)
+                            elif self.frame_rotation in (270, -90):
+                                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        except Exception as e:
+                            logger.error(f"Failed to rotate frame (rotation={self.frame_rotation}): {e}")
+
                     consecutive_failures = 0
                     with self._lock:
                         self._frame = frame
@@ -96,6 +130,7 @@ class LatestFrameBuffer:
             except Exception as e:
                 self.is_connected = False
                 self.last_error = str(e)
+                self.reconnect_count += 1
                 logger.warning(f"RTSP capture error ({self.rtsp_url}): {e}")
             finally:
                 if cap is not None:

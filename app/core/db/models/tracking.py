@@ -36,6 +36,11 @@ class TrackSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     stability_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=0.0)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
 
+    # Demographics
+    gender: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    age_group: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    best_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
     camera: Mapped["Camera"] = relationship("Camera", back_populates="track_sessions")
     person_identity: Mapped[Optional["PersonIdentity"]] = relationship(
         "PersonIdentity", back_populates="track_sessions"

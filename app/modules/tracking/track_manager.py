@@ -32,6 +32,21 @@ class ActiveTrack:
     last_reid_time: Optional[datetime] = None
     reid_attempted: bool = False
 
+    # Refined ReID Accumulation & Confidence State
+    reid_resolved: bool = False
+    reid_confident: bool = False
+    reid_score: float = 0.0
+    reid_frame_count: int = 0
+    reid_max_refinement_frames: int = 20
+
+    # Demographics and Face crop tracking
+    face_analysis_count: int = 0
+    best_demographics: Optional[dict] = None
+
+    # Track's best crop (body)
+    best_crop_quality: float = 0.0
+    best_crop_path: Optional[str] = None
+
     @property
     def track_age_seconds(self) -> float:
         return seconds_since(self.started_at)
@@ -44,17 +59,14 @@ class ActiveTrack:
         """Check if ReID should be triggered for this track."""
         if not self.bbox:
             return False
-        # Track age > 1.5 seconds
-        if self.track_age_seconds < 1.5:
+        # Stop once confident
+        if self.reid_confident:
             return False
-        # Bbox height > 120 pixels
-        if bbox_height(self.bbox) < 120:
+        # Stop after max refinement frames
+        if self.reid_frame_count >= self.reid_max_refinement_frames:
             return False
-        # Stability > 0.65
-        if self.stability_score < 0.65:
-            return False
-        # Last ReID > 3 seconds ago (or never)
-        if self.last_reid_time and seconds_since(self.last_reid_time) < 3.0:
+        # POC's minimum crop size
+        if bbox_height(self.bbox) < 100:
             return False
         return True
 
@@ -113,7 +125,8 @@ class TrackManager:
         if not track.bbox:
             return
 
-        center = bbox_center(track.bbox)
+        from app.utils.geometry import bbox_bottom_center
+        center = bbox_bottom_center(track.bbox)
         current_zone_ids = set()
 
         for zone in zones_data:
