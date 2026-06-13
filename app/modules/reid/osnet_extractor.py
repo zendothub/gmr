@@ -34,35 +34,30 @@ class OSNetExtractor:
         self.model_path = model_path or settings.OSNET_MODEL_PATH
         self.embedding_dim = settings.REID_EMBEDDING_DIM
         self.model = None
-        self._input_size = (128, 256)  # (width, height)
+        
+        # Detect device: cuda -> mps -> cpu
+        import torch
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+            
+        logger.info(f"OSNet extractor device set to: {self.device}")
         self._load_model()
 
     def _load_model(self):
         """Load OSNet model."""
         try:
-            import torch
-            import torchvision.transforms as T
-
-            # TODO: Load actual torchreid OSNet model weights
-            # from torchreid.utils import FeatureExtractor
-            # self.model = FeatureExtractor(
-            #     model_name='osnet_x1_0',
-            #     model_path=self.model_path,
-            #     device='cuda' if torch.cuda.is_available() else 'cpu'
-            # )
-
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.transform = T.Compose([
-                T.ToPILImage(),
-                T.Resize(self._input_size[::-1]),  # (H, W)
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-
-            logger.info(f"OSNet extractor initialized (device={self.device})")
-            logger.warning("OSNet model weights not loaded - using random embeddings as stub. "
-                         "Place real weights at: " + self.model_path)
-
+            from torchreid.reid.utils import FeatureExtractor
+            # Note: FeatureExtractor automatically handles resizing and transforms
+            self.model = FeatureExtractor(
+                model_name='osnet_x1_0',
+                model_path=self.model_path if self.model_path else None,
+                device=self.device
+            )
+            logger.info(f"OSNet FeatureExtractor loaded: {self.model_path}")
         except Exception as e:
             logger.error(f"Failed to initialize OSNet extractor: {e}")
             self.model = None
@@ -77,6 +72,9 @@ class OSNetExtractor:
         Returns:
             512-dim numpy array (L2 normalized), or None on failure
         """
+        if self.model is None:
+            return None
+
         try:
             if crop is None or crop.size == 0:
                 return None
@@ -84,21 +82,11 @@ class OSNetExtractor:
             # Convert BGR to RGB
             rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
-            if self.model is not None:
-                # Use actual model
-                # features = self.model(rgb_crop)
-                # embedding = features.cpu().numpy().flatten()
-                pass
-
-            # TODO: Replace stub with actual model inference
-            # Stub: Generate deterministic embedding based on pixel content
             import torch
-            tensor = self.transform(rgb_crop).unsqueeze(0)
-
-            # Simple feature extraction stub using mean pooling of pixel values
-            np.random.seed(int(np.mean(rgb_crop) * 1000) % (2**31))
-            embedding = np.random.randn(self.embedding_dim).astype(np.float32)
-
+            with torch.no_grad():
+                features = self.model(rgb_crop)
+                embedding = features[0].cpu().numpy()  # shape (512,)
+                
             # L2 normalize
             norm = np.linalg.norm(embedding)
             if norm > 0:

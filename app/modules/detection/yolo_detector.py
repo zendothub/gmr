@@ -43,8 +43,16 @@ class DetectionResult:
     bbox: dict  # {x1, y1, x2, y2}
 
 
+@dataclass
+class TrackedDetection:
+    """Detection with active tracker ID."""
+    track_id: int
+    confidence: float
+    bbox: dict  # {x1, y1, x2, y2}
+
+
 class YOLODetector:
-    """YOLO-based object detector using ultralytics."""
+    """YOLO-based object detector and tracker using ultralytics."""
 
     def __init__(
         self,
@@ -57,6 +65,17 @@ class YOLODetector:
         self.confidence_threshold = confidence_threshold or settings.YOLO_CONFIDENCE_THRESHOLD
         self.allowed_classes = allowed_classes or settings.yolo_allowed_classes_list
         self.model = None
+        
+        # Detect device: cuda -> mps -> cpu
+        import torch
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+            
+        logger.info(f"YOLO detector device set to: {self.device}")
         self._load_model()
 
     def _load_model(self):
@@ -64,10 +83,10 @@ class YOLODetector:
         try:
             from ultralytics import YOLO
             self.model = YOLO(self.model_path)
-            logger.info(f"YOLO model loaded: {self.model_path}")
+            self.model.to(self.device)
+            logger.info(f"YOLO model loaded on {self.device}: {self.model_path}")
         except Exception as e:
             logger.error(f"Failed to load YOLO model from {self.model_path}: {e}")
-            # TODO: Download model weights if not present
             logger.warning("YOLO model not available. Detection will return empty results.")
             self.model = None
 
@@ -89,6 +108,7 @@ class YOLODetector:
                 frame,
                 conf=self.confidence_threshold,
                 classes=self.allowed_classes if self.allowed_classes else None,
+                device=self.device,
                 verbose=False,
             )
 
@@ -126,3 +146,69 @@ class YOLODetector:
         """Detect only person class (class_id=0 in COCO)."""
         all_detections = self.detect(frame)
         return [d for d in all_detections if d.class_id == 0]
+
+    def track(self, frame: np.ndarray) -> List[TrackedDetection]:
+        """
+        Run detection and tracking on a single frame.
+
+        Args:
+            frame: BGR image as numpy array
+
+        Returns:
+            List of TrackedDetection objects
+        """
+        if self.model is None:
+            return []
+
+        try:
+            results = self.model.track(
+                frame,
+                classes=[0],  # only person tracking is supported/needed
+                conf=self.confidence_threshold,
+                persist=True,
+                tracker="bytetrack.yaml",
+                device=self.device,
+                verbose=False,
+            )
+
+            tracked_detections = []
+            for result in results:
+                boxes = result.boxes
+                if boxes is None or boxes.id is None:
+                    continue
+
+                track_ids = boxes.id.int().cpu().tolist()
+                for i in range(len(boxes)):
+                    track_id = track_ids[i]
+                    conf = float(boxes.conf[i].item())
+                    xyxy = boxes.xyxy[i].cpu().numpy()
+
+                    tracked_det = TrackedDetection(
+                        track_id=track_id,
+                        confidence=conf,
+                        bbox={
+                            "x1": float(xyxy[0]),
+                            "y1": float(xyxy[1]),
+                            "x2": float(xyxy[2]),
+                            "y2": float(xyxy[3]),
+                        },
+                    )
+                    tracked_detections.append(tracked_det)
+
+            return tracked_detections
+
+        except Exception as e:
+            logger.error(f"YOLO tracking failed: {e}")
+            return []
+
+    def reset_tracker(self):
+        """Reset the internal tracker state."""
+        try:
+            if self.model is not None and hasattr(self.model, "predictor") and self.model.predictor is not None:
+                if hasattr(self.model.predictor, "trackers") and self.model.predictor.trackers:
+                    for tracker in self.model.predictor.trackers:
+                        if hasattr(tracker, "reset"):
+                            tracker.reset()
+                    logger.info("YOLO tracking states reset successfully.")
+        except Exception as e:
+            logger.error(f"Error resetting YOLO tracker: {e}")

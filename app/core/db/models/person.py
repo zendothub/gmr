@@ -26,11 +26,43 @@ class PersonIdentity(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     is_anonymous: Mapped[bool] = mapped_column(default=True, nullable=False)
 
+    # Demographic fields
+    gender: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    age_group: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    estimated_age: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    best_face_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
     embeddings: Mapped[List["PersonEmbedding"]] = relationship(
         "PersonEmbedding", back_populates="person_identity", cascade="all, delete-orphan"
     )
+    face_embeddings: Mapped[List["PersonFaceEmbedding"]] = relationship(
+        "PersonFaceEmbedding", back_populates="person_identity", cascade="all, delete-orphan"
+    )
     track_sessions: Mapped[List["TrackSession"]] = relationship(
         "TrackSession", back_populates="person_identity"
+    )
+
+
+class PersonFaceEmbedding(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "person_face_embeddings"
+
+    person_identity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("person_identities.id", ondelete="CASCADE"),
+        nullable=False, index=True
+    )
+    embedding = mapped_column(Vector(512), nullable=False)
+    camera_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cameras.id"), nullable=True
+    )
+    face_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    person_identity: Mapped["PersonIdentity"] = relationship(
+        "PersonIdentity", back_populates="face_embeddings"
     )
 
 
