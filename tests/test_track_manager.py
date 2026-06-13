@@ -61,36 +61,30 @@ class TestTrackManager:
 
 
 class TestShouldRunReid:
-    def _stable_track(self) -> ActiveTrack:
+    def _eligible_track(self) -> ActiveTrack:
         track = ActiveTrack(
             local_track_id=1,
             camera_id=CAMERA_ID,
-            bbox=make_bbox(y1=0, y2=200),  # height 200 > 120
+            bbox=make_bbox(y1=0, y2=200),  # height 200 >= 100
         )
-        track.started_at = utc_now() - timedelta(seconds=3)  # age > 1.5s
-        track.stability_score = 0.8  # > 0.65
-        track.last_reid_time = None
+        track.reid_frame_count = 0
+        track.reid_confident = False
         return track
 
     def test_eligible_track(self):
-        assert self._stable_track().should_run_reid() is True
+        assert self._eligible_track().should_run_reid() is True
 
-    def test_too_young(self):
-        track = self._stable_track()
-        track.started_at = utc_now()
+    def test_reid_confident(self):
+        track = self._eligible_track()
+        track.reid_confident = True
         assert track.should_run_reid() is False
 
     def test_bbox_too_small(self):
-        track = self._stable_track()
-        track.bbox = make_bbox(y1=0, y2=100)  # height 100 < 120
+        track = self._eligible_track()
+        track.bbox = make_bbox(y1=0, y2=90)  # height 90 < 100
         assert track.should_run_reid() is False
 
-    def test_unstable(self):
-        track = self._stable_track()
-        track.stability_score = 0.5
-        assert track.should_run_reid() is False
-
-    def test_recent_reid(self):
-        track = self._stable_track()
-        track.last_reid_time = utc_now()
+    def test_too_many_frames(self):
+        track = self._eligible_track()
+        track.reid_frame_count = 20
         assert track.should_run_reid() is False

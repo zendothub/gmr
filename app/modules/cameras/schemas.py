@@ -27,6 +27,7 @@ class CameraCreate(BaseModel):
     detection_model: str = "yolov8n"
     reid_enabled: bool = True
     demographic_enabled: bool = False
+    frame_rotation: Optional[int] = Field(default=None, ge=0, le=270)  # None, 90, 180, 270
     location_description: Optional[str] = None
 
 
@@ -39,6 +40,7 @@ class CameraUpdate(BaseModel):
     detection_model: Optional[str] = None
     reid_enabled: Optional[bool] = None
     demographic_enabled: Optional[bool] = None
+    frame_rotation: Optional[int] = Field(default=None, ge=0, le=270)
     location_description: Optional[str] = None
     is_active: Optional[bool] = None
 
@@ -55,6 +57,7 @@ class CameraResponse(BaseModel):
     detection_model: str
     reid_enabled: bool
     demographic_enabled: bool
+    frame_rotation: Optional[int]
     location_description: Optional[str]
     is_active: bool
     created_at: datetime

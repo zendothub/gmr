@@ -85,6 +85,7 @@ class CameraService:
             detection_model=data.detection_model,
             reid_enabled=data.reid_enabled,
             demographic_enabled=data.demographic_enabled,
+            frame_rotation=data.frame_rotation,
             location_description=data.location_description,
             status=CameraStatus.INACTIVE,
             is_active=True,

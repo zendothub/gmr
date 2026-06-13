@@ -27,18 +27,33 @@ class Settings(BaseSettings):
     REPORT_DIR: str = "reports"
 
     # AI Models
-    YOLO_MODEL_PATH: str = "models/yolov8n.pt"
+    YOLO_MODEL_PATH: str = "models/yolo11n.pt"
     YOLO_CONFIDENCE_THRESHOLD: float = 0.45
     YOLO_ALLOWED_CLASSES: str = "0"  # comma-separated class IDs
     OSNET_MODEL_PATH: str = "models/osnet_x1_0.pth"
     REID_EMBEDDING_DIM: int = 512
-    REID_MATCH_THRESHOLD: float = 0.78
+    REID_MATCH_THRESHOLD: float = 0.60
     REID_CROP_QUALITY_THRESHOLD: float = 0.70
+    REID_ACCUMULATION_FRAMES: int = 5
+    REID_CONFIDENCE_LIMIT: float = 0.75
+    REID_MAX_REFINEMENT_FRAMES: int = 20
+
+    # InsightFace
+    INSIGHTFACE_MODEL: str = "buffalo_l"
+    INSIGHTFACE_DET_SIZE: str = "640,640"
+    INSIGHTFACE_MAX_ATTEMPTS: int = 5
+    FACE_MATCH_THRESHOLD: float = 0.50
 
     # Runtime
-    DEFAULT_FPS_TARGET: int = 5
+    DEFAULT_FPS_TARGET: int = 10
     MAX_WORKERS: int = 8
     FRAME_BUFFER_SIZE: int = 2
+    RUNTIME_SHOW_GUI: bool = False
+
+    # Worker robustness
+    WORKER_WATCHDOG_TIMEOUT: int = 30
+    WORKER_TRACKER_RESET_HOURS: int = 6
+    WORKER_MAX_CRASH_RETRIES: int = 3
 
     # Logging
     LOG_LEVEL: str = "INFO"

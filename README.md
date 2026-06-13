@@ -11,7 +11,7 @@ Production-ready **single modular FastAPI application** for an on-prem AI CCTV r
 | ORM / Migrations | SQLAlchemy 2.0 (async) / Alembic |
 | Camera I/O | OpenCV (RTSP test + runtime frame reading) |
 | Detection | Ultralytics YOLO (person by default) |
-| Tracking | ByteTrack adapter (stub tracker included; TODO real weights) |
+| Tracking | YOLO11 built-in tracker (ByteTrack) |
 | ReID | torchreid OSNet 512-dim embeddings stored in `VECTOR(512)` (pgvector cosine search) |
 | Media storage | Local filesystem (snapshots / crops / clips / reports) |
 | Background jobs | APScheduler (in-process) |
@@ -36,7 +36,7 @@ retail-ai-platform/
 │   │   ├── rules/            # rule CRUD (line_crossing, zone_dwell, ...)
 │   │   ├── ai_runtime/       # worker_supervisor, camera_worker, frame_buffer
 │   │   ├── detection/        # yolo_detector.py (DetectionResult)
-│   │   ├── tracking/         # bytetrack_adapter.py, track_manager.py
+│   │   ├── tracking/         # track_manager.py
 │   │   ├── reid/             # crop_quality, osnet_extractor, identity_decision_engine
 │   │   ├── rule_engine/      # rule_evaluator, camera_view_engine, config_loader
 │   │   ├── events/           # event listing / ack / false-positive
@@ -58,22 +58,21 @@ retail-ai-platform/
 ## AI Pipeline (per camera worker)
 
 ```
-RTSP stream ──> LatestFrameBuffer (capture thread, keeps newest frame only)
-   │  sampled at camera.fps_target (never the native 25 FPS)
+RTSP stream ──> LatestFrameBuffer (capture thread, keeps newest frame only, with rotation support)
+   │  sampled at camera.fps_target (exactly 10 FPS / 100ms throttle by default)
    ▼
-YOLO detection (person class) ──> camera-view ROI filter (center point in polygon)
+YOLO11 tracking (person class, built-in ByteTrack) ──> camera-view ROI filter (center point in polygon)
    ▼
-ByteTrack tracking ──> TrackManager (in-memory state + track_sessions in PostgreSQL)
+TrackManager (in-memory state + track_sessions in PostgreSQL)
    ▼
-Zone update (point-in-polygon, dwell seconds per zone)
+Zone update (point-in-polygon, dwell seconds per zone) ──> ZoneEventDetector (automatic enter/exit/dwell events)
    ▼
-ReID (gated):  track age > 1.5s, bbox height > 120px,
-               stability > 0.65, last ReID > 3s ago
+ReID (gated):  height >= 100px, reid_frame_count < 20, not reid_confident
    crop ─> quality (reject < 0.70) ─> OSNet 512-dim embedding
-        ─> pgvector cosine search ─> identity decision:
-   final_score = 0.60*visual + 0.15*crop_quality + 0.10*time
-               + 0.10*camera_transition + 0.05*stability
-   score >= 0.78 → match existing person, else new anonymous identity
+   5-frame accumulation ─> mean embedding ─> pgvector cosine search (threshold 0.60, confidence 0.75)
+   Refinement continues at frames 10, 15, 20. Identity switches prune old temporary visitors.
+   ▼
+InsightFace demographics (buffalo_l, max 5 runs per track, selects highest face score demographics)
    ▼
 Rule engine (in-memory cache, cooldown_seconds dedup) ──> events + billing_interactions
 ```
@@ -119,7 +118,7 @@ Place real weights in `models/` (configured via `.env`):
 
 - `models/yolov8n.pt` — auto-downloaded by ultralytics on first run, or copy manually.
 - `models/osnet_x1_0.pth` — torchreid OSNet weights. Until provided, the extractor runs a deterministic stub (marked `TODO` in `osnet_extractor.py`).
-- ByteTrack: the adapter ships with a simple IoU tracker stub; plug in the real ByteTrack implementation in `bytetrack_adapter.py` (marked `TODO`).
+- ByteTrack: handled internally by Ultralytics YOLO11 (`bytetrack.yaml`). No external weights needed.
 
 ## Typical Workflow
 

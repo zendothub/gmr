@@ -74,6 +74,7 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     detection_model: Mapped[str] = mapped_column(String(100), nullable=False, default="yolov8n")
     reid_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     demographic_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    frame_rotation: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # None, 90, 180, 270
     location_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
