@@ -34,6 +34,7 @@ class FFmpegPublisher(StreamPublisher):
         self.mode = (mode or self.settings.STREAM_PUBLISH_MODE or "copy").lower()
 
         self._proc: Optional[subprocess.Popen] = None
+        self._proc_start_time: float = 0.0
         self._watchdog: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -51,6 +52,11 @@ class FFmpegPublisher(StreamPublisher):
             "-loglevel", "warning",
             # Prefer TCP for RTSP - far more reliable over WAN/NVRs.
             "-rtsp_transport", "tcp",
+            # Give the source stream time to produce data before ffmpeg gives up.
+            # Important in copy mode where no video keyframe = empty output = exit 0.
+            "-timeout", "30000000",       # 30 s socket I/O timeout (microseconds)
+            "-analyzeduration", "15M",    # probe up to 15 s for stream info
+            "-probesize", "10M",          # read up to 10 MB for codec discovery
             "-fflags", "nobuffer",
             "-flags", "low_delay",
             "-i", self.source_url,
@@ -104,10 +110,11 @@ class FFmpegPublisher(StreamPublisher):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        self._proc_start_time = time.time()
 
     def _watch(self) -> None:
         """Restart ffmpeg with backoff if it dies while it should be running."""
-        backoff = 2.0
+        backoff = 0.5
         max_backoff = 30.0
         while not self._stop_event.is_set():
             proc = self._proc
@@ -134,7 +141,7 @@ class FFmpegPublisher(StreamPublisher):
             with self._lock:
                 if not self._stop_event.is_set():
                     self._spawn()
-                    backoff = 2.0  # reset after a successful respawn
+                    backoff = 0.5  # reset after a successful respawn
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -152,6 +159,44 @@ class FFmpegPublisher(StreamPublisher):
     def is_alive(self) -> bool:
         proc = self._proc
         return bool(proc and proc.poll() is None)
+
+    def wait_until_alive(self, timeout: float = 8.0) -> bool:
+        """Wait for the ffmpeg process to stabilize (produce output).
+
+        Returns True once the process has been alive for at least 1 second
+        without exiting, or False if it died or timed out.
+
+        This prevents returning stream URLs to the client while ffmpeg is
+        still probing / waiting for the first video keyframe.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            proc = self._proc
+            if proc is None:
+                return False
+            ret = proc.poll()
+            if ret is not None:
+                # Exited already - capture error
+                try:
+                    if proc.stderr:
+                        tail = proc.stderr.read().decode(errors="ignore").strip().splitlines()
+                        if tail:
+                            self._error = tail[-1]
+                except Exception:
+                    pass
+                logger.warning(
+                    f"FFmpeg publisher died during stabilization (code={ret}) "
+                    f"for {self.target.path}: {self._error}"
+                )
+                return False
+            # Process is still running. Give it at minimum 1.5 s to push the
+            # first few packets into MediaMTX before declaring it ready.
+            if time.time() - self._proc_start_time >= 1.5:
+                return True
+            time.sleep(0.1)
+        # Still running but timed out waiting for stabilization window.
+        # The process hasn't exited, so it's probably fine.
+        return bool(self._proc and self._proc.poll() is None)
 
     @property
     def last_error(self) -> Optional[str]:

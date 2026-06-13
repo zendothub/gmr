@@ -68,7 +68,12 @@ class StreamManager:
     # -- public API --------------------------------------------------------
 
     def start_stream(self, camera_id: uuid.UUID, rtsp_url: str) -> StreamEndpoints:
-        """Ensure a publisher is running for this camera; returns playback URLs."""
+        """Ensure a publisher is running for this camera; returns playback URLs.
+
+        Blocks for up to 10 s until ffmpeg is confirmed stable and has pushed
+        at least the first few packets into MediaMTX, so the client doesn't
+        receive a stream URL before the RTSP path is publishing.
+        """
         key = str(camera_id)
         with self._lock:
             handle = self._streams.get(key)
@@ -84,7 +89,14 @@ class StreamManager:
             elif not handle.publisher.is_alive():
                 handle.publisher.start()
             handle.last_active_at = time.time()
-            return handle.endpoints
+
+        # Wait for the ffmpeg process to stabilize (produces output packets)
+        if not handle.publisher.wait_until_alive(timeout=10.0):
+            logger.warning(
+                f"Stream publisher did not stabilize for camera {key}: "
+                f"{handle.publisher.last_error}"
+            )
+        return handle.endpoints
 
     def add_viewer(self, camera_id: uuid.UUID, rtsp_url: str) -> StreamEndpoints:
         """Register a viewer (starts the stream if needed)."""
