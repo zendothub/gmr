@@ -14,10 +14,12 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+
 
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://retail_user:retail_pass@localhost:5432/retail_ai_db"
-    DATABASE_SYNC_URL: str = "postgresql://retail_user:retail_pass@localhost:5432/retail_ai_db"
+    DATABASE_URL: str = "postgresql+asyncpg://retail_user:retail_pass@localhost:5433/retail_ai_db"
+    DATABASE_SYNC_URL: str = "postgresql://retail_user:retail_pass@localhost:5433/retail_ai_db"
 
     # Storage
     STORAGE_ROOT: str = "/app/storage"
@@ -54,6 +56,31 @@ class Settings(BaseSettings):
     WORKER_WATCHDOG_TIMEOUT: int = 30
     WORKER_TRACKER_RESET_HOURS: int = 6
     WORKER_MAX_CRASH_RETRIES: int = 3
+
+    # ------------------------------------------------------------------
+    # Streaming (ffmpeg -> MediaMTX -> WebRTC/WHEP/HLS)
+    # ------------------------------------------------------------------
+    # Path to the ffmpeg binary used to republish RTSP into MediaMTX.
+    FFMPEG_BINARY: str = "ffmpeg"
+    # MediaMTX host as reachable from this backend (container/network name).
+    MEDIAMTX_HOST: str = "localhost"
+    # MediaMTX ports.
+    MEDIAMTX_RTSP_PORT: int = 8554
+    MEDIAMTX_WEBRTC_PORT: int = 8889   # WHEP (WebRTC-HTTP Egress Protocol)
+    MEDIAMTX_HLS_PORT: int = 8888
+    MEDIAMTX_API_PORT: int = 9997
+    # Public base URL the browser uses to reach MediaMTX WebRTC/HLS.
+    # When empty it is derived from MEDIAMTX_HOST + the relevant port.
+    MEDIAMTX_PUBLIC_URL: str = ""
+    # Transcode preset for the republish step. "copy" = no re-encode (cheapest,
+    # requires H.264). Use "lowlatency" to re-encode for browser-friendly output.
+    STREAM_PUBLISH_MODE: str = "copy"  # copy | lowlatency
+    # Auto-stop a published stream after this many seconds with no viewers.
+    STREAM_IDLE_TIMEOUT_SECONDS: int = 120
+    # Snapshot (single JPEG frame) settings for the zone-drawing canvas.
+    SNAPSHOT_TIMEOUT_SECONDS: int = 10
+    SNAPSHOT_JPEG_QUALITY: int = 85
+
 
     # Logging
     LOG_LEVEL: str = "INFO"

@@ -1,17 +1,18 @@
 """Database models package - imports all models for easy access."""
 
 from app.core.db.models.user import User, Role, user_roles
-from app.core.db.models.store import Store
+from app.core.db.models.area import Area
+
+
 from app.core.db.models.camera import (
     Camera,
-    CameraView,
     Zone,
     CameraRole,
     CameraStatus,
-    ViewType,
     ZoneType,
     ZoneShape,
 )
+
 from app.core.db.models.rule import Rule, RuleType
 from app.core.db.models.tracking import TrackSession, TrackObservation
 from app.core.db.models.person import PersonIdentity, PersonEmbedding
@@ -24,14 +25,14 @@ __all__ = [
     "User",
     "Role",
     "user_roles",
-    "Store",
+    "Area",
+
     "Camera",
-    "CameraView",
     "Zone",
     "CameraRole",
     "CameraStatus",
-    "ViewType",
     "ZoneType",
+
     "ZoneShape",
     "Rule",
     "RuleType",

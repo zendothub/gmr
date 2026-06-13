@@ -30,6 +30,7 @@ from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
 from app.modules.rule_engine.camera_view_engine import CameraViewEngine
 from app.utils.image_utils import extract_crop, save_image
+
 from app.utils.time_utils import utc_now
 from app.utils.geometry import polygon_from_json
 
@@ -59,7 +60,6 @@ class CameraWorker:
             allowed_classes=self.settings.yolo_allowed_classes_list,
         )
         self.track_manager = TrackManager(self.camera_id)
-        self.view_engine = CameraViewEngine()
         self.rule_evaluator = RuleEvaluator()
         self.zone_event_detector = ZoneEventDetector(self.camera_id)
         
@@ -67,8 +67,9 @@ class CameraWorker:
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
         self.insightface_analyzer = get_shared_analyzer(self.settings.INSIGHTFACE_MODEL) if self.demographic_enabled else None
 
-        # Runtime config (views/zones/rules)
+        # Runtime config (zones/rules). Cameras are static -> no ROI/views.
         self.zones: List[dict] = []
+
         self.apply_runtime_config(runtime_config)
 
         # Observation sampling state: local_track_id -> last sample monotonic time
@@ -136,8 +137,8 @@ class CameraWorker:
     def apply_runtime_config(self, runtime_config: dict):
         """Apply (or re-apply) runtime configuration loaded from PostgreSQL."""
         self.zones = runtime_config.get("zones", [])
-        self.view_engine.load_views(runtime_config.get("views", []))
         self.rule_evaluator.cache.load(
+
             runtime_config.get("rules", []),
             runtime_config.get("zones_by_id", {}),
         )

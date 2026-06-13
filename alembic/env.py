@@ -9,8 +9,10 @@ from app.core.db.base import Base
 
 # Import all models so Alembic can detect them
 from app.core.db.models.user import User, Role
-from app.core.db.models.store import Store
-from app.core.db.models.camera import Camera, CameraView, Zone
+from app.core.db.models.area import Area
+from app.core.db.models.camera import Camera, Zone
+
+
 from app.core.db.models.rule import Rule
 from app.core.db.models.tracking import TrackSession, TrackObservation
 from app.core.db.models.person import PersonIdentity, PersonEmbedding

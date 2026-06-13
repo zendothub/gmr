@@ -1,4 +1,9 @@
-"""Camera, CameraView, and Zone models."""
+"""Camera and Zone models.
+
+Cameras are statically mounted (no PTZ / moving), so there is no per-camera
+ROI/"view" concept - detection runs on the full frame and is filtered by zones.
+"""
+
 
 import uuid
 from datetime import datetime
@@ -27,16 +32,8 @@ class CameraStatus(str, enum.Enum):
     MAINTENANCE = "maintenance"
 
 
-class ViewType(str, enum.Enum):
-    FULL_FRAME = "full_frame"
-    ENTRY_GATE_VIEW = "entry_gate_view"
-    BILLING_COUNTER_VIEW = "billing_counter_view"
-    QUEUE_VIEW = "queue_view"
-    PRODUCT_SHELF_VIEW = "product_shelf_view"
-    IGNORE_AREA = "ignore_area"
-
-
 class ZoneType(str, enum.Enum):
+
     ENTRY_LINE = "entry_line"
     EXIT_LINE = "exit_line"
     BILLING_ZONE = "billing_zone"
@@ -44,6 +41,9 @@ class ZoneType(str, enum.Enum):
     PRODUCT_ZONE = "product_zone"
     IGNORE_ZONE = "ignore_zone"
     RESTRICTED_ZONE = "restricted_zone"
+    # Where medicine is taken / dispensed (Apollo pharmacy pickup point)
+    MEDICINE_PICKUP_ZONE = "medicine_pickup_zone"
+
 
 
 class ZoneShape(str, enum.Enum):
@@ -55,11 +55,15 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "cameras"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Source RTSP the backend pulls from (camera/NVR).
     rtsp_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    store_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("stores.id"), nullable=False
-    )
+    # MediaMTX path the backend republishes into; the browser pulls the feed back
+    # (WebRTC/HLS) from this path. Stable & deterministic per camera id.
+    stream_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     role: Mapped[str] = mapped_column(
+
+
         SAEnum(CameraRole, name="camera_role_enum", create_constraint=True),
         nullable=False,
         default=CameraRole.GENERAL,
@@ -78,38 +82,28 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     location_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    store: Mapped["Store"] = relationship("Store", back_populates="cameras")
-    views: Mapped[List["CameraView"]] = relationship("CameraView", back_populates="camera", cascade="all, delete-orphan")
+    # Area is chosen from a dropdown when the camera is added (independent entity).
+    area_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("areas.id", ondelete="SET NULL"), nullable=True
+    )
+
+    area: Mapped[Optional["Area"]] = relationship("Area", back_populates="cameras")
+
     track_sessions: Mapped[List["TrackSession"]] = relationship("TrackSession", back_populates="camera")
+
     events: Mapped[List["Event"]] = relationship("Event", back_populates="camera")
 
-
-class CameraView(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    __tablename__ = "camera_views"
-
-    camera_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False
+    # A camera can have MANY zones (each zone is bound on this camera's stream).
+    zones: Mapped[List["Zone"]] = relationship(
+        "Zone", back_populates="camera", cascade="all, delete-orphan"
     )
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    view_type: Mapped[str] = mapped_column(
-        SAEnum(ViewType, name="view_type_enum", create_constraint=True),
-        nullable=False,
-        default=ViewType.FULL_FRAME,
-    )
-    polygon: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    camera: Mapped["Camera"] = relationship("Camera", back_populates="views")
-    zones: Mapped[List["Zone"]] = relationship("Zone", back_populates="camera_view", cascade="all, delete-orphan")
 
 
 class Zone(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+
     __tablename__ = "zones"
 
-    camera_view_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("camera_views.id", ondelete="CASCADE"), nullable=False
-    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     zone_type: Mapped[str] = mapped_column(
         SAEnum(ZoneType, name="zone_type_enum", create_constraint=True),
@@ -120,10 +114,15 @@ class Zone(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
         default=ZoneShape.POLYGON,
     )
+    # A zone is bound on a specific camera's stream (camera -> many zones).
+    camera_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=True
+    )
+    # The selected polygon points drawn on the camera frame.
     polygon: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    line_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    color: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default="#FF0000")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    camera_view: Mapped["CameraView"] = relationship("CameraView", back_populates="zones")
+
+    camera: Mapped[Optional["Camera"]] = relationship("Camera", back_populates="zones")
     rules: Mapped[List["Rule"]] = relationship("Rule", back_populates="zone")
+

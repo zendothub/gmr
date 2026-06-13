@@ -1,7 +1,10 @@
-"""Config loader - loads runtime configuration (rules, zones, views) from PostgreSQL.
+"""Config loader - loads runtime configuration (rules, zones) from PostgreSQL.
 
 This keeps the AI runtime decoupled from per-frame DB queries: configuration is
 loaded once into memory and only refreshed when /api/runtime/reload-config is called.
+
+Note: cameras are static (fixed mounting), so there is no per-camera "view"/ROI
+concept anymore - detections run on the full frame and are filtered by zones.
 """
 
 import uuid
@@ -11,13 +14,27 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db.models.camera import Camera, CameraView, Zone
+from app.core.db.models.camera import Camera, Zone
 from app.core.db.models.rule import Rule
 
 
 def _enum_value(v):
     """Return .value for enums, pass through plain values."""
     return v.value if hasattr(v, "value") else v
+
+
+def _line_config_from_polygon(polygon: Optional[dict], shape: Optional[str]) -> Optional[dict]:
+    """Derive a crossing line from the first two drawn points of a line-shaped zone.
+
+    Returns ``{"start": [x1, y1], "end": [x2, y2]}`` or None when the zone is not a
+    line / not enough points were drawn.
+    """
+    if shape != "line" or not polygon:
+        return None
+    points = polygon.get("points") if isinstance(polygon, dict) else None
+    if not points or len(points) < 2:
+        return None
+    return {"start": points[0], "end": points[1]}
 
 
 async def load_camera_config(db: AsyncSession, camera_id: uuid.UUID) -> Optional[dict]:
@@ -37,8 +54,8 @@ async def load_camera_config(db: AsyncSession, camera_id: uuid.UUID) -> Optional
         "detection_model": camera.detection_model,
         "reid_enabled": camera.reid_enabled,
         "demographic_enabled": camera.demographic_enabled,
-        "store_id": camera.store_id,
     }
+
 
 
 async def load_active_cameras(db: AsyncSession) -> List[dict]:
@@ -60,39 +77,16 @@ async def load_active_cameras(db: AsyncSession) -> List[dict]:
     ]
 
 
-async def load_views_for_camera(db: AsyncSession, camera_id: uuid.UUID) -> List[dict]:
-    """Load active camera views (ROI polygons) for a camera."""
-    result = await db.execute(
-        select(CameraView).where(
-            CameraView.camera_id == camera_id,
-            CameraView.is_active.is_(True),
-        )
-    )
-    views = result.scalars().all()
-    return [
-        {
-            "id": v.id,
-            "name": v.name,
-            "view_type": _enum_value(v.view_type),
-            "polygon": v.polygon,
-            "is_default": v.is_default,
-        }
-        for v in views
-    ]
-
-
 async def load_zones_for_camera(db: AsyncSession, camera_id: uuid.UUID) -> List[dict]:
-    """Load active zones across all views of a camera."""
+    """Load all active zones bound to this camera (camera -> many zones)."""
     result = await db.execute(
-        select(Zone)
-        .join(CameraView, Zone.camera_view_id == CameraView.id)
-        .where(
-            CameraView.camera_id == camera_id,
+        select(Zone).where(
+            Zone.camera_id == camera_id,
             Zone.is_active.is_(True),
-            CameraView.is_active.is_(True),
         )
     )
     zones = result.scalars().all()
+
     return [
         {
             "id": z.id,
@@ -100,8 +94,9 @@ async def load_zones_for_camera(db: AsyncSession, camera_id: uuid.UUID) -> List[
             "zone_type": _enum_value(z.zone_type),
             "shape": _enum_value(z.shape),
             "polygon": z.polygon,
-            "line_config": z.line_config,
-            "camera_view_id": z.camera_view_id,
+            # Line-crossing config is derived from the drawn polygon points so the
+            # operator only ever draws one shape (no separate line_config field).
+            "line_config": _line_config_from_polygon(z.polygon, _enum_value(z.shape)),
         }
         for z in zones
     ]
@@ -136,7 +131,6 @@ async def load_active_rules(db: AsyncSession, camera_id: Optional[uuid.UUID] = N
 async def load_runtime_config(db: AsyncSession, camera_id: uuid.UUID) -> Dict:
     """Load the full runtime configuration for a camera worker."""
     camera = await load_camera_config(db, camera_id)
-    views = await load_views_for_camera(db, camera_id)
     zones = await load_zones_for_camera(db, camera_id)
     rules = await load_active_rules(db, camera_id)
 
@@ -144,11 +138,10 @@ async def load_runtime_config(db: AsyncSession, camera_id: uuid.UUID) -> Dict:
 
     logger.info(
         f"Runtime config loaded for camera {camera_id}: "
-        f"{len(views)} views, {len(zones)} zones, {len(rules)} rules"
+        f"{len(zones)} zones, {len(rules)} rules"
     )
     return {
         "camera": camera,
-        "views": views,
         "zones": zones,
         "zones_by_id": zones_by_id,
         "rules": rules,
