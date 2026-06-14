@@ -66,3 +66,27 @@ class PersonJourneyResponse(BaseModel):
     total_sessions: int
     journey: List[JourneyStep]
     events: List[dict]
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Summary (single endpoint aggregating all key metrics)
+# ---------------------------------------------------------------------------
+
+class DemographicsBreakdown(BaseModel):
+    """Age-group and gender breakdown from track sessions."""
+    children: int = 0
+    teenager: int = 0
+    adult: int = 0
+    senior_citizen: int = 0
+    male: int = 0
+    female: int = 0
+
+
+class DashboardSummaryResponse(BaseModel):
+    """Unified dashboard summary for a given datetime range."""
+    start_time: datetime
+    end_time: datetime
+    unique_persons: int
+    total_entries: int
+    total_purchases: int
+    demographics: DemographicsBreakdown
