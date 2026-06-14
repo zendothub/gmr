@@ -345,8 +345,7 @@ class CameraWorker:
         crop_path = None
         crop = extract_crop(frame, track.bbox)
         if crop is not None and crop.size > 0:
-            crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-            crop_path = save_image(crop, crop_dir, prefix=f"crop_{self.camera_id}")
+            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
             track.best_crop_path = crop_path
             # Initial quality is 0, will be overwritten if ReID runs
 
@@ -497,8 +496,7 @@ class CameraWorker:
                 return
 
             # Save crop for audit / debugging
-            crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-            crop_path = save_image(crop, crop_dir, prefix=f"crop_{self.camera_id}")
+            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
 
             if quality > track.best_crop_quality:
                 track.best_crop_quality = quality
@@ -518,8 +516,7 @@ class CameraWorker:
                     
                     if face_result.face_crop is not None:
                         # Save face crop
-                        face_crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-                        face_crop_path = save_image(face_result.face_crop, face_crop_dir, prefix=f"face_{self.camera_id}")
+                        face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
 
                     # Keep the best face score demographics for display and TrackSession updating
                     if (track.best_demographics is None or 
@@ -556,19 +553,26 @@ class CameraWorker:
                 best_face_score = best_face_item[4]
                 best_face_crop_path = best_face_item[5]
 
-                # Delete the other unused crops in this window from disk
-                import os
+                # Delete the other unused crops in this window from MinIO
+                from app.modules.storage.minio_client import delete_object as minio_delete
                 for item in accum_list:
                     other_path = item[2]
                     other_face_path = item[5]
-                    
+
+                    # Extract object_name from the full MinIO path (bucket/object_name)
+                    def _extract_object_name(full_path: str) -> str:
+                        parts = full_path.split("/", 1)
+                        return parts[1] if len(parts) > 1 else full_path
+
                     try:
-                        if other_path and other_path != best_crop_path and os.path.exists(other_path):
-                            os.remove(other_path)
-                        if other_face_path and other_face_path != best_face_crop_path and os.path.exists(other_face_path):
-                            os.remove(other_face_path)
+                        if other_path and other_path != best_crop_path:
+                            obj_name = _extract_object_name(other_path)
+                            minio_delete(obj_name)
+                        if other_face_path and other_face_path != best_face_crop_path:
+                            obj_name = _extract_object_name(other_face_path)
+                            minio_delete(obj_name)
                     except Exception as e:
-                        logger.warning(f"Failed to remove unused crop: {e}")
+                        logger.warning(f"Failed to remove unused crop from MinIO: {e}")
 
                 accum_list.clear()
 
@@ -633,8 +637,7 @@ class CameraWorker:
         from app.core.db.models.event import Event, EventSeverity
         from app.core.db.models.billing import BillingInteraction
 
-        snapshot_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.SNAPSHOT_DIR}"
-        snapshot_path = save_image(frame, snapshot_dir, prefix=f"event_{self.camera_id}")
+        snapshot_path = save_image(frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}")
 
         for ev in rule_events:
             try:

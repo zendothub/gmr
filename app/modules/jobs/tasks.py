@@ -10,7 +10,7 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.analytics import DailyAnalyticsSummary
-from app.modules.storage.service import StorageService
+from app.modules.storage.service import cleanup_old_objects as s3_cleanup_old_objects
 from app.utils.time_utils import utc_now
 
 
@@ -152,7 +152,7 @@ async def cleanup_old_storage(retention_days: int = 30):
     older_than = utc_now() - timedelta(days=retention_days)
     async with AsyncSessionLocal() as db:
         try:
-            removed = await StorageService.cleanup_old_objects(db, older_than)
+            removed = await s3_cleanup_old_objects(db, older_than)
             await db.commit()
             logger.info(f"Storage cleanup job removed {removed} old objects")
         except Exception as e:

@@ -15,7 +15,7 @@ class TrackSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "track_sessions"
 
     camera_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("cameras.id"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True
     )
     local_track_id: Mapped[int] = mapped_column(Integer, nullable=False)
     person_identity_id: Mapped[Optional[uuid.UUID]] = mapped_column(

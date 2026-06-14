@@ -15,7 +15,7 @@ class BillingInteraction(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "billing_interactions"
 
     camera_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("cameras.id"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True
     )
     person_identity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("person_identities.id"), nullable=True, index=True
@@ -38,5 +38,5 @@ class BillingInteraction(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
-    camera: Mapped["Camera"] = relationship("Camera")
+    camera: Mapped["Camera"] = relationship("Camera", back_populates="billing_interactions")
     person_identity: Mapped[Optional["PersonIdentity"]] = relationship("PersonIdentity")

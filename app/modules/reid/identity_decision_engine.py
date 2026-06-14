@@ -299,14 +299,14 @@ class IdentityDecisionEngine:
                     existing_face.camera_id = camera_id
                     existing_face.captured_at = utc_now()
                     
-                    # Clean up old face crop if it changed
+                    # Clean up old face crop from MinIO if it changed
                     if old_path and old_path != face_crop_path:
-                        import os
+                        from app.modules.storage.minio_client import delete_object as minio_delete
                         try:
-                            if os.path.exists(old_path):
-                                os.remove(old_path)
+                            obj_name = old_path.split("/", 1)[1] if "/" in old_path else old_path
+                            minio_delete(obj_name)
                         except Exception as e:
-                            logger.warning(f"Failed to delete old face crop: {e}")
+                            logger.warning(f"Failed to delete old face crop from MinIO: {e}")
             else:
                 # Insert new face embedding
                 face_emb = PersonFaceEmbedding(
@@ -346,13 +346,13 @@ class IdentityDecisionEngine:
                     {"ids": ids_to_delete}
                 )
 
-                # Delete files from disk
-                import os
+                # Delete files from MinIO
+                from app.modules.storage.minio_client import delete_object as minio_delete
                 for path in paths_to_delete:
                     try:
-                        if os.path.exists(path):
-                            os.remove(path)
-                            logger.debug(f"Pruned crop file deleted: {path}")
+                        obj_name = path.split("/", 1)[1] if "/" in path else path
+                        minio_delete(obj_name)
+                        logger.debug(f"Pruned crop file deleted: {path}")
                     except Exception as e:
                         logger.warning(f"Failed to delete pruned crop file {path}: {e}")
         except Exception as e:
@@ -380,13 +380,13 @@ class IdentityDecisionEngine:
             )
             logger.info(f"Deleted temporary person identity from database: {person_id}")
 
-            # Delete files from disk
-            import os
+            # Delete files from MinIO
+            from app.modules.storage.minio_client import delete_object as minio_delete
             for path in set(paths):  # set to avoid duplicate removals
                 try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                        logger.debug(f"Temporary crop file deleted: {path}")
+                    obj_name = path.split("/", 1)[1] if "/" in path else path
+                    minio_delete(obj_name)
+                    logger.debug(f"Temporary crop file deleted: {path}")
                 except Exception as e:
                     logger.warning(f"Failed to delete temporary crop file {path}: {e}")
         except Exception as e:

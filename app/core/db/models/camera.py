@@ -78,9 +78,17 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     area: Mapped[Optional["Area"]] = relationship("Area", back_populates="cameras")
 
-    track_sessions: Mapped[List["TrackSession"]] = relationship("TrackSession", back_populates="camera")
+    track_sessions: Mapped[List["TrackSession"]] = relationship(
+        "TrackSession", back_populates="camera", passive_deletes=True
+    )
 
-    events: Mapped[List["Event"]] = relationship("Event", back_populates="camera")
+    events: Mapped[List["Event"]] = relationship(
+        "Event", back_populates="camera", passive_deletes=True
+    )
+
+    billing_interactions: Mapped[List["BillingInteraction"]] = relationship(
+        "BillingInteraction", back_populates="camera", passive_deletes=True
+    )
 
     # A camera can have MANY zones (each zone is bound on this camera's stream).
     zones: Mapped[List["Zone"]] = relationship(
