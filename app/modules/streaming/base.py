@@ -9,6 +9,7 @@ platform stays decoupled from the transport tool.
 from __future__ import annotations
 
 import abc
+import time as _time
 from dataclasses import dataclass
 
 
@@ -42,6 +43,21 @@ class StreamPublisher(abc.ABC):
     def is_alive(self) -> bool:
         """Return True while the publisher is actively running."""
         raise NotImplementedError
+
+    def wait_until_alive(self, timeout: float = 8.0) -> bool:
+        """Wait for the publisher to stabilize (produce output).
+
+        Default implementation polls is_alive() in a sleep loop. Concrete
+        publishers may override with transport-specific logic.
+
+        Returns True if the publisher is confirmed alive, False otherwise.
+        """
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if self.is_alive():
+                return True
+            _time.sleep(0.1)
+        return self.is_alive()
 
     @property
     def last_error(self) -> str | None:
