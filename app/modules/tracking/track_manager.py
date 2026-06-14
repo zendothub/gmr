@@ -113,13 +113,16 @@ class TrackManager:
 
         return track
 
-    def update_zones(self, track: ActiveTrack, zones_data: List[dict]):
+    def update_zones(self, track: ActiveTrack, zones_data: List[dict],
+                     frame_width: int = 1920, frame_height: int = 1080):
         """
         Update which zones a track is currently in.
 
         Args:
             track: The active track
             zones_data: List of zone dicts with id, polygon, zone_type, etc.
+            frame_width: Frame width in pixels (for normalizing bbox coords to [0-1])
+            frame_height: Frame height in pixels (for normalizing bbox coords to [0-1])
         """
         now = utc_now()
         if not track.bbox:
@@ -127,13 +130,15 @@ class TrackManager:
 
         from app.utils.geometry import bbox_bottom_center
         center = bbox_bottom_center(track.bbox)
+        # Normalize to [0-1] range to match stored polygon coordinates
+        norm_center = (center[0] / frame_width, center[1] / frame_height)
         current_zone_ids = set()
 
         for zone in zones_data:
             zone_id = str(zone["id"])
             poly_points = polygon_from_json(zone.get("polygon"))
 
-            if poly_points and point_in_polygon(center, poly_points):
+            if poly_points and point_in_polygon(norm_center, poly_points):
                 current_zone_ids.add(zone_id)
 
                 # Track zone entry time

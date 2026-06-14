@@ -236,6 +236,7 @@ class CameraWorker:
         # 2) Update in-memory track state and zones; collect pending DB work
         #    (Cameras are static — no ROI filtering needed; detection runs on full frame)
         now_mono = time.monotonic()
+        height, width = frame.shape[:2]
         active_tracks: List[ActiveTrack] = []
         new_tracks: List[ActiveTrack] = []
         reid_tracks: List[ActiveTrack] = []
@@ -243,7 +244,7 @@ class CameraWorker:
 
         for td in tracked_detections:
             track = self.track_manager.update_track(td.track_id, td.bbox, td.confidence)
-            self.track_manager.update_zones(track, self.zones)
+            self.track_manager.update_zones(track, self.zones, width, height)
             active_tracks.append(track)
 
             if track.track_session_id is None:
@@ -275,7 +276,8 @@ class CameraWorker:
 
         # 5) Rule evaluation (pure in-memory; no DB)
         rule_events = self.rule_evaluator.evaluate(
-            self.camera_id, active_tracks, camera_role=self.camera_role
+            self.camera_id, active_tracks, camera_role=self.camera_role,
+            frame_width=width, frame_height=height,
         )
 
         # 6) Stale tracks (in-memory removal; sessions closed in the same batch)

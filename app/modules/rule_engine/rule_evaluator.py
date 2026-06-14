@@ -75,7 +75,8 @@ class RuleEvaluator:
         if removed:
             logger.debug(f"Cooldown tracker pruned: removed {removed} expired entries")
 
-    def evaluate(self, camera_id: uuid.UUID, tracks: List[ActiveTrack], camera_role: str = "general") -> List[RuleEvent]:
+    def evaluate(self, camera_id: uuid.UUID, tracks: List[ActiveTrack], camera_role: str = "general",
+                 frame_width: int = 1920, frame_height: int = 1080) -> List[RuleEvent]:
         """Evaluate all applicable rules against current tracks."""
         self._prune_cooldowns()
         events = []
@@ -88,7 +89,8 @@ class RuleEvaluator:
             rule_type = rule["rule_type"]
             for track in tracks:
                 try:
-                    event = self._evaluate_single(rule, track, camera_id, camera_role)
+                    event = self._evaluate_single(rule, track, camera_id, camera_role,
+                                                   frame_width, frame_height)
                     if event:
                         # Check cooldown
                         cooldown_key = f"{rule['id']}:{track.local_track_id}"
@@ -102,12 +104,13 @@ class RuleEvaluator:
 
         return events
 
-    def _evaluate_single(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID, camera_role: str) -> Optional[RuleEvent]:
+    def _evaluate_single(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID, camera_role: str,
+                         frame_width: int = 1920, frame_height: int = 1080) -> Optional[RuleEvent]:
         """Evaluate a single rule against a single track."""
         rule_type = rule["rule_type"]
 
         if rule_type == "line_crossing":
-            return self._eval_line_crossing(rule, track, camera_id)
+            return self._eval_line_crossing(rule, track, camera_id, frame_width, frame_height)
         elif rule_type == "zone_dwell":
             return self._eval_zone_dwell(rule, track, camera_id)
         elif rule_type == "billing_interaction":
@@ -120,7 +123,8 @@ class RuleEvaluator:
             return self._eval_restricted_zone(rule, track, camera_id)
         return None
 
-    def _eval_line_crossing(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID) -> Optional[RuleEvent]:
+    def _eval_line_crossing(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID,
+                            frame_width: int = 1920, frame_height: int = 1080) -> Optional[RuleEvent]:
         zone_id = rule.get("zone_id")
         if not zone_id or not track.prev_bbox or not track.bbox:
             return None
@@ -132,7 +136,10 @@ class RuleEvaluator:
             return None
         prev_center = bbox_bottom_center(track.prev_bbox)
         curr_center = bbox_bottom_center(track.bbox)
-        direction = line_crossing_check(prev_center, curr_center, line[0], line[1])
+        # Normalize to [0-1] range to match stored line coordinates
+        prev_norm = (prev_center[0] / frame_width, prev_center[1] / frame_height)
+        curr_norm = (curr_center[0] / frame_width, curr_center[1] / frame_height)
+        direction = line_crossing_check(prev_norm, curr_norm, line[0], line[1])
         if direction:
             return RuleEvent(
                 rule_id=uuid.UUID(rule["id"]), rule_type="line_crossing", camera_id=camera_id,
