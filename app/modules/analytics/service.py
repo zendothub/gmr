@@ -249,7 +249,7 @@ class AnalyticsService:
 
         Returns:
         - unique_persons: count of distinct person_identity_id in track sessions
-        - total_entries: total track sessions (may include duplicate persons)
+        - total_entries: count of line_crossing events (true footfall, excludes false positives)
         - total_purchases: count of billing interactions
         - demographics: age-group and gender breakdown from PersonIdentity
         """
@@ -265,13 +265,15 @@ class AnalyticsService:
             unique_q = unique_q.where(TrackSession.camera_id == camera_id)
         unique_persons = (await db.execute(unique_q)).scalar() or 0
 
-        # --- Total entries (all track sessions regardless of person identity) ---
-        entries_q = select(func.count(TrackSession.id)).where(
-            TrackSession.started_at >= start,
-            TrackSession.started_at <= end,
+        # --- Total entries (line_crossing events — true footfall count) ---
+        entries_q = select(func.count(Event.id)).where(
+            Event.event_type == "line_crossing",
+            Event.occurred_at >= start,
+            Event.occurred_at <= end,
+            Event.is_false_positive.is_(False),
         )
         if camera_id:
-            entries_q = entries_q.where(TrackSession.camera_id == camera_id)
+            entries_q = entries_q.where(Event.camera_id == camera_id)
         total_entries = (await db.execute(entries_q)).scalar() or 0
 
         # --- Total purchases (billing interactions) ---
