@@ -44,7 +44,6 @@ class CameraWorker:
         self.settings = get_settings()
         self.camera_config = camera_config
         self.camera_id: uuid.UUID = camera_config["id"]
-        self.camera_role: str = camera_config.get("role", "general")
         self.fps_target: int = max(1, int(camera_config.get("fps_target") or self.settings.DEFAULT_FPS_TARGET))
         self.reid_enabled: bool = bool(camera_config.get("reid_enabled", True))
         self.demographic_enabled: bool = bool(camera_config.get("demographic_enabled", False))
@@ -276,7 +275,7 @@ class CameraWorker:
 
         # 5) Rule evaluation (pure in-memory; no DB)
         rule_events = self.rule_evaluator.evaluate(
-            self.camera_id, active_tracks, camera_role=self.camera_role,
+            self.camera_id, active_tracks,
             frame_width=width, frame_height=height,
         )
 

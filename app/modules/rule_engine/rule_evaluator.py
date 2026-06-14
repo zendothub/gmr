@@ -75,7 +75,7 @@ class RuleEvaluator:
         if removed:
             logger.debug(f"Cooldown tracker pruned: removed {removed} expired entries")
 
-    def evaluate(self, camera_id: uuid.UUID, tracks: List[ActiveTrack], camera_role: str = "general",
+    def evaluate(self, camera_id: uuid.UUID, tracks: List[ActiveTrack],
                  frame_width: int = 1920, frame_height: int = 1080) -> List[RuleEvent]:
         """Evaluate all applicable rules against current tracks."""
         self._prune_cooldowns()
@@ -89,7 +89,7 @@ class RuleEvaluator:
             rule_type = rule["rule_type"]
             for track in tracks:
                 try:
-                    event = self._evaluate_single(rule, track, camera_id, camera_role,
+                    event = self._evaluate_single(rule, track, camera_id,
                                                    frame_width, frame_height)
                     if event:
                         # Check cooldown
@@ -104,7 +104,7 @@ class RuleEvaluator:
 
         return events
 
-    def _evaluate_single(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID, camera_role: str,
+    def _evaluate_single(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID,
                          frame_width: int = 1920, frame_height: int = 1080) -> Optional[RuleEvent]:
         """Evaluate a single rule against a single track."""
         rule_type = rule["rule_type"]
@@ -114,7 +114,7 @@ class RuleEvaluator:
         elif rule_type == "zone_dwell":
             return self._eval_zone_dwell(rule, track, camera_id)
         elif rule_type == "billing_interaction":
-            return self._eval_billing_interaction(rule, track, camera_id, camera_role)
+            return self._eval_billing_interaction(rule, track, camera_id)
         elif rule_type == "queue_count":
             return self._eval_queue_count(rule, track, camera_id)
         elif rule_type == "possible_purchase":
@@ -168,9 +168,9 @@ class RuleEvaluator:
             )
         return None
 
-    def _eval_billing_interaction(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID, camera_role: str) -> Optional[RuleEvent]:
+    def _eval_billing_interaction(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID) -> Optional[RuleEvent]:
         zone_id = rule.get("zone_id")
-        if not zone_id or camera_role != "billing_counter":
+        if not zone_id:
             return None
         if str(zone_id) in track.current_zones:
             dwell = track.dwell_seconds.get(str(zone_id), 0)
