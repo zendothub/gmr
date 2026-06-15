@@ -44,12 +44,16 @@ services:
     container_name: retail_ai_mediamtx
     environment:
       MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
-      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.123,127.0.0.1
+      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.123,127.0.0.1,
       MTX_RTSPTIMEOUT: 1h                    # Keep path alive 1 hour with zero readers (Go duration format)
       MTX_READTIMEOUT: 24h                   # TCP read timeout: 24h (Go duration format, must include unit)
       MTX_RUNONREADY: ""
       MTX_RUNONREADYRESTART: "yes"
       MTX_RUNONDEMAND: ""
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_ORIGIN: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_METHODS: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_HEADERS: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_CREDENTIALS: "true"
     ports:
       - "8554:8554"      # RTSP (ingest + playback)
       - "8889:8889"      # WebRTC / WHEP (TCP signaling)
