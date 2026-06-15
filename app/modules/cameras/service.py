@@ -182,10 +182,46 @@ class CameraService:
         return camera
 
     @staticmethod
+    async def _teardown_resources(camera_id: UUID) -> None:
+        """Stop the camera worker and stream publisher (ffmpeg + watchdog).
+
+        Best-effort: failures are logged as warnings but never raised so
+        callers (stop_camera, delete_camera) can continue with their own
+        cleanup (status update / DB delete).
+        """
+        # Stop camera worker (AI processing).
+        try:
+            from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
+            supervisor = WorkerSupervisor.get_instance()
+            if supervisor:
+                await supervisor.stop_camera(camera_id)
+        except Exception as e:
+            logger.warning(f"Could not stop camera worker: {e}")
+
+        # Stop MediaMTX stream publisher (force-stop releases WHEP path +
+        # terminates ffmpeg subprocess + allows watchdog to exit).
+        try:
+            manager = StreamManager.get_instance()
+            manager.stop_stream(camera_id)
+            logger.info(f"Stream publisher stopped for camera {camera_id}")
+        except Exception as e:
+            logger.warning(f"Could not stop stream publisher: {e}")
+
+    @staticmethod
     async def delete_camera(db: AsyncSession, camera_id: UUID) -> dict:
-        """Delete a camera."""
+        """Delete a camera.
+
+        Stops the camera worker + stream publisher (ffmpeg + watchdog) first,
+        then removes the database row.
+        """
         camera = await CameraService.get_camera(db, camera_id)
+
+        # Tear down worker and stream publisher so no orphaned subprocesses
+        # or watchdog threads linger after the DB row is gone.
+        await CameraService._teardown_resources(camera_id)
+
         await db.delete(camera)
+        await db.flush()
         logger.info(f"Camera deleted: {camera.name} (id={camera_id})")
         return {"message": f"Camera '{camera.name}' deleted successfully"}
 
@@ -228,22 +264,7 @@ class CameraService:
         await db.flush()
         await db.refresh(camera)
 
-        # Stop camera worker
-        try:
-            from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
-            supervisor = WorkerSupervisor.get_instance()
-            if supervisor:
-                await supervisor.stop_camera(camera_id)
-        except Exception as e:
-            logger.warning(f"Could not stop camera worker: {e}")
-
-        # Stop MediaMTX stream publisher (force-stop so the WHEP path is released).
-        try:
-            manager = StreamManager.get_instance()
-            manager.stop_stream(camera_id)
-            logger.info(f"Stream publisher stopped for camera {camera_id}")
-        except Exception as e:
-            logger.warning(f"Could not stop stream publisher: {e}")
+        await CameraService._teardown_resources(camera_id)
 
         logger.info(f"Camera stopped: {camera.name}")
         return camera
