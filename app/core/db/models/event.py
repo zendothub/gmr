@@ -23,7 +23,7 @@ class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "events"
 
     camera_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("cameras.id"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True
     )
     rule_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("rules.id"), nullable=True

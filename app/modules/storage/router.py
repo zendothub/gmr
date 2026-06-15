@@ -1,16 +1,18 @@
-"""Storage API routes - browse and download stored media."""
+"""Storage API routes — browse and download stored media.
 
-import os
+Now routes through MinIO (when configured) or local filesystem (fallback).
+"""
+
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
-from app.modules.storage.service import StorageService
+from app.modules.storage import service as storage_svc
 
 router = APIRouter(prefix="/api/storage", tags=["Storage"])
 
@@ -25,8 +27,8 @@ async def list_storage_objects(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List stored media objects."""
-    items, total = await StorageService.list_objects(
+    """List stored media objects (metadata from Postgres, blobs in MinIO/local)."""
+    items, total = await storage_svc.list_objects(
         db,
         storage_type=storage_type,
         camera_id=camera_id,
@@ -61,12 +63,5 @@ async def download_storage_object(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Download a stored media file."""
-    obj = await StorageService.get_object(db, object_id)
-    if not os.path.exists(obj.file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk")
-    return FileResponse(
-        path=obj.file_path,
-        filename=obj.file_name,
-        media_type=obj.mime_type or "application/octet-stream",
-    )
+    """Download a stored media file (streamed from MinIO or local disk)."""
+    return await storage_svc.stream_object_response(db, object_id)

@@ -1,4 +1,24 @@
 services:
+  # MinIO — S3-compatible object storage for snapshots, crops, clips, reports.
+  minio:
+    image: minio/minio:latest
+    container_name: retail_ai_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console (http://localhost:9001)
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: retail_ai_postgres
@@ -23,13 +43,23 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: retail_ai_mediamtx
     environment:
-      MTX_PROTOCOLS: tcp
-      MTX_WEBRTCADDITIONALHOSTS: 127.0.0.1
+      MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
+      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.123,127.0.0.1,
+      MTX_RTSPTIMEOUT: 1h                    # Keep path alive 1 hour with zero readers (Go duration format)
+      MTX_READTIMEOUT: 24h                   # TCP read timeout: 24h (Go duration format, must include unit)
+      MTX_RUNONREADY: ""
+      MTX_RUNONREADYRESTART: "yes"
+      MTX_RUNONDEMAND: ""
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_ORIGIN: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_METHODS: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_HEADERS: "*"
+      MTX_HEADERS_ACCESS_CONTROL_ALLOW_CREDENTIALS: "true"
     ports:
-      - "8554:8554"   # RTSP (ingest + playback)
-      - "8889:8889"   # WebRTC / WHEP
-      - "8888:8888"   # HLS
-      - "9997:9997"   # API
+      - "8554:8554"      # RTSP (ingest + playback)
+      - "8889:8889"      # WebRTC / WHEP (TCP signaling)
+      - "8189:8189/udp"  # WebRTC / ICE (UDP media transport)
+      - "8888:8888"      # HLS
+      - "9997:9997"      # API
     restart: unless-stopped
 
   app:
@@ -49,10 +79,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./storage:/app/storage
       - ./models:/app/models
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
       mediamtx:
         condition: service_started
@@ -60,4 +91,4 @@ services:
 
 volumes:
   pgdata:
-
+  minio_data:

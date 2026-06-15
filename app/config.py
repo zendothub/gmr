@@ -21,8 +21,13 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://retail_user:retail_pass@localhost:5433/retail_ai_db"
     DATABASE_SYNC_URL: str = "postgresql://retail_user:retail_pass@localhost:5433/retail_ai_db"
 
-    # Storage
-    STORAGE_ROOT: str = "/app/storage"
+    # Storage — MinIO (S3-compatible object storage)
+    MINIO_ENDPOINT: str = "minio:9000"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin"
+    MINIO_SECURE: bool = False
+    MINIO_BUCKET_PREFIX: str = "retail"
+    # Object-name prefixes for categorising blobs inside the bucket.
     SNAPSHOT_DIR: str = "snapshots"
     CROP_DIR: str = "crops"
     CLIP_DIR: str = "clips"
@@ -74,7 +79,7 @@ class Settings(BaseSettings):
     MEDIAMTX_PUBLIC_URL: str = ""
     # Transcode preset for the republish step. "copy" = no re-encode (cheapest,
     # requires H.264). Use "lowlatency" to re-encode for browser-friendly output.
-    STREAM_PUBLISH_MODE: str = "copy"  # copy | lowlatency
+    STREAM_PUBLISH_MODE: str = "lowlatency"  # copy | lowlatency
     # Auto-stop a published stream after this many seconds with no viewers.
     STREAM_IDLE_TIMEOUT_SECONDS: int = 120
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.

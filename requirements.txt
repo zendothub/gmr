@@ -33,6 +33,9 @@ lapx
 # Background Jobs
 apscheduler==3.10.4
 
+# Object Storage
+minio==7.2.10
+
 # Utilities
 python-dotenv==1.0.1
 aiofiles==24.1.0

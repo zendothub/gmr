@@ -18,53 +18,43 @@ class RTSPTestResponse(BaseModel):
 
 
 class CameraCreate(BaseModel):
-    # Initial add form: name + rtsp_url + area (dropdown). Nothing else.
-    # All AI-config fields use model defaults and run internally.
+    """Minimal camera add form for Apollo Pharmacy.
+
+    Only name, rtsp_url, and area (dropdown) are sent by the frontend.
+    AI-config fields (fps_target, resolution, detection_model, reid_enabled,
+    demographic_enabled, frame_rotation, location_description) are never
+    exposed — the backend applies model defaults internally.
+
+    A camera has NO role/type — roles belong at the ZONE level because one
+    camera may cover multiple zones (entry, exit, billing, pickup, ...).
+    """
     name: str = Field(..., min_length=1, max_length=255)
     rtsp_url: str
-    store_id: UUID
-    role: str = "general"
-    fps_target: int = Field(default=5, ge=1, le=30)
-    resolution: Optional[str] = "1920x1080"
-    detection_model: str = "yolov8n"
-    reid_enabled: bool = True
-    demographic_enabled: bool = False
-    frame_rotation: Optional[int] = Field(default=None, ge=0, le=270)  # None, 90, 180, 270
-    location_description: Optional[str] = None
-    area_id: Optional[UUID] = Field(None, description="Area chosen from dropdown")
-    # Internal flag: skip the (slow) RTSP probe when the stream is offline at add time.
-    skip_rtsp_test: bool = Field(default=False, description="Skip RTSP connectivity probe")
+    area_id: Optional[UUID] = Field(None, description="Area chosen from dropdown (Entry, Exit, Billing, Medicine Pickup, ...)")
+    skip_rtsp_test: bool = Field(default=False, description="Skip the RTSP connectivity probe (use when camera is offline)")
 
 
 
 class CameraUpdate(BaseModel):
+    """Editable camera fields — AI config is internal-only."""
     name: Optional[str] = None
     rtsp_url: Optional[str] = None
-    role: Optional[str] = None
-    fps_target: Optional[int] = Field(default=None, ge=1, le=30)
-    resolution: Optional[str] = None
-    detection_model: Optional[str] = None
-    reid_enabled: Optional[bool] = None
-    demographic_enabled: Optional[bool] = None
-    frame_rotation: Optional[int] = Field(default=None, ge=0, le=270)
-    location_description: Optional[str] = None
-    is_active: Optional[bool] = None
     area_id: Optional[UUID] = None
+    is_active: Optional[bool] = None
 
 
 class CameraResponse(BaseModel):
+    """Public camera response — only essential fields.
+
+    AI-config fields (fps_target, resolution, detection_model, reid_enabled,
+    demographic_enabled, frame_rotation, location_description) are internal-only
+    and NOT exposed to the frontend.
+    """
     id: UUID
     name: str
     rtsp_url: str
     area_id: Optional[UUID] = None
     status: str
-    fps_target: int
-    resolution: Optional[str]
-    detection_model: str
-    reid_enabled: bool
-    demographic_enabled: bool
-    frame_rotation: Optional[int]
-    location_description: Optional[str]
     is_active: bool
     # MediaMTX path the backend republishes the feed into.
     stream_path: Optional[str] = None

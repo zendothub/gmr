@@ -3,6 +3,16 @@
 A zone is bound on a specific camera's stream: the operator views the live
 stream, selects polygon points, names the zone and picks a zone type. One
 camera can have many zones.
+
+Zone naming convention (Apollo Pharmacy):
+  - entry_line       → "Main Entry Door", "Side Entry"
+  - exit_line        → "Main Exit", "Back Exit"
+  - billing_zone     → "Counter 1", "Billing Counter"
+  - medicine_pickup_zone → "Dispensing Counter", "Medicine Pickup Point"
+  - restricted_zone  → "Staff Only Area", "Back Store"
+  - queue_zone       → "Billing Queue", "Pickup Queue"
+  - product_zone     → "OTC Shelf Aisle 1", "Prescription Rack"
+  - ignore_zone      → "Window Glare", "Decorative Area"
 """
 
 from typing import Optional, Dict, Any
@@ -16,6 +26,7 @@ class ZoneCreate(BaseModel):
     zone_type: str = Field(
         ...,
         description=(
+            "Zone type for Apollo Pharmacy analytics: "
             "entry_line, exit_line, billing_zone, queue_zone, product_zone, "
             "ignore_zone, restricted_zone, medicine_pickup_zone"
         ),

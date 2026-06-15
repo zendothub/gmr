@@ -1,6 +1,6 @@
 """Image utility functions for crop extraction and frame processing."""
 
-import os
+import io
 import uuid
 from datetime import datetime
 from typing import Optional, Tuple
@@ -51,30 +51,30 @@ def resize_crop(crop: np.ndarray, target_size: Tuple[int, int] = (128, 256)) -> 
 
 def save_image(image: np.ndarray, directory: str, prefix: str = "img") -> Optional[str]:
     """
-    Save an image to disk.
+    Encode image to JPEG bytes and upload to MinIO.
 
     Args:
         image: numpy array image
-        directory: Target directory
+        directory: MinIO object-name prefix (e.g. "crops", "snapshots")
         prefix: Filename prefix
 
     Returns:
-        Full file path, or None on failure
+        MinIO object key on success, or None on failure.
     """
     try:
-        settings = get_settings()
-        full_dir = os.path.join(settings.STORAGE_ROOT, directory)
-        os.makedirs(full_dir, exist_ok=True)
+        from app.modules.storage.minio_client import upload_image
 
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{prefix}_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
-        filepath = os.path.join(full_dir, filename)
+        object_name = f"{directory}/{prefix}_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
 
-        cv2.imwrite(filepath, image, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        logger.debug(f"Image saved: {filepath}")
-        return filepath
+        result = upload_image(image, object_name)
+        if result is None:
+            logger.error(f"MinIO upload failed for object_name={object_name}")
+            return None
+        logger.debug(f"Image uploaded to MinIO: {result}")
+        return result
     except Exception as e:
-        logger.error(f"Failed to save image: {e}")
+        logger.error(f"Failed to upload image: {e}")
         return None
 
 

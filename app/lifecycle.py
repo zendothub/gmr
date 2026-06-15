@@ -1,6 +1,5 @@
 """Application lifecycle management - startup and shutdown events."""
 
-import os
 from contextlib import asynccontextmanager
 from loguru import logger
 
@@ -17,16 +16,14 @@ async def lifespan(app: FastAPI):
     # --- STARTUP ---
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
 
-    # Create storage directories
-    storage_dirs = [
-        os.path.join(settings.STORAGE_ROOT, settings.SNAPSHOT_DIR),
-        os.path.join(settings.STORAGE_ROOT, settings.CROP_DIR),
-        os.path.join(settings.STORAGE_ROOT, settings.CLIP_DIR),
-        os.path.join(settings.STORAGE_ROOT, settings.REPORT_DIR),
-    ]
-    for d in storage_dirs:
-        os.makedirs(d, exist_ok=True)
-        logger.info(f"Storage directory ensured: {d}")
+    # Initialize MinIO bucket
+    try:
+        from app.modules.storage.minio_client import get_client
+        get_client()  # _ensure_bucket() is called implicitly
+        logger.info(f"MinIO bucket '{settings.MINIO_BUCKET_PREFIX}' ready")
+    except Exception as e:
+        logger.error(f"Failed to initialize MinIO: {e}")
+        raise
 
     # Start background job scheduler
     try:

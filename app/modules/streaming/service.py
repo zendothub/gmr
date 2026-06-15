@@ -27,14 +27,16 @@ class StreamingService:
         return camera
 
     @staticmethod
-    async def start_stream(db: AsyncSession, camera_id: UUID) -> StreamEndpointsResponse:
+    async def start_stream(
+        db: AsyncSession, camera_id: UUID, public_host: str | None = None,
+    ) -> StreamEndpointsResponse:
         """Start (or attach a viewer to) the live preview for a camera."""
         camera = await StreamingService._get_camera(db, camera_id)
         manager = StreamManager.get_instance()
         # run the (blocking) ffmpeg spawn off the event loop
         import anyio
         endpoints = await anyio.to_thread.run_sync(
-            manager.add_viewer, camera.id, camera.rtsp_url
+            manager.add_viewer, camera.id, camera.rtsp_url, None, public_host,
         )
         return StreamEndpointsResponse(
             camera_id=camera.id,
@@ -56,11 +58,13 @@ class StreamingService:
         return {"message": "Viewer removed; stream will stop when idle"}
 
     @staticmethod
-    async def get_status(db: AsyncSession, camera_id: UUID) -> StreamStatusResponse:
+    async def get_status(
+        db: AsyncSession, camera_id: UUID, public_host: str | None = None,
+    ) -> StreamStatusResponse:
         """Get live publish status; reflects endpoints even when not yet started."""
         camera = await StreamingService._get_camera(db, camera_id)
         manager = StreamManager.get_instance()
-        status = manager.get_status(camera_id)
+        status = manager.get_status(camera_id, public_host=public_host)
         if status:
             ep = status["endpoints"]
             return StreamStatusResponse(
@@ -74,7 +78,7 @@ class StreamingService:
                 rtsp_url=ep["rtsp_url"],
             )
         # Not running yet - still surface the URLs it WILL have.
-        endpoints = MediaMTXManager().endpoints(camera.id)
+        endpoints = MediaMTXManager().endpoints(camera.id, public_host=public_host)
         return StreamStatusResponse(
             camera_id=camera.id,
             is_publishing=False,

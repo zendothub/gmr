@@ -28,7 +28,6 @@ from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
-from app.modules.rule_engine.camera_view_engine import CameraViewEngine
 from app.utils.image_utils import extract_crop, save_image
 
 from app.utils.time_utils import utc_now
@@ -45,7 +44,6 @@ class CameraWorker:
         self.settings = get_settings()
         self.camera_config = camera_config
         self.camera_id: uuid.UUID = camera_config["id"]
-        self.camera_role: str = camera_config.get("role", "general")
         self.fps_target: int = max(1, int(camera_config.get("fps_target") or self.settings.DEFAULT_FPS_TARGET))
         self.reid_enabled: bool = bool(camera_config.get("reid_enabled", True))
         self.demographic_enabled: bool = bool(camera_config.get("demographic_enabled", False))
@@ -71,6 +69,9 @@ class CameraWorker:
         self.zones: List[dict] = []
 
         self.apply_runtime_config(runtime_config)
+
+        # view_engine placeholder — cameras are static, no ROI filtering needed.
+        self.view_engine = None
 
         # Observation sampling state: local_track_id -> last sample monotonic time
         self._last_obs_time: Dict[int, float] = {}
@@ -231,15 +232,10 @@ class CameraWorker:
         # 1) Unified YOLO Detection & Tracking on the shared inference pool
         tracked_detections = await run_inference(self.detector.track, frame)
 
-        # 2) Camera-view (ROI) filter: only accept tracks whose center
-        #    point is inside an active camera view (ignore_area excluded).
-        tracked_detections = [
-            td for td in tracked_detections 
-            if self.view_engine.is_detection_in_view(self._det_bbox(td))
-        ]
-
-        # 3) Update in-memory track state and zones; collect pending DB work
+        # 2) Update in-memory track state and zones; collect pending DB work
+        #    (Cameras are static — no ROI filtering needed; detection runs on full frame)
         now_mono = time.monotonic()
+        height, width = frame.shape[:2]
         active_tracks: List[ActiveTrack] = []
         new_tracks: List[ActiveTrack] = []
         reid_tracks: List[ActiveTrack] = []
@@ -247,7 +243,7 @@ class CameraWorker:
 
         for td in tracked_detections:
             track = self.track_manager.update_track(td.track_id, td.bbox, td.confidence)
-            self.track_manager.update_zones(track, self.zones)
+            self.track_manager.update_zones(track, self.zones, width, height)
             active_tracks.append(track)
 
             if track.track_session_id is None:
@@ -279,7 +275,8 @@ class CameraWorker:
 
         # 5) Rule evaluation (pure in-memory; no DB)
         rule_events = self.rule_evaluator.evaluate(
-            self.camera_id, active_tracks, camera_role=self.camera_role
+            self.camera_id, active_tracks,
+            frame_width=width, frame_height=height,
         )
 
         # 6) Stale tracks (in-memory removal; sessions closed in the same batch)
@@ -349,8 +346,7 @@ class CameraWorker:
         crop_path = None
         crop = extract_crop(frame, track.bbox)
         if crop is not None and crop.size > 0:
-            crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-            crop_path = save_image(crop, crop_dir, prefix=f"crop_{self.camera_id}")
+            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
             track.best_crop_path = crop_path
             # Initial quality is 0, will be overwritten if ReID runs
 
@@ -501,8 +497,7 @@ class CameraWorker:
                 return
 
             # Save crop for audit / debugging
-            crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-            crop_path = save_image(crop, crop_dir, prefix=f"crop_{self.camera_id}")
+            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
 
             if quality > track.best_crop_quality:
                 track.best_crop_quality = quality
@@ -522,8 +517,7 @@ class CameraWorker:
                     
                     if face_result.face_crop is not None:
                         # Save face crop
-                        face_crop_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.CROP_DIR}"
-                        face_crop_path = save_image(face_result.face_crop, face_crop_dir, prefix=f"face_{self.camera_id}")
+                        face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
 
                     # Keep the best face score demographics for display and TrackSession updating
                     if (track.best_demographics is None or 
@@ -560,19 +554,26 @@ class CameraWorker:
                 best_face_score = best_face_item[4]
                 best_face_crop_path = best_face_item[5]
 
-                # Delete the other unused crops in this window from disk
-                import os
+                # Delete the other unused crops in this window from MinIO
+                from app.modules.storage.minio_client import delete_object as minio_delete
                 for item in accum_list:
                     other_path = item[2]
                     other_face_path = item[5]
-                    
+
+                    # Extract object_name from the full MinIO path (bucket/object_name)
+                    def _extract_object_name(full_path: str) -> str:
+                        parts = full_path.split("/", 1)
+                        return parts[1] if len(parts) > 1 else full_path
+
                     try:
-                        if other_path and other_path != best_crop_path and os.path.exists(other_path):
-                            os.remove(other_path)
-                        if other_face_path and other_face_path != best_face_crop_path and os.path.exists(other_face_path):
-                            os.remove(other_face_path)
+                        if other_path and other_path != best_crop_path:
+                            obj_name = _extract_object_name(other_path)
+                            minio_delete(obj_name)
+                        if other_face_path and other_face_path != best_face_crop_path:
+                            obj_name = _extract_object_name(other_face_path)
+                            minio_delete(obj_name)
                     except Exception as e:
-                        logger.warning(f"Failed to remove unused crop: {e}")
+                        logger.warning(f"Failed to remove unused crop from MinIO: {e}")
 
                 accum_list.clear()
 
@@ -637,8 +638,7 @@ class CameraWorker:
         from app.core.db.models.event import Event, EventSeverity
         from app.core.db.models.billing import BillingInteraction
 
-        snapshot_dir = f"{self.settings.STORAGE_ROOT}/{self.settings.SNAPSHOT_DIR}"
-        snapshot_path = save_image(frame, snapshot_dir, prefix=f"event_{self.camera_id}")
+        snapshot_path = save_image(frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}")
 
         for ev in rule_events:
             try:

@@ -15,6 +15,7 @@ from app.modules.analytics.schemas import (
     DwellAnalyticsResponse,
     ZoneOccupancyResponse,
     PersonJourneyResponse,
+    DashboardSummaryResponse,
 )
 from app.modules.analytics.service import AnalyticsService
 
@@ -68,6 +69,27 @@ async def zone_occupancy_analytics(
 ):
     """Get per-zone event activity."""
     return await AnalyticsService.get_zone_occupancy(db, start_time, end_time)
+
+
+@router.get("/summary", response_model=DashboardSummaryResponse)
+async def dashboard_summary(
+    start_time: Optional[datetime] = Query(None, description="Range start (default: 24h ago)"),
+    end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
+    camera_id: Optional[UUID] = Query(None, description="Optional camera filter"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Unified dashboard summary for a given datetime range.
+
+    Returns:
+    - unique_persons: count of distinct persons detected
+    - total_entries: total track sessions including duplicates
+    - total_purchases: count of billing interactions
+    - demographics: age-group (children, teenager, adult, senior citizen)
+                    and gender (male, female) breakdown
+    """
+    return await AnalyticsService.get_dashboard_summary(db, start_time, end_time, camera_id)
 
 
 @router.get("/person-journey/{person_id}", response_model=PersonJourneyResponse)

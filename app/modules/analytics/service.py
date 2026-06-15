@@ -23,6 +23,8 @@ from app.modules.analytics.schemas import (
     ZoneOccupancyResponse,
     JourneyStep,
     PersonJourneyResponse,
+    DemographicsBreakdown,
+    DashboardSummaryResponse,
 )
 from app.utils.time_utils import utc_now
 
@@ -233,6 +235,120 @@ class AnalyticsService:
                 )
                 for r in rows
             ],
+        )
+
+    @staticmethod
+    async def get_dashboard_summary(
+        db: AsyncSession,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        camera_id: Optional[UUID] = None,
+    ) -> DashboardSummaryResponse:
+        """
+        Unified dashboard summary within a datetime range.
+
+        Returns:
+        - unique_persons: count of distinct person_identity_id in track sessions
+        - total_entries: count of line_crossing events (true footfall, excludes false positives)
+        - total_purchases: count of billing interactions
+        - demographics: age-group and gender breakdown from PersonIdentity
+        """
+        start, end = _default_range(start_time, end_time)
+
+        # --- Unique persons (distinct person_identity_id in TrackSession) ---
+        unique_q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
+            TrackSession.started_at >= start,
+            TrackSession.started_at <= end,
+            TrackSession.person_identity_id.isnot(None),
+        )
+        if camera_id:
+            unique_q = unique_q.where(TrackSession.camera_id == camera_id)
+        unique_persons = (await db.execute(unique_q)).scalar() or 0
+
+        # --- Total entries (line_crossing events — true footfall count) ---
+        entries_q = select(func.count(Event.id)).where(
+            Event.event_type == "line_crossing",
+            Event.occurred_at >= start,
+            Event.occurred_at <= end,
+            Event.is_false_positive.is_(False),
+        )
+        if camera_id:
+            entries_q = entries_q.where(Event.camera_id == camera_id)
+        total_entries = (await db.execute(entries_q)).scalar() or 0
+
+        # --- Total purchases (billing interactions) ---
+        purchases_q = select(func.count(BillingInteraction.id)).where(
+            BillingInteraction.entered_at >= start,
+            BillingInteraction.entered_at <= end,
+        )
+        if camera_id:
+            purchases_q = purchases_q.where(BillingInteraction.camera_id == camera_id)
+        total_purchases = (await db.execute(purchases_q)).scalar() or 0
+
+        # --- Demographics: age-group & gender counts from PersonIdentity ---
+        # We get distinct person_identity_ids seen in TrackSessions within the range,
+        # then join to PersonIdentity to aggregate their demographic fields.
+        distinct_persons_subq = (
+            select(TrackSession.person_identity_id)
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
+            )
+            .distinct()
+        )
+        if camera_id:
+            distinct_persons_subq = distinct_persons_subq.where(
+                TrackSession.camera_id == camera_id
+            )
+        distinct_persons_subq = distinct_persons_subq.subquery()
+
+        # Count per age_group
+        age_q = select(
+            PersonIdentity.age_group,
+            func.count(PersonIdentity.id),
+        ).where(
+            PersonIdentity.id.in_(select(distinct_persons_subq.c.person_identity_id))
+        ).group_by(PersonIdentity.age_group)
+
+        age_rows = (await db.execute(age_q)).all()
+        age_counts: dict[str, int] = {}
+        for row in age_rows:
+            key = (row[0] or "").strip().lower()
+            count = row[1] or 0
+            age_counts[key] = age_counts.get(key, 0) + count
+
+        # Count per gender
+        gender_q = select(
+            PersonIdentity.gender,
+            func.count(PersonIdentity.id),
+        ).where(
+            PersonIdentity.id.in_(select(distinct_persons_subq.c.person_identity_id))
+        ).group_by(PersonIdentity.gender)
+
+        gender_rows = (await db.execute(gender_q)).all()
+        gender_counts: dict[str, int] = {}
+        for row in gender_rows:
+            key = (row[0] or "").strip().lower()
+            count = row[1] or 0
+            gender_counts[key] = gender_counts.get(key, 0) + count
+
+        demographics = DemographicsBreakdown(
+            children=age_counts.get("child", 0),
+            teenager=age_counts.get("teen", 0) + age_counts.get("teenager", 0),
+            adult=age_counts.get("adult", 0),
+            senior_citizen=age_counts.get("senior", 0) + age_counts.get("senior citizen", 0),
+            male=gender_counts.get("male", 0),
+            female=gender_counts.get("female", 0),
+        )
+
+        return DashboardSummaryResponse(
+            start_time=start,
+            end_time=end,
+            unique_persons=unique_persons,
+            total_entries=total_entries,
+            total_purchases=total_purchases,
+            demographics=demographics,
         )
 
     @staticmethod

@@ -73,8 +73,9 @@ class FFmpegPublisher(StreamPublisher):
                 "-g", "30",
             ]
         else:
-            # Remux only - no re-encode.
-            cmd += ["-c", "copy"]
+            # Remux only - no re-encode.  Drop audio — surveillance cameras
+            # don't need it, and an audio-only track would break WebRTC.
+            cmd += ["-an", "-c", "copy"]
 
         # Push to MediaMTX over RTSP.
         cmd += [
