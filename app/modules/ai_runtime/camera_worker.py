@@ -46,7 +46,7 @@ class CameraWorker:
         self.camera_id: uuid.UUID = camera_config["id"]
         self.fps_target: int = max(1, int(camera_config.get("fps_target") or self.settings.DEFAULT_FPS_TARGET))
         self.reid_enabled: bool = bool(camera_config.get("reid_enabled", True))
-        self.demographic_enabled: bool = bool(camera_config.get("demographic_enabled", False))
+        self.demographic_enabled: bool = bool(camera_config.get("demographic_enabled", True))
 
         # Components (models are shared across all workers)
         rotation = camera_config.get("frame_rotation")
