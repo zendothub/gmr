@@ -34,12 +34,22 @@ from app.modules.storage.router import router as storage_router
 settings = get_settings()
 
 # Configure logging
+import os
+os.makedirs("logs", exist_ok=True)
+
 logger.remove()
 logger.add(
     sys.stderr,
     level=settings.LOG_LEVEL,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | "
            "<cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+)
+logger.add(
+    "logs/ai_processing.log",
+    rotation="50 MB",
+    retention="7 days",
+    level=settings.LOG_LEVEL,
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}",
 )
 
 app = FastAPI(

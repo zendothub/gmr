@@ -103,13 +103,50 @@ class FFmpegPublisher(StreamPublisher):
             f"{self.target.ingest_url} (mode={self.mode})"
         )
 
+    def _read_last_error_from_file(self) -> Optional[str]:
+        if not self.settings.STREAM_PIPELINE_LOG:
+            return "Logging disabled (enable STREAM_PIPELINE_LOG in env)"
+        try:
+            import os
+            path = "logs/stream_pipeline.log"
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                # Read last 10 lines
+                lines = f.readlines()[-10:]
+                # Return the last non-empty line
+                for line in reversed(lines):
+                    s = line.strip()
+                    if s:
+                        return s
+        except Exception:
+            pass
+        return None
+
     def _spawn(self) -> None:
         cmd = self._build_command()
         logger.debug(f"Spawning ffmpeg: {shlex.join(cmd)}")
+        
+        # Close old file handle if any to prevent leaks
+        if hasattr(self, "_log_file") and self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
+        if self.settings.STREAM_PIPELINE_LOG:
+            import os
+            os.makedirs("logs", exist_ok=True)
+            self._log_file = open("logs/stream_pipeline.log", "a", encoding="utf-8")
+            stderr_dest = self._log_file
+        else:
+            stderr_dest = subprocess.DEVNULL
+
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=stderr_dest,
         )
         self._proc_start_time = time.time()
 
@@ -124,14 +161,8 @@ class FFmpegPublisher(StreamPublisher):
             ret = proc.wait()
             if self._stop_event.is_set():
                 break
-            # Capture last error line for diagnostics.
-            try:
-                if proc.stderr:
-                    tail = proc.stderr.read().decode(errors="ignore").strip().splitlines()
-                    if tail:
-                        self._error = tail[-1]
-            except Exception:
-                pass
+            # Capture last error line from log file for diagnostics.
+            self._error = self._read_last_error_from_file()
             logger.warning(
                 f"FFmpeg publisher exited (code={ret}) for {self.target.path}; "
                 f"restarting in {backoff:.0f}s. last_error={self._error}"
@@ -155,6 +186,15 @@ class FFmpegPublisher(StreamPublisher):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        
+        # Close log file handle
+        if hasattr(self, "_log_file") and self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
         logger.info(f"FFmpeg publisher stopped: {self.target.path}")
 
     def is_alive(self) -> bool:
@@ -177,14 +217,8 @@ class FFmpegPublisher(StreamPublisher):
                 return False
             ret = proc.poll()
             if ret is not None:
-                # Exited already - capture error
-                try:
-                    if proc.stderr:
-                        tail = proc.stderr.read().decode(errors="ignore").strip().splitlines()
-                        if tail:
-                            self._error = tail[-1]
-                except Exception:
-                    pass
+                # Exited already - capture error from log file
+                self._error = self._read_last_error_from_file()
                 logger.warning(
                     f"FFmpeg publisher died during stabilization (code={ret}) "
                     f"for {self.target.path}: {self._error}"

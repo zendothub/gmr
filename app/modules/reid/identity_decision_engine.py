@@ -113,7 +113,7 @@ class IdentityDecisionEngine:
                         # We are switching identities!
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
-                            await self._delete_person(db, prune_old_id)
+                            await self._delete_person(db, prune_old_id, matched_id)
                             
                         is_confident = (best_similarity >= confidence_limit)
                         await self._update_person(db, matched_id)
@@ -358,9 +358,27 @@ class IdentityDecisionEngine:
         except Exception as e:
             logger.warning(f"Embedding pruning failed for person {person_id}: {e}")
 
-    async def _delete_person(self, db: AsyncSession, person_id: uuid.UUID):
-        """Delete a temporary person identity and all their embeddings."""
+    async def _delete_person(self, db: AsyncSession, person_id: uuid.UUID, matched_id: uuid.UUID):
+        """Delete a temporary person identity and merge all their references into matched_id."""
         try:
+            # Update references in other tables pointing to person_id to point to matched_id
+            await db.execute(
+                text("UPDATE track_sessions SET person_identity_id = :matched_id WHERE person_identity_id = :pid"),
+                {"pid": str(person_id), "matched_id": str(matched_id)}
+            )
+            await db.execute(
+                text("UPDATE events SET person_identity_id = :matched_id WHERE person_identity_id = :pid"),
+                {"pid": str(person_id), "matched_id": str(matched_id)}
+            )
+            await db.execute(
+                text("UPDATE billing_interactions SET person_identity_id = :matched_id WHERE person_identity_id = :pid"),
+                {"pid": str(person_id), "matched_id": str(matched_id)}
+            )
+            await db.execute(
+                text("UPDATE storage_objects SET person_identity_id = :matched_id WHERE person_identity_id = :pid"),
+                {"pid": str(person_id), "matched_id": str(matched_id)}
+            )
+
             # Get all crop paths first
             query = text("SELECT crop_path FROM person_embeddings WHERE person_identity_id = :pid")
             res = await db.execute(query, {"pid": str(person_id)})
@@ -378,7 +396,7 @@ class IdentityDecisionEngine:
                 text("DELETE FROM person_identities WHERE id = :pid"),
                 {"pid": str(person_id)}
             )
-            logger.info(f"Deleted temporary person identity from database: {person_id}")
+            logger.info(f"Deleted temporary person identity from database: {person_id} (merged into {matched_id})")
 
             # Delete files from MinIO
             from app.modules.storage.minio_client import delete_object as minio_delete

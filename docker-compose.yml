@@ -44,16 +44,18 @@ services:
     container_name: retail_ai_mediamtx
     environment:
       MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
-      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.123,127.0.0.1,
+      MTX_WEBRTCADDITIONALHOSTS: 192.168.1.104,127.0.0.1
       MTX_RTSPTIMEOUT: 1h                    # Keep path alive 1 hour with zero readers (Go duration format)
       MTX_READTIMEOUT: 24h                   # TCP read timeout: 24h (Go duration format, must include unit)
       MTX_RUNONREADY: ""
       MTX_RUNONREADYRESTART: "yes"
       MTX_RUNONDEMAND: ""
-      MTX_HEADERS_ACCESS_CONTROL_ALLOW_ORIGIN: "*"
-      MTX_HEADERS_ACCESS_CONTROL_ALLOW_METHODS: "*"
-      MTX_HEADERS_ACCESS_CONTROL_ALLOW_HEADERS: "*"
-      MTX_HEADERS_ACCESS_CONTROL_ALLOW_CREDENTIALS: "true"
+      MTX_WEBRTCALLOWORIGIN: "*"
+      MTX_WEBRTCALLOWORIGINS: '["*"]'
+      MTX_APIALLOWORIGIN: "*"
+      MTX_APIALLOWORIGINS: '["*"]'
+      MTX_HLSALLOWORIGIN: "*"
+      MTX_HLSALLOWORIGINS: '["*"]'
     ports:
       - "8554:8554"      # RTSP (ingest + playback)
       - "8889:8889"      # WebRTC / WHEP (TCP signaling)
@@ -62,32 +64,32 @@ services:
       - "9997:9997"      # API
     restart: unless-stopped
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: retail_ai_app
-    env_file:
-      - .env.example
-    environment:
-      DATABASE_URL: postgresql+asyncpg://retail_user:retail_pass@postgres:5432/retail_ai_db
-      DATABASE_SYNC_URL: postgresql://retail_user:retail_pass@postgres:5432/retail_ai_db
-      # Backend talks to MediaMTX by its compose service name.
-      MEDIAMTX_HOST: mediamtx
-      # Browser reaches WebRTC/HLS via the host - override per deployment.
-      MEDIAMTX_PUBLIC_URL: ""
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./models:/app/models
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      mediamtx:
-        condition: service_started
-    restart: unless-stopped
+  # app:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: retail_ai_app
+  #   env_file:
+  #     - .env.example
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://retail_user:retail_pass@postgres:5432/retail_ai_db
+  #     DATABASE_SYNC_URL: postgresql://retail_user:retail_pass@postgres:5432/retail_ai_db
+  #     # Backend talks to MediaMTX by its compose service name.
+  #     MEDIAMTX_HOST: mediamtx
+  #     # Browser reaches WebRTC/HLS via the host - override per deployment.
+  #     MEDIAMTX_PUBLIC_URL: ""
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./models:/app/models
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     minio:
+  #       condition: service_healthy
+  #     mediamtx:
+  #       condition: service_started
+  #   restart: unless-stopped
 
 volumes:
   pgdata:

@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.
     SNAPSHOT_TIMEOUT_SECONDS: int = 10
     SNAPSHOT_JPEG_QUALITY: int = 85
+    # Whether to write FFmpeg stream pipeline output to logs/stream_pipeline.log (otherwise devnull)
+    STREAM_PIPELINE_LOG: bool = False
 
 
     # Logging
