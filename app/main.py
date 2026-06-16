@@ -30,6 +30,7 @@ from app.modules.events.router import router as events_router
 from app.modules.billing.router import router as billing_router
 from app.modules.analytics.router import router as analytics_router
 from app.modules.storage.router import router as storage_router
+from app.modules.feature_requests.router import router as feature_requests_router
 
 settings = get_settings()
 
@@ -108,6 +109,7 @@ app.include_router(events_router)
 app.include_router(billing_router)
 app.include_router(analytics_router)
 app.include_router(storage_router)
+app.include_router(feature_requests_router)
 
 
 # ----------------------------------------------------------------------

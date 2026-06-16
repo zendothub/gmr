@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
+    # SMTP / Email (for feature-request notifications and other alerts)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    SMTP_USE_TLS: bool = True
+    SMTP_FROM: str = ""
+    NOTIFICATION_EMAIL: str = ""
+
     # CORS (comma-separated dashboard origins)
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 

@@ -18,6 +18,7 @@ from app.core.db.models.person import PersonIdentity, PersonEmbedding
 from app.core.db.models.event import Event, EventSeverity
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.analytics import DailyAnalyticsSummary
+from app.core.db.models.feature_request import FeatureRequest, FeatureStatus
 from app.core.db.models.storage import StorageObject, StorageType
 
 __all__ = [
@@ -44,4 +45,6 @@ __all__ = [
     "DailyAnalyticsSummary",
     "StorageObject",
     "StorageType",
+    "FeatureRequest",
+    "FeatureStatus",
 ]
