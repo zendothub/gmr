@@ -1,0 +1,1 @@
+"""Feature Requests module - admin dashboard feature communication."""

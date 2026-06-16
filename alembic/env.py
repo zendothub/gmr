@@ -20,6 +20,7 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.analytics import DailyAnalyticsSummary
 from app.core.db.models.storage import StorageObject
+from app.core.db.models.feature_request import FeatureRequest
 
 config = context.config
 
