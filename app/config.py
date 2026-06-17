@@ -101,8 +101,8 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASS: str = ""
     SMTP_USE_TLS: bool = True
-    SMTP_FROM: str = ""
-    NOTIFICATION_EMAIL: str = ""
+    SMTP_FROM: str = "abdur@zendot.in"          # source / sender address
+    NOTIFICATION_EMAIL: str = "tech@zendot.in"  # destination address for feature-request alerts
 
     # CORS (comma-separated dashboard origins)
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"

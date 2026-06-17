@@ -443,7 +443,7 @@ class CameraWorker:
             person_identity_id=None,
             track_session_id=track.track_session_id,
             event_type="person_entered_view",
-            severity=EventSeverity.INFO,
+            severity=EventSeverity.LOW,
             description="Person entered view.",
             snapshot_path=crop_path,
             metadata_json={"local_track_id": track.local_track_id},
@@ -507,7 +507,7 @@ class CameraWorker:
             person_identity_id=track.person_identity_id,
             track_session_id=track.track_session_id,
             event_type="person_left_view",
-            severity=EventSeverity.INFO,
+            severity=EventSeverity.LOW,
             description=f"Person {str(track.person_identity_id)[:8] if track.person_identity_id else 'unknown'} left view.",
             occurred_at=utc_now(),
             metadata_json={"total_frames": track.total_frames, "duration_seconds": track.last_seen_at.timestamp() - track.started_at.timestamp()}
@@ -711,6 +711,8 @@ class CameraWorker:
 
         for ev in rule_events:
             try:
+                # Purchase events are High severity; all others are Low
+                severity = EventSeverity.HIGH if ev.event_type == "purchase" else EventSeverity.LOW
                 event = Event(
                     camera_id=ev.camera_id,
                     rule_id=ev.rule_id,
@@ -718,7 +720,7 @@ class CameraWorker:
                     person_identity_id=ev.person_identity_id,
                     track_session_id=ev.track_session_id,
                     event_type=ev.event_type,
-                    severity=ev.severity,
+                    severity=severity,
                     description=ev.description,
                     metadata_json=ev.metadata,
                     snapshot_path=snapshot_path,
@@ -756,7 +758,7 @@ class CameraWorker:
                     person_identity_id=ev.person_identity_id,
                     track_session_id=ev.track_session_id,
                     event_type=ev.event_type,
-                    severity=EventSeverity.INFO,
+                    severity=EventSeverity.LOW,
                     description=ev.description,
                     metadata_json=ev.metadata,
                     snapshot_path=snapshot_path,
