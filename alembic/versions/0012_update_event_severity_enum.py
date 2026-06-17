@@ -17,7 +17,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = '0012_update_event_severity_enum'
-down_revision = '8b8b559916d9'
+down_revision = '0011_burnin'
 branch_labels = None
 depends_on = None
 
