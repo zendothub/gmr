@@ -15,6 +15,7 @@ from app.modules.cameras.schemas import (
 )
 from app.modules.streaming.mediamtx import MediaMTXManager, camera_path
 from app.modules.streaming.manager import StreamManager
+from app.modules.rule_engine.config_loader import load_camera_config
 import anyio
 
 
@@ -243,15 +244,18 @@ class CameraService:
             logger.warning(f"Could not start camera worker: {e}")
 
         # Start MediaMTX stream publisher so WHEP/HLS endpoints resolve.
-        # The ffmpeg subprocess is spawned off the event loop since it is blocking.
-        try:
-            manager = StreamManager.get_instance()
-            await anyio.to_thread.run_sync(
-                manager.add_viewer, camera.id, camera.rtsp_url
-            )
-            logger.info(f"Stream publisher started for camera {camera_id}")
-        except Exception as e:
-            logger.warning(f"Could not start stream publisher: {e}")
+        # Skip if burnin_enabled — the CameraWorker's StreamBroadcaster handles it.
+        if not camera.burnin_enabled:
+            try:
+                manager = StreamManager.get_instance()
+                await anyio.to_thread.run_sync(
+                    manager.add_viewer, camera.id, camera.rtsp_url
+                )
+                logger.info(f"Stream publisher started for camera {camera_id}")
+            except Exception as e:
+                logger.warning(f"Could not start stream publisher: {e}")
+        else:
+            logger.info(f"Skipping external stream publisher for camera {camera_id} (burnin_enabled)")
 
         logger.info(f"Camera started: {camera.name}")
         return camera

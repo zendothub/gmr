@@ -53,6 +53,8 @@ async def load_camera_config(db: AsyncSession, camera_id: uuid.UUID) -> Optional
         "detection_model": camera.detection_model,
         "reid_enabled": camera.reid_enabled,
         "demographic_enabled": camera.demographic_enabled,
+        "frame_rotation": camera.frame_rotation,
+        "burnin_enabled": bool(camera.burnin_enabled),
     }
 
 

@@ -20,6 +20,7 @@ from app.config import get_settings
 from app.core.db.session import AsyncSessionLocal
 from app.modules.ai_runtime.frame_buffer import LatestFrameBuffer
 from app.modules.ai_runtime.inference_pool import run_inference
+from app.modules.ai_runtime.stream_broadcaster import StreamBroadcaster
 from app.modules.detection.yolo_detector import get_shared_detector
 from app.modules.tracking.track_manager import TrackManager, ActiveTrack
 from app.modules.reid.crop_quality import assess_crop_quality
@@ -80,6 +81,14 @@ class CameraWorker:
         self.track_embeddings: Dict[int, List[tuple]] = {}  # local_track_id -> list of (embedding, quality, crop_path)
         self.temporary_person_ids: Set[uuid.UUID] = set()
 
+        # Stream burn-in (bounding boxes on the live stream)
+        self.burnin_enabled: bool = bool(camera_config.get("burnin_enabled", False))
+        self.stream_broadcaster: Optional[StreamBroadcaster] = None
+        # Shared mutable state: latest YOLO bounding boxes for the broadcaster.
+        # Populated each time _process_frame runs tracking. Format:
+        #   [{"x1": int, "y1": int, "x2": int, "y2": int}, ...]
+        self.latest_tracks: List[dict] = []
+
         # State
         self._task: Optional[asyncio.Task] = None
         self.is_running: bool = False
@@ -88,6 +97,45 @@ class CameraWorker:
         self.current_fps: float = 0.0
         self.error_message: Optional[str] = None
         self.last_tracker_reset: float = time.time()
+
+    # ------------------------------------------------------------------
+    # Stream burn-in helpers
+    # ------------------------------------------------------------------
+
+    def _start_broadcaster(self) -> None:
+        """Start the StreamBroadcaster that pipes annotated frames to MediaMTX.
+
+        Resolution is resolved from the *actual* first frame so FFmpeg is told
+        the correct stride.  Falling back to the camera-config hint avoids an
+        infinite wait if the buffer hasn't filled yet at start time.
+        """
+        # Try to get the real frame dimensions from the live buffer first
+        frame, _ = self.frame_buffer.get_latest()
+        if frame is not None:
+            height, width = frame.shape[:2]
+        else:
+            # Fall back to camera config hint
+            resolution = self.camera_config.get("resolution", "1920x1080")
+            try:
+                w_str, h_str = resolution.split("x")
+                width, height = int(w_str), int(h_str)
+            except (ValueError, AttributeError):
+                width, height = 1920, 1080
+
+        self.stream_broadcaster = StreamBroadcaster(
+            frame_buffer=self.frame_buffer,
+            camera_id=self.camera_id,
+            width=width,
+            height=height,
+            fps=self.settings.STREAM_BURNIN_FPS,
+        )
+        # Share the *same* list object so updates in _process_frame are visible
+        # to the broadcaster without any copy.  Use .clear() + extend() to
+        # mutate it in-place instead of reassigning the reference.
+        self.stream_broadcaster.latest_tracks = self.latest_tracks
+        # Share zone definitions so the broadcaster can draw them
+        self.stream_broadcaster.latest_zones = self.zones
+        self.stream_broadcaster.start()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -104,6 +152,12 @@ class CameraWorker:
         self.error_message = None
         self.last_tracker_reset = time.time()
         self._task = asyncio.create_task(self._run_loop())
+
+        # Start stream burn-in broadcaster if enabled for this camera
+        if self.burnin_enabled:
+            self._start_broadcaster()
+            logger.info(f"Stream burn-in enabled for camera {self.camera_id}")
+
         logger.info(f"Camera worker started: {self.camera_id} (fps_target={self.fps_target}, rotation={self.camera_config.get('frame_rotation')})")
 
     async def stop(self):
@@ -116,6 +170,11 @@ class CameraWorker:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Stop stream burn-in broadcaster if running
+        if self.stream_broadcaster:
+            self.stream_broadcaster.stop()
+            self.stream_broadcaster = None
+
         # Stop capture thread in executor (it joins a thread)
         await asyncio.to_thread(self.frame_buffer.stop)
         # Close any open track sessions
@@ -289,7 +348,17 @@ class CameraWorker:
         if new_tracks or reid_tracks or rule_events or zone_events or observations or stale:
             await self._persist_batch(frame, new_tracks, reid_tracks, rule_events, zone_events, observations, stale)
 
-        # 8) Optional GUI display
+        # 8) Update shared bounding box state for the StreamBroadcaster.
+        #    IMPORTANT: mutate the list IN-PLACE (clear + extend) so the
+        #    StreamBroadcaster — which holds a reference to this exact list
+        #    object — always sees the latest data.  Do NOT reassign
+        #    self.latest_tracks = [] because that would break the reference.
+        self.latest_tracks.clear()
+        for t in active_tracks:
+            if t.bbox:
+                self.latest_tracks.append(dict(t.bbox))
+
+        # 9) Optional GUI display
         self._display_gui_frame(frame, active_tracks)
 
     # ------------------------------------------------------------------

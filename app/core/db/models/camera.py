@@ -70,6 +70,7 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     frame_rotation: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # None, 90, 180, 270
     location_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    burnin_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
 
     # Area is chosen from a dropdown when the camera is added (independent entity).
     area_id: Mapped[Optional[uuid.UUID]] = mapped_column(
