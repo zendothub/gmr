@@ -29,6 +29,8 @@ from app.modules.analytics.schemas import (
     DemographicsTableRow,
     DemographicsTableSummary,
     DemographicsTableResponse,
+    VisitorEntryExitPoint,
+    VisitorEntryExitResponse,
 )
 from app.utils.time_utils import utc_now
 
@@ -515,6 +517,160 @@ class AnalyticsService:
         )
 
         return DemographicsTableResponse(demographics=demographics, summary=summary)
+
+    @staticmethod
+    def _resolve_group_by(group_by: str, range_days: float) -> str:
+        """
+        Resolve 'auto' to a concrete granularity based on range length.
+
+        Auto rules:
+          ≤ 2 days   → hour   (24–48 points)
+          ≤ 30 days  → day    (up to 30 points)
+          ≤ 180 days → week   (up to ~26 points)
+          > 180 days → month  (monthly aggregation)
+        """
+        if group_by != "auto":
+            return group_by
+        if range_days <= 2:
+            return "hour"
+        if range_days <= 30:
+            return "day"
+        if range_days <= 180:
+            return "week"
+        return "month"
+
+    @staticmethod
+    def _truncate_slot(dt: datetime, resolved: str) -> datetime:
+        """Truncate a datetime to the start of its slot (hour/day/week/month)."""
+        if resolved == "hour":
+            return dt.replace(minute=0, second=0, microsecond=0)
+        if resolved == "day":
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if resolved == "week":
+            # ISO week starts on Monday
+            day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            return day_start - timedelta(days=day_start.weekday())
+        # month
+        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    @staticmethod
+    def _next_slot(dt: datetime, resolved: str) -> datetime:
+        """Advance a slot cursor by one slot."""
+        if resolved == "hour":
+            return dt + timedelta(hours=1)
+        if resolved == "day":
+            return dt + timedelta(days=1)
+        if resolved == "week":
+            return dt + timedelta(weeks=1)
+        # month – advance to 1st of next month
+        if dt.month == 12:
+            return dt.replace(year=dt.year + 1, month=1, day=1)
+        return dt.replace(month=dt.month + 1, day=1)
+
+    @staticmethod
+    def _slot_label(dt: datetime, resolved: str) -> str:
+        """Format the display label for a slot."""
+        if resolved == "hour":
+            return dt.strftime("%H:%M")
+        if resolved == "day":
+            return dt.strftime("%Y-%m-%d")
+        if resolved == "week":
+            return dt.strftime("%Y-W%W")   # e.g. "2026-W25"
+        return dt.strftime("%Y-%m")        # e.g. "2026-06"
+
+    @staticmethod
+    async def get_entry_exit_hourly(
+        db: AsyncSession,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        camera_id: Optional[UUID] = None,
+        group_by: str = "auto",
+    ) -> VisitorEntryExitResponse:
+        """
+        Entry/exit counts for the requested date range, grouped by hour / day / week / month.
+
+        - entry  → line_crossing_forward  events
+        - exit   → line_crossing_backward events
+        - group_by auto-detection:
+            ≤ 2 days   → hour  (great for today / yesterday)
+            ≤ 30 days  → day   (great for last-7 / last-30)
+            ≤ 180 days → week  (great for last-90 / last-6-months)
+            > 180 days → month (great for full-year view)
+
+        All slots between start and end are always returned (zeros for empty
+        slots) so the frontend gets a gapless series for the graph.
+        """
+        start, end = _default_range(start_time, end_time)
+
+        range_days = (end - start).total_seconds() / 86400
+        resolved = AnalyticsService._resolve_group_by(group_by, range_days)
+
+        # -- build DB query with the appropriate PostgreSQL bucket -------
+        # For week/month, date_trunc uses "week" / "month" in Postgres
+        pg_trunc = resolved  # hour/day/week/month all valid in date_trunc
+        bucket_expr = func.date_trunc(pg_trunc, Event.occurred_at)
+
+        q = (
+            select(
+                bucket_expr.label("bucket"),
+                Event.event_type,
+                func.count(Event.id).label("cnt"),
+            )
+            .where(
+                Event.event_type.in_(["line_crossing_forward", "line_crossing_backward"]),
+                Event.occurred_at >= start,
+                Event.occurred_at <= end,
+                Event.is_false_positive.is_(False),
+            )
+            .group_by("bucket", Event.event_type)
+            .order_by("bucket")
+        )
+        if camera_id:
+            q = q.where(Event.camera_id == camera_id)
+
+        rows = (await db.execute(q)).all()
+
+        # -- index results by bucket datetime ----------------------------
+        counts: dict = defaultdict(
+            lambda: {"line_crossing_forward": 0, "line_crossing_backward": 0}
+        )
+        for row in rows:
+            counts[row.bucket][row.event_type] = row.cnt
+
+        # -- generate all slots between start and end --------------------
+        slot_cursor = AnalyticsService._truncate_slot(start, resolved)
+        data: List[VisitorEntryExitPoint] = []
+
+        while slot_cursor <= end:
+            slot_end = AnalyticsService._next_slot(slot_cursor, resolved)
+            bucket_data = counts.get(slot_cursor, {})
+            data.append(
+                VisitorEntryExitPoint(
+                    label=AnalyticsService._slot_label(slot_cursor, resolved),
+                    slot_start=slot_cursor,
+                    slot_end=slot_end,
+                    entry=bucket_data.get("line_crossing_forward", 0),
+                    exit=bucket_data.get("line_crossing_backward", 0),
+                )
+            )
+            slot_cursor = slot_end
+
+        total_entry = sum(p.entry for p in data)
+        total_exit = sum(p.exit for p in data)
+
+        logger.info(
+            f"Entry/Exit ({resolved}): range={start}–{end}, "
+            f"total_entry={total_entry}, total_exit={total_exit}, slots={len(data)}"
+        )
+
+        return VisitorEntryExitResponse(
+            start_time=start,
+            end_time=end,
+            group_by=resolved,
+            total_entry=total_entry,
+            total_exit=total_exit,
+            data=data,
+        )
 
     @staticmethod
     async def get_person_journey(

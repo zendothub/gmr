@@ -120,3 +120,26 @@ class DemographicsTableResponse(BaseModel):
     """Full demographics table with age-group × gender breakdown."""
     demographics: List[DemographicsTableRow]
     summary: DemographicsTableSummary
+
+
+# ---------------------------------------------------------------------------
+# Visitors Entry / Exit  (hourly breakdown for graph)
+# ---------------------------------------------------------------------------
+
+class VisitorEntryExitPoint(BaseModel):
+    """Single data point (hour or day) for the entry/exit graph."""
+    label: str          # "09:00" for hour-mode, "2026-06-19" for day-mode
+    slot_start: datetime
+    slot_end: datetime
+    entry: int = 0
+    exit: int = 0
+
+
+class VisitorEntryExitResponse(BaseModel):
+    """Entry/exit counts grouped by hour or day for the requested date range."""
+    start_time: datetime
+    end_time: datetime
+    group_by: str           # "hour" or "day" (resolved from "auto")
+    total_entry: int
+    total_exit: int
+    data: List[VisitorEntryExitPoint]
