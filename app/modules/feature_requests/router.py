@@ -148,3 +148,31 @@ async def toggle_feature_request_active(
     """
     fr = await FeatureRequestService.set_active(db, UUID(feature_id), payload.is_active)
     return FeatureRequestResponse.model_validate(fr)
+
+
+@router.delete("/{feature_id}", status_code=204)
+async def delete_feature_request(
+    feature_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
+):
+    """Hard-delete a single feature request by ID (admin only).
+
+    Works regardless of status (queued / in_progress / live).
+    Returns 204 No Content on success.
+    """
+    await FeatureRequestService.delete_by_id(db, UUID(feature_id))
+
+
+@router.delete("", status_code=200)
+async def delete_all_feature_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
+):
+    """Hard-delete ALL feature requests regardless of status (admin only).
+
+    ⚠️ This is a destructive, irreversible operation.
+    Returns the count of deleted records.
+    """
+    deleted = await FeatureRequestService.delete_all(db)
+    return {"deleted": deleted, "message": f"{deleted} feature request(s) permanently deleted"}

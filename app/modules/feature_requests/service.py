@@ -226,3 +226,35 @@ class FeatureRequestService:
                 detail="Feature request not found",
             )
         return feature_req
+
+    @staticmethod
+    async def delete_by_id(
+        db: AsyncSession,
+        feature_id: UUID,
+    ) -> None:
+        """Hard-delete a single feature request by ID (any status)."""
+        result = await db.execute(
+            select(FeatureRequest).where(FeatureRequest.id == feature_id)
+        )
+        feature_req = result.scalar_one_or_none()
+        if not feature_req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Feature request not found",
+            )
+        await db.delete(feature_req)
+        await db.commit()
+        logger.info(f"Feature request {feature_id} deleted")
+
+    @staticmethod
+    async def delete_all(db: AsyncSession) -> int:
+        """Hard-delete ALL feature requests regardless of status.
+
+        Returns the number of rows deleted.
+        """
+        from sqlalchemy import delete as sa_delete
+        result = await db.execute(sa_delete(FeatureRequest))
+        await db.commit()
+        deleted = result.rowcount or 0
+        logger.warning(f"All feature requests deleted — {deleted} row(s) removed")
+        return deleted
