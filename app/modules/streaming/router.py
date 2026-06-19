@@ -12,7 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user
+from app.dependencies import get_db, get_current_user, require_role
 from app.core.db.models.user import User
 from app.modules.streaming.schemas import StreamEndpointsResponse, StreamStatusResponse
 from app.modules.streaming.service import StreamingService
@@ -25,10 +25,10 @@ async def start_stream(
     request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Start the live WebRTC/HLS preview (republishes RTSP via MediaMTX).
-    
+    """Start the live WebRTC/HLS preview (admin only).
+
     Returns URLs built against the requesting host so the frontend on another
     LAN laptop gets the correct IP (e.g. ``http://10.251.39.75:8889/...``)
     instead of ``localhost``.
@@ -41,9 +41,9 @@ async def stop_stream(
     camera_id: UUID,
     force: bool = Query(False, description="Force-stop even if other viewers remain"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Detach a viewer; the stream auto-stops once idle (or force-stop now)."""
+    """Detach a viewer (admin only); the stream auto-stops once idle (or force-stop now)."""
     return await StreamingService.stop_stream(db, camera_id, force=force)
 
 
@@ -55,7 +55,7 @@ async def stream_status(
     current_user: User = Depends(get_current_user),
 ):
     """Get publish status and playback URLs for a camera's preview.
-    
+
     URLs are built against the requesting host so LAN clients see the correct IP.
     """
     return await StreamingService.get_status(db, camera_id, public_host=request.url.hostname)

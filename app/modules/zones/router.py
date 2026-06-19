@@ -12,7 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user
+from app.dependencies import get_db, get_current_user, require_role
 from app.core.db.models.user import User
 from app.core.db.models.camera import ZoneType
 from app.modules.zones.schemas import ZoneCreate, ZoneUpdate, ZoneResponse
@@ -36,9 +36,9 @@ async def create_zone_for_camera(
     camera_id: UUID,
     data: ZoneCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Bind a new zone to a camera (polygon points + zone type)."""
+    """Bind a new zone to a camera (admin only)."""
     zone = await ZoneService.create_zone(db, camera_id, data)
     return ZoneResponse.model_validate(zone)
 
@@ -84,9 +84,9 @@ async def update_zone(
     zone_id: UUID,
     data: ZoneUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Update a zone."""
+    """Update a zone (admin only)."""
     zone = await ZoneService.update_zone(db, zone_id, data)
     return ZoneResponse.model_validate(zone)
 
@@ -95,7 +95,7 @@ async def update_zone(
 async def delete_zone(
     zone_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Delete a zone."""
+    """Delete a zone (admin only)."""
     return await ZoneService.delete_zone(db, zone_id)

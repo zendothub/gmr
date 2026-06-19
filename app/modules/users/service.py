@@ -27,7 +27,6 @@ class UserService:
             username=data.username,
             hashed_password=hash_password(data.password),
             full_name=data.full_name,
-            is_superuser=data.is_superuser,
         )
 
 

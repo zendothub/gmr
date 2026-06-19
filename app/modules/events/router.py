@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user
+from app.dependencies import get_db, get_current_user, require_role
 from app.core.db.models.user import User
 from app.modules.events.schemas import EventResponse, EventListResponse
 from app.modules.events.service import EventService
@@ -52,34 +52,34 @@ async def list_events(
     )
 
 
-@router.get("/{alerts}", response_model=EventResponse)
+@router.get("/{alert_id}", response_model=EventResponse)
 async def get_event(
-    event_id: UUID,
+    alert_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get a single event by ID."""
-    event = await EventService.get_event(db, event_id)
+    event = await EventService.get_event(db, alert_id)
     return EventResponse.model_validate(event)
 
 
 @router.post("/{alert_id}/acknowledge", response_model=EventResponse)
 async def acknowledge_event(
-    event_id: UUID,
+    alert_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Acknowledge an event."""
-    event = await EventService.acknowledge_event(db, event_id, current_user.id)
+    """Acknowledge an event (admin only)."""
+    event = await EventService.acknowledge_event(db, alert_id, current_user.id)
     return EventResponse.model_validate(event)
 
 
 @router.post("/{alert_id}/false-positive", response_model=EventResponse)
 async def mark_false_positive(
-    event_id: UUID,
+    alert_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Mark an event as a false positive."""
-    event = await EventService.mark_false_positive(db, event_id, current_user.id)
+    """Mark an event as a false positive (admin only)."""
+    event = await EventService.mark_false_positive(db, alert_id, current_user.id)
     return EventResponse.model_validate(event)
