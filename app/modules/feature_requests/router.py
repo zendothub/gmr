@@ -11,6 +11,7 @@ from app.core.db.models.user import User
 from app.modules.feature_requests.schemas import (
     FeatureRequestCreate,
     FeatureRequestUpdate,
+    FeatureRequestActiveToggle,
     FeatureRequestResponse,
     FeatureRequestListResponse,
 )
@@ -28,8 +29,14 @@ async def create_feature_request(
     """Submit a new feature request (admin only).
 
     An email notification is sent to the developer team (configured via SMTP_* env vars).
+    Priority defaults to 'low'; pass 'high' for urgent requests.
     """
-    fr = await FeatureRequestService.create(db, payload.title, payload.description)
+    fr = await FeatureRequestService.create(
+        db,
+        title=payload.title,
+        description=payload.description,
+        priority=payload.priority,
+    )
     return FeatureRequestResponse.model_validate(fr)
 
 
@@ -39,6 +46,14 @@ async def list_feature_requests(
         None, pattern=r"^(queued|in_progress|live)$",
         description="Filter by status"
     ),
+    priority: Optional[str] = Query(
+        None, pattern=r"^(low|high)$",
+        description="Filter by priority"
+    ),
+    is_active: Optional[bool] = Query(
+        None,
+        description="Filter by active flag (true / false)"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
@@ -46,10 +61,15 @@ async def list_feature_requests(
 ):
     """List all feature requests, ordered newest-first.
 
-    Optionally filter by `status` (queued / in_progress / live).
+    Optionally filter by `status`, `priority`, and/or `is_active`.
     """
     items, total = await FeatureRequestService.list_requests(
-        db, status_filter=status, page=page, page_size=page_size
+        db,
+        status_filter=status,
+        priority_filter=priority,
+        is_active_filter=is_active,
+        page=page,
+        page_size=page_size,
     )
     return FeatureRequestListResponse(
         items=[FeatureRequestResponse.model_validate(i) for i in items],
@@ -96,11 +116,35 @@ async def update_feature_request(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("admin")),
 ):
-    """Admin updates status and/or forecast_message on a feature request."""
+    """Admin updates status, forecast_message, and/or priority on a feature request.
+
+    **Auto-activation rule**: when `status` is set to `"live"`, `is_active` is
+    automatically set to `true` — no extra call needed.
+    """
     fr = await FeatureRequestService.update(
         db,
         UUID(feature_id),
         status=payload.status,
         forecast_message=payload.forecast_message,
+        priority=payload.priority,
     )
+    return FeatureRequestResponse.model_validate(fr)
+
+
+@router.patch("/{feature_id}/active", response_model=FeatureRequestResponse)
+async def toggle_feature_request_active(
+    feature_id: str,
+    payload: FeatureRequestActiveToggle,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
+):
+    """Admin manually toggles is_active for a feature request.
+
+    Use this to deactivate a live feature or re-activate a previously disabled one
+    without changing its status.
+
+    - `{ "is_active": false }` → deactivate
+    - `{ "is_active": true }`  → activate
+    """
+    fr = await FeatureRequestService.set_active(db, UUID(feature_id), payload.is_active)
     return FeatureRequestResponse.model_validate(fr)

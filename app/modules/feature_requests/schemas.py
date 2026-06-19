@@ -12,6 +12,11 @@ class FeatureRequestCreate(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=500, description="Title of the feature request")
     description: str = Field(..., min_length=1, description="Detailed description of the feature")
+    priority: str = Field(
+        default="low",
+        pattern=r"^(low|high)$",
+        description="Priority level: 'low' (default) or 'high'",
+    )
 
 
 class FeatureRequestUpdate(BaseModel):
@@ -19,6 +24,13 @@ class FeatureRequestUpdate(BaseModel):
 
     status: Optional[str] = Field(default=None, pattern=r"^(queued|in_progress|live)$")
     forecast_message: Optional[str] = Field(default=None, description="e.g. 'Will be live after 48 hours'")
+    priority: Optional[str] = Field(default=None, pattern=r"^(low|high)$")
+
+
+class FeatureRequestActiveToggle(BaseModel):
+    """Admin payload to manually toggle is_active."""
+
+    is_active: bool = Field(..., description="Set true to activate, false to deactivate")
 
 
 class FeatureRequestResponse(BaseModel):
@@ -28,6 +40,8 @@ class FeatureRequestResponse(BaseModel):
     title: str
     description: str
     status: str
+    priority: str
+    is_active: bool
     forecast_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
