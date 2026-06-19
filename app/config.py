@@ -43,12 +43,11 @@ class Settings(BaseSettings):
     REID_CROP_QUALITY_THRESHOLD: float = 0.70
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
-    REID_MAX_REFINEMENT_FRAMES: int = 20
+    REID_MIN_QUALITY_FOR_SWITCH: float = 0.80
 
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
-    INSIGHTFACE_MAX_ATTEMPTS: int = 5
     FACE_MATCH_THRESHOLD: float = 0.50
 
     # Runtime

@@ -14,6 +14,7 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.person import PersonIdentity
+from collections import defaultdict
 from app.modules.analytics.schemas import (
     FootfallPoint,
     FootfallResponse,
@@ -25,6 +26,9 @@ from app.modules.analytics.schemas import (
     PersonJourneyResponse,
     DemographicsBreakdown,
     DashboardSummaryResponse,
+    DemographicsTableRow,
+    DemographicsTableSummary,
+    DemographicsTableResponse,
 )
 from app.utils.time_utils import utc_now
 
@@ -350,6 +354,167 @@ class AnalyticsService:
             total_purchases=total_purchases,
             demographics=demographics,
         )
+
+    # Age-group definitions and display labels (remapped from estimated_age)
+    _AGE_GROUPS = [
+        ("child", "Child (0–10)", 0, 10),
+        ("teenager", "Teenager (11–17)", 11, 17),
+        ("young_adult", "Young Adult (18–35)", 18, 35),
+        ("middle_adult", "Middle Adult (36–55)", 36, 55),
+        ("senior", "Senior (55+)", 55, 999),
+    ]
+
+    @classmethod
+    def _remap_age_group(cls, estimated_age: Optional[int]) -> str:
+        """Map raw estimated_age to one of our 5 standard age groups."""
+        if estimated_age is None:
+            return "unidentified"
+        for ag_key, _label, lo, hi in cls._AGE_GROUPS:
+            if lo <= estimated_age <= hi:
+                return ag_key
+        return "unidentified"
+
+    @classmethod
+    def _gender_key(cls, raw_gender: Optional[str]) -> str:
+        """Normalise gender to 'male', 'female', or 'unidentified'."""
+        if raw_gender:
+            g = raw_gender.strip().upper()
+            if g == "M":
+                return "male"
+            if g == "F":
+                return "female"
+        return "unidentified"
+
+    @classmethod
+    async def get_demographics_table(
+        cls,
+        db: AsyncSession,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        camera_id: Optional[UUID] = None,
+    ) -> DemographicsTableResponse:
+        """
+        Cross-tabulated demographics: age_group × gender, plus per-group purchases.
+
+        Counts unique persons (by person_identity_id) seen in TrackSessions within the
+        time range.  ``summary.total_visitors`` is the total track session count.
+        """
+        start, end = _default_range(start_time, end_time)
+
+        # ── 1. Total track sessions (visitors) ──────────────────────────
+        sessions_q = select(func.count(TrackSession.id)).where(
+            TrackSession.started_at >= start,
+            TrackSession.started_at <= end,
+        )
+        if camera_id:
+            sessions_q = sessions_q.where(TrackSession.camera_id == camera_id)
+        total_visitors = (await db.execute(sessions_q)).scalar() or 0
+
+        # ── 2. Distinct person IDs seen in range ────────────────────────
+        person_subq = (
+            select(TrackSession.person_identity_id)
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
+            )
+            .distinct()
+        )
+        if camera_id:
+            person_subq = person_subq.where(TrackSession.camera_id == camera_id)
+        person_subq = person_subq.subquery()
+
+        # ── 3. Fetch demographics for those persons ─────────────────────
+        rows_q = select(
+            PersonIdentity.id,
+            PersonIdentity.gender,
+            PersonIdentity.estimated_age,
+        ).where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
+        
+        rows = (await db.execute(rows_q)).all()
+
+        # ── 4. Fetch per-person purchase counts ─────────────────────────
+        purchase_subq = (
+            select(BillingInteraction.person_identity_id)
+            .where(
+                BillingInteraction.entered_at >= start,
+                BillingInteraction.entered_at <= end,
+                BillingInteraction.person_identity_id.isnot(None),
+            )
+        )
+        if camera_id:
+            purchase_subq = purchase_subq.where(BillingInteraction.camera_id == camera_id)
+        purchase_subq = purchase_subq.subquery()
+
+        purchase_q = select(
+            purchase_subq.c.person_identity_id,
+            func.count().label("purchase_count"),
+        ).group_by(purchase_subq.c.person_identity_id)
+
+        purchase_rows = (await db.execute(purchase_q)).all()
+        purchase_map: dict[str, int] = {}
+        for pid, cnt in purchase_rows:
+            purchase_map[str(pid)] = cnt
+
+        # ── 5. Cross-tabulate age_group × gender ────────────────────────
+        # structure: matrix[age_group][gender] = count
+        matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        # Track which person IDs we've already counted (unique persons)
+        seen_persons: set[UUID] = set()
+
+        for person_id, raw_gender, estimated_age in rows:
+            if person_id in seen_persons:
+                continue
+            seen_persons.add(person_id)
+
+            ag = cls._remap_age_group(estimated_age)
+            g = cls._gender_key(raw_gender)
+            matrix[ag][g] += 1
+
+        # Also count purchase totals per age group
+        age_purchase_totals: dict[str, int] = defaultdict(int)
+        for person_id, raw_gender, estimated_age in rows:
+            ag = cls._remap_age_group(estimated_age)
+            purchases = purchase_map.get(str(person_id), 0)
+            age_purchase_totals[ag] += purchases
+
+        # ── 6. Build ordered response rows ──────────────────────────────
+        demographics: List[DemographicsTableRow] = []
+        for ag_key, label, _lo, _hi in cls._AGE_GROUPS:
+            males = matrix[ag_key].get("male", 0)
+            females = matrix[ag_key].get("female", 0)
+            unidentified = matrix[ag_key].get("unidentified", 0)
+            total = males + females + unidentified
+            purchases = age_purchase_totals.get(ag_key, 0)
+
+            demographics.append(
+                DemographicsTableRow(
+                    age_group=ag_key,
+                    label=label,
+                    male_count=males,
+                    female_count=females,
+                    unidentified_count=unidentified,
+                    total_count=total,
+                    total_purchase_count=purchases,
+                )
+            )
+
+        # ── 7. Summary ──────────────────────────────────────────────────
+        summary = DemographicsTableSummary(
+            total_male=sum(r.male_count for r in demographics),
+            total_female=sum(r.female_count for r in demographics),
+            total_unidentified=sum(r.unidentified_count for r in demographics),
+            total_visitors=total_visitors,
+            total_purchases=sum(r.total_purchase_count for r in demographics),
+        )
+
+        logger.info(
+            f"Demographics table: {len(demographics)} rows, "
+            f"unique_persons={summary.total_male + summary.total_female + summary.total_unidentified}, "
+            f"visitors={total_visitors}, purchases={summary.total_purchases}"
+        )
+
+        return DemographicsTableResponse(demographics=demographics, summary=summary)
 
     @staticmethod
     async def get_person_journey(

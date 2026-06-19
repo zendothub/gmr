@@ -580,7 +580,7 @@ class CameraWorker:
             face_score = 0.0
             face_crop_path = None
             
-            if self.demographic_enabled and self.insightface_analyzer and track.face_analysis_count < self.settings.INSIGHTFACE_MAX_ATTEMPTS:
+            if self.demographic_enabled and self.insightface_analyzer:
                 face_result = await run_inference(self.insightface_analyzer.analyze, crop)
                 if face_result:
                     track.face_analysis_count += 1
