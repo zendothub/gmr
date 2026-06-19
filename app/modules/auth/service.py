@@ -5,12 +5,13 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
 from loguru import logger
 
 from jose import JWTError
 
-from app.core.db.models.user import User
+from app.core.db.models.user import User, Role
 from app.utils.encryption import (
     hash_password,
     verify_password,
@@ -31,7 +32,7 @@ class AuthService:
 
     @staticmethod
     async def signup(db: AsyncSession, data: UserSignup) -> User:
-        """Register a new user."""
+        """Register a new user with default 'user' role."""
         # Check if username exists
         result = await db.execute(select(User).where(User.username == data.username))
         if result.scalar_one_or_none():
@@ -40,12 +41,20 @@ class AuthService:
                 detail="Username already exists",
             )
 
+        # Ensure the default "user" role exists (create if missing)
+        role_result = await db.execute(select(Role).where(Role.name == "user"))
+        default_role = role_result.scalar_one_or_none()
+        if not default_role:
+            default_role = Role(name="user", description="Default read-only user role")
+            db.add(default_role)
+            await db.flush()
+
         user = User(
             username=data.username,
             hashed_password=hash_password(data.password),
             full_name=data.full_name,
-            is_superuser=False,
         )
+        user.roles.append(default_role)
         db.add(user)
         await db.flush()
         await db.refresh(user)
@@ -55,7 +64,9 @@ class AuthService:
     @staticmethod
     async def login(db: AsyncSession, data: UserLogin) -> TokenResponse:
         """Authenticate user and return both access and refresh tokens."""
-        result = await db.execute(select(User).where(User.username == data.username))
+        result = await db.execute(
+            select(User).options(selectinload(User.roles)).where(User.username == data.username)
+        )
         user = result.scalar_one_or_none()
 
         if not user or not verify_password(data.password, user.hashed_password):
@@ -114,6 +125,7 @@ class AuthService:
     @staticmethod
     async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
         """Get user by ID."""
-        result = await db.execute(select(User).where(User.id == user_id))
+        result = await db.execute(
+            select(User).options(selectinload(User.roles)).where(User.id == user_id)
+        )
         return result.scalar_one_or_none()
-

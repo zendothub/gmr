@@ -8,6 +8,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.core.db.session import get_async_session
@@ -27,7 +28,7 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Decode JWT token and return the current user."""
+    """Decode JWT token and return the current user (with roles eager-loaded)."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -45,7 +46,9 @@ async def get_current_user(
     except JWTError:
         raise credentials_exception
 
-    result = await db.execute(select(User).where(User.id == UUID(user_id)))
+    result = await db.execute(
+        select(User).options(selectinload(User.roles)).where(User.id == UUID(user_id))
+    )
     user = result.scalar_one_or_none()
 
     if user is None:
@@ -53,14 +56,17 @@ async def get_current_user(
     return user
 
 
+def require_role(role_name: str):
+    """Dependency factory: only allow users with the given role.
 
-async def get_current_superuser(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """Ensure the current user is a superuser."""
-    if not current_user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient privileges",
-        )
-    return current_user
+    Usage: ``current_user: User = Depends(require_role("admin"))``
+    """
+    async def dependency(current_user: User = Depends(get_current_user)) -> User:
+        user_role_names = {r.name for r in current_user.roles}
+        if role_name not in user_role_names:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires '{role_name}' role",
+            )
+        return current_user
+    return dependency

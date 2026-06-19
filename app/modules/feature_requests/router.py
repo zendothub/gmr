@@ -6,7 +6,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db
+from app.dependencies import get_db, get_current_user, require_role
+from app.core.db.models.user import User
 from app.modules.feature_requests.schemas import (
     FeatureRequestCreate,
     FeatureRequestUpdate,
@@ -22,8 +23,9 @@ router = APIRouter(prefix="/api/feature-requests", tags=["Feature Requests"])
 async def create_feature_request(
     payload: FeatureRequestCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Submit a new feature request from the admin dashboard.
+    """Submit a new feature request (admin only).
 
     An email notification is sent to the developer team (configured via SMTP_* env vars).
     """
@@ -40,6 +42,7 @@ async def list_feature_requests(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """List all feature requests, ordered newest-first.
 
@@ -61,6 +64,7 @@ async def list_live_feature_requests(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Shortcut: fetch only feature requests with 'live' status, newest-first."""
     items, total = await FeatureRequestService.get_live_requests(
@@ -78,6 +82,7 @@ async def list_live_feature_requests(
 async def get_feature_request(
     feature_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Get a single feature request by ID."""
     fr = await FeatureRequestService.get_by_id(db, UUID(feature_id))
@@ -89,8 +94,9 @@ async def update_feature_request(
     feature_id: str,
     payload: FeatureRequestUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Developer updates status and/or forecast_message on a feature request."""
+    """Admin updates status and/or forecast_message on a feature request."""
     fr = await FeatureRequestService.update(
         db,
         UUID(feature_id),

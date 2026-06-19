@@ -104,7 +104,15 @@ class Settings(BaseSettings):
     NOTIFICATION_EMAIL: str = "tech@zendot.in"  # destination address for feature-request alerts
 
     # CORS (comma-separated dashboard origins)
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+    CORS_ORIGINS: str = (
+        "http://localhost:3000,"
+        "http://localhost:5173,"
+        "http://10.69.154.89,"
+        "http://10.69.154.89:80,"
+        "http://10.69.154.89:3000,"
+        "http://10.69.154.89:5173,"
+        "http://10.69.154.89:8080"
+    )
 
     @property
     def yolo_allowed_classes_list(self) -> List[int]:

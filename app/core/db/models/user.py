@@ -37,9 +37,7 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     roles: Mapped[List["Role"]] = relationship(
         "Role", secondary=user_roles, back_populates="users"
     )
-

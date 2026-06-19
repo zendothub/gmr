@@ -1,8 +1,8 @@
 """Auth Pydantic schemas."""
 
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class UserSignup(BaseModel):
@@ -40,7 +40,15 @@ class UserResponse(BaseModel):
     id: UUID
     username: str
     full_name: Optional[str] = None
-    is_superuser: bool
+    roles: List[str] = []
+
+    @field_validator("roles", mode="before")
+    @classmethod
+    def extract_role_names(cls, v):
+        """Convert Role ORM objects to plain role name strings."""
+        if v and hasattr(v[0], "name"):
+            return [r.name for r in v]
+        return v or []
 
     class Config:
         from_attributes = True
