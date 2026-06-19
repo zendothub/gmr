@@ -151,6 +151,9 @@ class CameraWorker:
         self.started_at = time.time()
         self.error_message = None
         self.last_tracker_reset = time.time()
+        # Set _last_success_ts in start() so the watchdog in _run_loop()
+        # doesn't immediately trigger when a previous run left a stale ts.
+        self._last_success_ts = time.time()
         self._task = asyncio.create_task(self._run_loop())
 
         # Start stream burn-in broadcaster if enabled for this camera

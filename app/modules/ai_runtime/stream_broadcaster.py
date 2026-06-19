@@ -70,6 +70,7 @@ class StreamBroadcaster:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[str] = None
+        self._first_frame_sent = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -99,6 +100,20 @@ class StreamBroadcaster:
     def is_alive(self) -> bool:
         proc = self._proc
         return bool(proc and proc.poll() is None)
+
+    def wait_until_ready(self, timeout: float = 15.0) -> bool:
+        """Wait for at least one annotated frame to be pushed to FFmpeg.
+
+        Returns True once a frame has been written to ffmpeg stdin, or False
+        if ffmpeg died or the timeout was reached with no stream data.
+        """
+        if not self._first_frame_sent.wait(timeout):
+            logger.warning(
+                f"StreamBroadcaster for camera {self.camera_id} "
+                f"did not send first frame within {timeout}s"
+            )
+            return False
+        return self.is_alive()
 
     # ------------------------------------------------------------------
     # FFmpeg subprocess
@@ -140,11 +155,19 @@ class StreamBroadcaster:
     def _spawn_ffmpeg(self) -> None:
         cmd = self._build_command()
         logger.debug(f"StreamBroadcaster spawning ffmpeg: {' '.join(cmd)}")
+        if self.settings.STREAM_PIPELINE_LOG:
+            import os
+            os.makedirs("logs", exist_ok=True)
+            self._log_file = open("logs/stream_pipeline.log", "a", encoding="utf-8")
+            stderr_dest = self._log_file
+        else:
+            self._log_file = None
+            stderr_dest = subprocess.DEVNULL
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_dest,
         )
 
     def _kill_ffmpeg(self) -> None:
@@ -220,6 +243,12 @@ class StreamBroadcaster:
             try:
                 annotated = self._draw_overlays(frame)
                 self._proc.stdin.write(annotated.tobytes())
+                if not self._first_frame_sent.is_set():
+                    self._first_frame_sent.set()
+                    logger.info(
+                        f"StreamBroadcaster first frame sent for camera {self.camera_id} "
+                        f"({actual_w}x{actual_h})"
+                    )
             except (BrokenPipeError, OSError) as e:
                 logger.warning(
                     f"StreamBroadcaster write error for camera {self.camera_id}: {e}"
