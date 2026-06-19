@@ -1,6 +1,7 @@
 """Rule service - CRUD and enable/disable."""
 
-from typing import List
+import asyncio
+from typing import List, Optional
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,29 @@ from loguru import logger
 
 from app.core.db.models.rule import Rule
 from app.modules.rules.schemas import RuleCreate, RuleUpdate
+
+
+def _schedule_config_reload(camera_id: Optional[UUID] = None):
+    """Fire-and-forget config reload for running workers.
+
+    If *camera_id* is provided only that camera's worker is reloaded;
+    otherwise all workers are refreshed.  The reload runs in the background
+    so the API response is never delayed.
+    """
+    try:
+        from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
+        supervisor = WorkerSupervisor.get_instance()
+        loop = asyncio.get_running_loop()
+        loop.create_task(supervisor.reload_config())
+        logger.info(
+            f"Scheduled runtime config reload "
+            f"({'camera=' + str(camera_id) if camera_id else 'all workers'})"
+        )
+    except RuntimeError:
+        # No running event loop (e.g. tests) — silently skip
+        pass
+    except Exception as exc:
+        logger.debug(f"Could not schedule config reload: {exc}")
 
 
 class RuleService:
@@ -33,6 +57,7 @@ class RuleService:
         await db.flush()
         await db.refresh(rule)
         logger.info(f"Rule created: {rule.name} (type={rule.rule_type})")
+        _schedule_config_reload(data.camera_id)
         return rule
 
     @staticmethod
@@ -68,14 +93,17 @@ class RuleService:
         await db.flush()
         await db.refresh(rule)
         logger.info(f"Rule updated: {rule.name} (id={rule_id})")
+        _schedule_config_reload(rule.camera_id)
         return rule
 
     @staticmethod
     async def delete_rule(db: AsyncSession, rule_id: UUID) -> dict:
         """Delete a rule."""
         rule = await RuleService.get_rule(db, rule_id)
+        camera_id = rule.camera_id
         await db.delete(rule)
         logger.info(f"Rule deleted: {rule.name} (id={rule_id})")
+        _schedule_config_reload(camera_id)
         return {"message": f"Rule '{rule.name}' deleted successfully"}
 
     @staticmethod
@@ -86,6 +114,7 @@ class RuleService:
         await db.flush()
         await db.refresh(rule)
         logger.info(f"Rule enabled: {rule.name}")
+        _schedule_config_reload(rule.camera_id)
         return rule
 
     @staticmethod
@@ -96,4 +125,5 @@ class RuleService:
         await db.flush()
         await db.refresh(rule)
         logger.info(f"Rule disabled: {rule.name}")
+        _schedule_config_reload(rule.camera_id)
         return rule

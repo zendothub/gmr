@@ -16,6 +16,7 @@ from app.modules.analytics.schemas import (
     ZoneOccupancyResponse,
     PersonJourneyResponse,
     DashboardSummaryResponse,
+    DemographicsTableResponse,
 )
 from app.modules.analytics.service import AnalyticsService
 
@@ -90,6 +91,26 @@ async def dashboard_summary(
                     and gender (male, female) breakdown
     """
     return await AnalyticsService.get_dashboard_summary(db, start_time, end_time, camera_id)
+
+
+@router.get("/demographics", response_model=DemographicsTableResponse)
+async def demographics_table(
+    start_time: Optional[datetime] = Query(None, description="Range start (default: 24h ago)"),
+    end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
+    camera_id: Optional[UUID] = Query(None, description="Optional camera filter"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Cross-tabulated demographics table: age-group × gender with per-group purchases.
+
+    Returns 5 standard age groups (child, teenager, young adult, middle adult, senior)
+    each broken down into male / female / unidentified counts, plus purchase totals.
+    Includes a summary row with overall totals.
+    """
+    return await AnalyticsService.get_demographics_table(
+        db, start_time=start_time, end_time=end_time, camera_id=camera_id
+    )
 
 
 @router.get("/person-journey/{person_id}", response_model=PersonJourneyResponse)

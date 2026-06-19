@@ -90,3 +90,33 @@ class DashboardSummaryResponse(BaseModel):
     total_entries: int
     total_purchases: int
     demographics: DemographicsBreakdown
+
+
+# ---------------------------------------------------------------------------
+# Demographics Table (cross-tabulated age-group × gender with purchases)
+# ---------------------------------------------------------------------------
+
+class DemographicsTableRow(BaseModel):
+    """Single row in the demographics cross-table."""
+    age_group: str
+    label: str
+    male_count: int = 0
+    female_count: int = 0
+    unidentified_count: int = 0
+    total_count: int = 0
+    total_purchase_count: int = 0
+
+
+class DemographicsTableSummary(BaseModel):
+    """Summary rollup for the demographics table."""
+    total_male: int = 0
+    total_female: int = 0
+    total_unidentified: int = 0
+    total_visitors: int = 0
+    total_purchases: int = 0
+
+
+class DemographicsTableResponse(BaseModel):
+    """Full demographics table with age-group × gender breakdown."""
+    demographics: List[DemographicsTableRow]
+    summary: DemographicsTableSummary

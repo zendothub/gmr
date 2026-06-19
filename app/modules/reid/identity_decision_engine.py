@@ -110,6 +110,22 @@ class IdentityDecisionEngine:
                     matched_id = best_candidate["person_identity_id"]
                     
                     if matched_id != current_person_id:
+                        # Quality gate: only switch identities when the crop is clear enough
+                        # to trust the match.  Low-quality crops produce noisy embeddings
+                        # that can cause false switches.
+                        min_quality = self.settings.REID_MIN_QUALITY_FOR_SWITCH
+                        if crop_quality_score < min_quality:
+                            logger.debug(
+                                f"[ReID Refined] Skipping identity switch for track (quality={crop_quality_score:.2f} < {min_quality})"
+                            )
+                            # Still store the embedding to refine the current identity's signature
+                            await self._store_embedding(
+                                db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
+                            )
+                            if face_embedding is not None and face_score > 0:
+                                await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
+                            return current_person_id, best_similarity, False, False, None
+
                         # We are switching identities!
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
@@ -122,7 +138,7 @@ class IdentityDecisionEngine:
                         )
                         if face_embedding is not None and face_score > 0:
                             await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
-                        logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f})")
+                        logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, quality={crop_quality_score:.2f})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
                     else:
                         # Same ID, but score upgraded

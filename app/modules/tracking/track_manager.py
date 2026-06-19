@@ -37,7 +37,6 @@ class ActiveTrack:
     reid_confident: bool = False
     reid_score: float = 0.0
     reid_frame_count: int = 0
-    reid_max_refinement_frames: int = 20
 
     # Demographics and Face crop tracking
     face_analysis_count: int = 0
@@ -56,18 +55,22 @@ class ActiveTrack:
         return self.confidence_sum / self.total_frames if self.total_frames > 0 else 0.0
 
     def should_run_reid(self) -> bool:
-        """Check if ReID should be triggered for this track."""
+        """Check if ReID should be triggered for this track.
+
+        Runs continuously throughout the track's lifetime.  When the identity is
+        already confident we still run but at a reduced cadence (every 5th
+        eligible candidate) to save compute while allowing correction if a
+        higher-quality match appears later.
+        """
         if not self.bbox:
             return False
-        # Stop once confident
-        if self.reid_confident:
-            return False
-        # Stop after max refinement frames
-        if self.reid_frame_count >= self.reid_max_refinement_frames:
-            return False
-        # POC's minimum crop size
+        # Minimum crop size (pixels)
         if bbox_height(self.bbox) < 100:
             return False
+        # Continuous mode: never fully stop.  If confident, only sample
+        # occasionally to catch better-quality matches.
+        if self.reid_confident:
+            return self.reid_frame_count % 5 == 0
         return True
 
 
