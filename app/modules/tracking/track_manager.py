@@ -121,27 +121,51 @@ class TrackManager:
         """
         Update which zones a track is currently in.
 
+        Zone polygons are stored as 0–100 percentage coordinates (camera-agnostic).
+        They are converted to pixel coordinates using the actual frame dimensions
+        before comparing with the track's bounding-box positions.
+
+        A track is considered "in" a zone when EITHER its bottom-centre (feet)
+        OR its bbox-centre falls inside the zone polygon.  This allows both
+        foot-level and body-level zone detection (e.g. a person standing behind
+        a billing counter may have feet outside the drawn zone but their body
+        clearly visible inside it).
+
         Args:
             track: The active track
             zones_data: List of zone dicts with id, polygon, zone_type, etc.
-            frame_width: Frame width in pixels (for normalizing bbox coords to [0-1])
-            frame_height: Frame height in pixels (for normalizing bbox coords to [0-1])
+            frame_width: Frame width in pixels
+            frame_height: Frame height in pixels
         """
         now = utc_now()
         if not track.bbox:
             return
 
-        from app.utils.geometry import bbox_bottom_center
-        center = bbox_bottom_center(track.bbox)
-        # Normalize to [0-1] range to match stored polygon coordinates
-        norm_center = (center[0] / frame_width, center[1] / frame_height)
+        from app.utils.geometry import bbox_bottom_center, bbox_center
+
+        # Raw pixel positions — we compare in pixel space, not normalised space
+        bottom = bbox_bottom_center(track.bbox)
+        centre = bbox_center(track.bbox)
+
         current_zone_ids = set()
 
         for zone in zones_data:
             zone_id = str(zone["id"])
             poly_points = polygon_from_json(zone.get("polygon"))
 
-            if poly_points and point_in_polygon(norm_center, poly_points):
+            if not poly_points:
+                continue
+
+            # Convert polygon from 0-100 percentage → pixel coordinates
+            pixel_poly = [
+                (p[0] * frame_width / 100.0, p[1] * frame_height / 100.0)
+                for p in poly_points
+            ]
+
+            # Check both foot (bottom-centre) and body (bbox-centre)
+            in_zone = point_in_polygon(bottom, pixel_poly) or point_in_polygon(centre, pixel_poly)
+
+            if in_zone:
                 current_zone_ids.add(zone_id)
 
                 # Track zone entry time

@@ -1,7 +1,7 @@
 """Analytics service - aggregated metrics for the dashboard."""
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import HTTPException, status
