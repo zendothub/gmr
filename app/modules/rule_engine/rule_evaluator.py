@@ -201,9 +201,9 @@ class RuleEvaluator:
                     rule_id=uuid.UUID(rule["id"]), rule_type="possible_purchase", camera_id=camera_id,
                     zone_id=uuid.UUID(zone_id), track_session_id=track.track_session_id,
                     person_identity_id=track.person_identity_id,
-                    event_type="possible_purchase", severity="info",
-                    description=f"Possible purchase activity ({dwell:.0f}s at product zone)",
-                    metadata={"dwell_seconds": dwell},
+                    event_type="purchase", severity="High",
+                    description=f"Purchase detected: {dwell:.0f}s dwell in billing zone",
+                    metadata={"dwell_seconds": dwell, "local_track_id": track.local_track_id},
                 )
         return None
 

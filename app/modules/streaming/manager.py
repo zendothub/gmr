@@ -72,6 +72,7 @@ class StreamManager:
     ) -> StreamEndpoints:
         """Ensure a publisher is running for this camera; returns playback URLs."""
         key = str(camera_id)
+        is_new = False
         with self._lock:
             handle = self._streams.get(key)
             if handle is None:
@@ -82,11 +83,28 @@ class StreamManager:
                     endpoints=self.mtx.endpoints(camera_id, public_host=public_host),
                 )
                 self._streams[key] = handle
+                is_new = True
                 logger.info(f"Stream started for camera {key}")
             elif not handle.publisher.is_alive():
                 handle.publisher.start()
+                is_new = True
             handle.last_active_at = time.time()
-            return handle.endpoints
+
+        # Wait for ffmpeg to stabilize and push data into MediaMTX before
+        # returning URLs — otherwise HLS requests get 404 while the source
+        # stream is still being probed.
+        if is_new:
+            ok = handle.publisher.wait_until_alive(timeout=10.0)
+            if not ok:
+                logger.warning(
+                    f"Stream publisher for camera {key} did not stabilize; "
+                    f"HLS playback may return 404 briefly"
+                )
+            # Refresh endpoints in case public_host was passed now but not
+            # when the handle was first created (e.g. recreate_camera flow).
+            handle.endpoints = self.mtx.endpoints(camera_id, public_host=public_host)
+
+        return handle.endpoints
 
     def add_viewer(
         self,

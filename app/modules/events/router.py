@@ -12,7 +12,7 @@ from app.core.db.models.user import User
 from app.modules.events.schemas import EventResponse, EventListResponse
 from app.modules.events.service import EventService
 
-router = APIRouter(prefix="/api/events", tags=["Events"])
+router = APIRouter(prefix="/api/alerts", tags=["Alerts"])
 
 
 @router.get("", response_model=EventListResponse)
@@ -52,7 +52,7 @@ async def list_events(
     )
 
 
-@router.get("/{event_id}", response_model=EventResponse)
+@router.get("/{alerts}", response_model=EventResponse)
 async def get_event(
     event_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -63,7 +63,7 @@ async def get_event(
     return EventResponse.model_validate(event)
 
 
-@router.post("/{event_id}/acknowledge", response_model=EventResponse)
+@router.post("/{alert_id}/acknowledge", response_model=EventResponse)
 async def acknowledge_event(
     event_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -74,7 +74,7 @@ async def acknowledge_event(
     return EventResponse.model_validate(event)
 
 
-@router.post("/{event_id}/false-positive", response_model=EventResponse)
+@router.post("/{alert_id}/false-positive", response_model=EventResponse)
 async def mark_false_positive(
     event_id: UUID,
     db: AsyncSession = Depends(get_db),

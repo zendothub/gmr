@@ -15,6 +15,7 @@ from app.modules.cameras.schemas import (
 )
 from app.modules.streaming.mediamtx import MediaMTXManager, camera_path
 from app.modules.streaming.manager import StreamManager
+from app.modules.rule_engine.config_loader import load_camera_config
 import anyio
 
 
@@ -243,15 +244,39 @@ class CameraService:
             logger.warning(f"Could not start camera worker: {e}")
 
         # Start MediaMTX stream publisher so WHEP/HLS endpoints resolve.
-        # The ffmpeg subprocess is spawned off the event loop since it is blocking.
-        try:
-            manager = StreamManager.get_instance()
-            await anyio.to_thread.run_sync(
-                manager.add_viewer, camera.id, camera.rtsp_url
-            )
-            logger.info(f"Stream publisher started for camera {camera_id}")
-        except Exception as e:
-            logger.warning(f"Could not start stream publisher: {e}")
+        # Skip if burnin_enabled — the CameraWorker's StreamBroadcaster handles it.
+        if not camera.burnin_enabled:
+            try:
+                manager = StreamManager.get_instance()
+                await anyio.to_thread.run_sync(
+                    manager.add_viewer, camera.id, camera.rtsp_url
+                )
+                logger.info(f"Stream publisher started for camera {camera_id}")
+            except Exception as e:
+                logger.warning(f"Could not start stream publisher: {e}")
+        else:
+            # Wait for the CameraWorker's StreamBroadcaster to push the first
+            # annotated frame to MediaMTX before returning stream URLs — otherwise
+            # the frontend gets a 404 on WHEP/HLS for the first few seconds.
+            logger.info(f"Waiting for StreamBroadcaster to become ready for camera {camera_id}")
+            try:
+                from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
+                supervisor = WorkerSupervisor.get_instance()
+                if supervisor:
+                    worker = supervisor.workers.get(str(camera_id))
+                    if worker and worker.stream_broadcaster:
+                        ready = await anyio.to_thread.run_sync(
+                            worker.stream_broadcaster.wait_until_ready, 15.0
+                        )
+                        if ready:
+                            logger.info(f"StreamBroadcaster ready for camera {camera_id}")
+                        else:
+                            logger.warning(
+                                f"StreamBroadcaster not ready after timeout for camera {camera_id}; "
+                                f"stream may return 404 briefly"
+                            )
+            except Exception as e:
+                logger.warning(f"Could not wait for StreamBroadcaster: {e}")
 
         logger.info(f"Camera started: {camera.name}")
         return camera

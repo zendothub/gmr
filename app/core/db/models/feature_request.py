@@ -19,7 +19,12 @@ class FeatureRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
-        SAEnum(FeatureStatus, name="feature_status_enum", create_constraint=True),
+        SAEnum(
+            FeatureStatus,
+            name="feature_status_enum",
+            values_callable=lambda obj: [e.value for e in obj],
+            create_constraint=True,
+        ),
         nullable=False,
         default=FeatureStatus.QUEUED,
     )

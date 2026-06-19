@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 import enum
 
-from sqlalchemy import String, Boolean, Float, ForeignKey, DateTime, Text, func, Enum as SAEnum
+from sqlalchemy import String, Boolean, ForeignKey, DateTime, Text, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,10 +13,9 @@ from app.core.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class EventSeverity(str, enum.Enum):
-    INFO = "info"
-    WARNING = "warning"
-    ALERT = "alert"
-    CRITICAL = "critical"
+    HIGH = "High"
+    LOW = "Low"
+
 
 
 class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -39,9 +38,9 @@ class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     severity: Mapped[str] = mapped_column(
-        SAEnum(EventSeverity, name="event_severity_enum", create_constraint=True),
+        String(50),
         nullable=False,
-        default=EventSeverity.INFO,
+        default=EventSeverity.LOW,
     )
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

@@ -41,6 +41,7 @@ class CameraUpdate(BaseModel):
     rtsp_url: Optional[str] = None
     area_id: Optional[UUID] = None
     is_active: Optional[bool] = None
+    burnin_enabled: Optional[bool] = None
 
 
 class CameraResponse(BaseModel):

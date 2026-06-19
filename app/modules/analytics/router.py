@@ -71,7 +71,7 @@ async def zone_occupancy_analytics(
     return await AnalyticsService.get_zone_occupancy(db, start_time, end_time)
 
 
-@router.get("/summary", response_model=DashboardSummaryResponse)
+@router.get("/events", response_model=DashboardSummaryResponse)
 async def dashboard_summary(
     start_time: Optional[datetime] = Query(None, description="Range start (default: 24h ago)"),
     end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
