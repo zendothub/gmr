@@ -403,16 +403,7 @@ class AnalyticsService:
         """
         start, end = _default_range(start_time, end_time)
 
-        # ── 1. Total track sessions (visitors) ──────────────────────────
-        sessions_q = select(func.count(TrackSession.id)).where(
-            TrackSession.started_at >= start,
-            TrackSession.started_at <= end,
-        )
-        if camera_id:
-            sessions_q = sessions_q.where(TrackSession.camera_id == camera_id)
-        total_visitors = (await db.execute(sessions_q)).scalar() or 0
-
-        # ── 2. Distinct person IDs seen in range ────────────────────────
+        # ── 1. Distinct person IDs seen in range ────────────────────────
         person_subq = (
             select(TrackSession.person_identity_id)
             .where(
@@ -426,16 +417,27 @@ class AnalyticsService:
             person_subq = person_subq.where(TrackSession.camera_id == camera_id)
         person_subq = person_subq.subquery()
 
-        # ── 3. Fetch demographics for those persons ─────────────────────
+        # ── 2. Count track sessions with NO person_identity_id ──────────
+        # These are anonymous visitors — counted as unidentified age + gender
+        anon_sessions_q = select(func.count(TrackSession.id)).where(
+            TrackSession.started_at >= start,
+            TrackSession.started_at <= end,
+            TrackSession.person_identity_id.is_(None),
+        )
+        if camera_id:
+            anon_sessions_q = anon_sessions_q.where(TrackSession.camera_id == camera_id)
+        anon_session_count = (await db.execute(anon_sessions_q)).scalar() or 0
+
+        # ── 3. Fetch demographics for identified persons ─────────────────
         rows_q = select(
             PersonIdentity.id,
             PersonIdentity.gender,
             PersonIdentity.estimated_age,
         ).where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
-        
+
         rows = (await db.execute(rows_q)).all()
 
-        # ── 4. Fetch per-person purchase counts ─────────────────────────
+        # ── 4. Fetch per-person purchase counts (identified persons) ─────
         purchase_subq = (
             select(BillingInteraction.person_identity_id)
             .where(
@@ -458,6 +460,16 @@ class AnalyticsService:
         for pid, cnt in purchase_rows:
             purchase_map[str(pid)] = cnt
 
+        # Count purchases NOT linked to any person (anonymous purchases)
+        anon_purchases_q = select(func.count(BillingInteraction.id)).where(
+            BillingInteraction.entered_at >= start,
+            BillingInteraction.entered_at <= end,
+            BillingInteraction.person_identity_id.is_(None),
+        )
+        if camera_id:
+            anon_purchases_q = anon_purchases_q.where(BillingInteraction.camera_id == camera_id)
+        anon_purchase_count = (await db.execute(anon_purchases_q)).scalar() or 0
+
         # ── 5. Cross-tabulate age_group × gender ────────────────────────
         # structure: matrix[age_group][gender] = count
         matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -473,12 +485,22 @@ class AnalyticsService:
             g = cls._gender_key(raw_gender)
             matrix[ag][g] += 1
 
-        # Also count purchase totals per age group
+        # Anonymous (no person_identity) → unidentified age + unidentified gender
+        matrix["unidentified"]["unidentified"] += anon_session_count
+
+        # Purchase totals per age group (for identified persons)
         age_purchase_totals: dict[str, int] = defaultdict(int)
+        seen_for_purchase: set[UUID] = set()
         for person_id, raw_gender, estimated_age in rows:
+            if person_id in seen_for_purchase:
+                continue
+            seen_for_purchase.add(person_id)
             ag = cls._remap_age_group(estimated_age)
             purchases = purchase_map.get(str(person_id), 0)
             age_purchase_totals[ag] += purchases
+
+        # Anonymous purchases go to the unidentified age group
+        age_purchase_totals["unidentified"] += anon_purchase_count
 
         # ── 6. Build ordered response rows ──────────────────────────────
         demographics: List[DemographicsTableRow] = []
@@ -501,13 +523,36 @@ class AnalyticsService:
                 )
             )
 
+        # Unidentified (Age) row — persons/sessions where age could not be determined
+        unid_males = matrix["unidentified"].get("male", 0)
+        unid_females = matrix["unidentified"].get("female", 0)
+        unid_unidentified = matrix["unidentified"].get("unidentified", 0)
+        unid_total = unid_males + unid_females + unid_unidentified
+        unid_purchases = age_purchase_totals.get("unidentified", 0)
+        demographics.append(
+            DemographicsTableRow(
+                age_group="unidentified",
+                label="Unidentified (Age)",
+                male_count=unid_males,
+                female_count=unid_females,
+                unidentified_count=unid_unidentified,
+                total_count=unid_total,
+                total_purchase_count=unid_purchases,
+            )
+        )
+
         # ── 7. Summary ──────────────────────────────────────────────────
+        # total_visitors = sum of all rows (identified unique persons + anonymous sessions)
+        # total_purchases = sum of all rows (identified + anonymous purchases)
+        total_visitors = sum(r.total_count for r in demographics)
+        total_purchases_all = sum(r.total_purchase_count for r in demographics)
+
         summary = DemographicsTableSummary(
             total_male=sum(r.male_count for r in demographics),
             total_female=sum(r.female_count for r in demographics),
             total_unidentified=sum(r.unidentified_count for r in demographics),
             total_visitors=total_visitors,
-            total_purchases=sum(r.total_purchase_count for r in demographics),
+            total_purchases=total_purchases_all,
         )
 
         logger.info(
