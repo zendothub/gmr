@@ -57,7 +57,13 @@ class AuthService:
         user.roles.append(default_role)
         db.add(user)
         await db.flush()
-        await db.refresh(user)
+        
+        # Reload user with roles eagerly loaded for Pydantic serialization
+        result = await db.execute(
+            select(User).options(selectinload(User.roles)).where(User.id == user.id)
+        )
+        user = result.scalar_one()
+        
         logger.info(f"New user registered: {user.username} (id={user.id})")
         return user
 
