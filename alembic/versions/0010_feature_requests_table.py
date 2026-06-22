@@ -16,14 +16,36 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _enum_exists(enum_name: str) -> bool:
+    """Check if an enum type exists"""
+    conn = op.get_bind()
+    result = conn.execute(
+        sa.text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_type WHERE typname = :enum_name"
+            ")"
+        ),
+        {"enum_name": enum_name},
+    )
+    return result.scalar()
+
+
 def upgrade() -> None:
+    # Create enum type if it doesn't exist
+    if not _enum_exists("feature_status_enum"):
+        feature_status_enum = sa.Enum(
+            "queued", "in_progress", "live", 
+            name="feature_status_enum"
+        )
+        feature_status_enum.create(op.get_bind(), checkfirst=True)
+    
     op.create_table(
         "feature_requests",
         sa.Column("title", sa.String(length=500), nullable=False),
         sa.Column("description", sa.Text(), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("queued", "in_progress", "live", name="feature_status_enum"),
+            sa.Enum("queued", "in_progress", "live", name="feature_status_enum", create_type=False),
             nullable=False,
         ),
         sa.Column("forecast_message", sa.Text(), nullable=True),
