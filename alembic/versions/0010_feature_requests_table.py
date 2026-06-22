@@ -37,36 +37,18 @@ def upgrade() -> None:
             "CREATE TYPE feature_status_enum AS ENUM ('queued', 'in_progress', 'live')"
         )
     
-    op.create_table(
-        "feature_requests",
-        sa.Column("title", sa.String(length=500), nullable=False),
-        sa.Column("description", sa.Text(), nullable=False),
-        sa.Column(
-            "status",
-            sa.Enum("queued", "in_progress", "live", name="feature_status_enum", create_type=False),
-            nullable=False,
-        ),
-        sa.Column("forecast_message", sa.Text(), nullable=True),
-        sa.Column(
-            "id",
-            sa.UUID(),
-            server_default=sa.text("gen_random_uuid()"),
-            nullable=False,
-        ),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.PrimaryKeyConstraint("id"),
-    )
+    # Create table without using sa.Enum to avoid auto-creation
+    op.execute("""
+        CREATE TABLE feature_requests (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            title VARCHAR(500) NOT NULL,
+            description TEXT NOT NULL,
+            status feature_status_enum NOT NULL,
+            forecast_message TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+        )
+    """)
 
 
 def downgrade() -> None:
