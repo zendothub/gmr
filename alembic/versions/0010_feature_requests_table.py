@@ -31,13 +31,11 @@ def _enum_exists(enum_name: str) -> bool:
 
 
 def upgrade() -> None:
-    # Create enum type if it doesn't exist
+    # Create enum type if it doesn't exist using raw SQL
     if not _enum_exists("feature_status_enum"):
-        feature_status_enum = sa.Enum(
-            "queued", "in_progress", "live", 
-            name="feature_status_enum"
+        op.execute(
+            "CREATE TYPE feature_status_enum AS ENUM ('queued', 'in_progress', 'live')"
         )
-        feature_status_enum.create(op.get_bind(), checkfirst=True)
     
     op.create_table(
         "feature_requests",
