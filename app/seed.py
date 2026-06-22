@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+# Ensure project root is in path when running seed.py directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import asyncio
 import uuid
 from app.core.db.session import AsyncSessionLocal
