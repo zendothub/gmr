@@ -117,7 +117,6 @@ class CameraService:
         camera_kwargs: dict = {
             "name": data.name,
             "rtsp_url": data.rtsp_url,
-            "area_id": data.area_id,
             "store_id": data.store_id,
             "status": CameraStatus.INACTIVE,
             "is_active": True,
@@ -160,7 +159,7 @@ class CameraService:
                 )
             resolution = test_result.resolution
 
-        # Only name + rtsp_url + area + store are sent by the frontend.
+        # Only name + rtsp_url + area + zone + store are sent by the frontend.
         # All AI-config fields (fps_target, detection_model, reid_enabled, ...)
         # use the model's column defaults — never exposed to the client.
         camera_kwargs: dict = {
@@ -170,6 +169,8 @@ class CameraService:
             "status": CameraStatus.INACTIVE,
             "is_active": True,
         }
+        if hasattr(data, "zone_id") and data.zone_id:
+            camera_kwargs["zone_id"] = data.zone_id
         # If store_id is provided, validate and link store
         if hasattr(data, "store_id") and data.store_id:
             store_result = await db.execute(select(Store).where(Store.id == data.store_id))

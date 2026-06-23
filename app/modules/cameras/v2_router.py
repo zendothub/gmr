@@ -53,7 +53,6 @@ from app.modules.cameras.schemas import (
     CameraFeedResponse,
     CameraFeedZoneSummary,
     _STATUS_DISPLAY_MAP,
-    _extract_protocol,
     DetectionZoneCreate,
     DetectionZoneUpdate,
     DetectionZoneResponse,
@@ -306,8 +305,6 @@ async def list_camera_feeds(
     |---|---|
     | `webrtc_url` / `hls_url` | Browser-playable stream URL from MediaMTX |
     | `status_display` | Badge label: LIVE / OFFLINE / RECONNECTING / MAINTENANCE |
-    | `protocol` | Detected from RTSP URL: RTSP / HTTP / RTMP |
-    | `resolution` | Camera resolution string, e.g. "1920x1080" |
     | `store_name` | Store this camera belongs to |
     | `store_zone_gate` | Physical location, e.g. "Gate B4" |
     | `zones` | Detection zones drawn on this camera |
@@ -372,8 +369,6 @@ async def list_camera_feeds(
                 stream_path=stream_path,
                 webrtc_url=endpoints.webrtc_url,
                 hls_url=endpoints.hls_url,
-                protocol=_extract_protocol(camera.rtsp_url),
-                resolution=camera.resolution,
                 zones=zone_summaries,
                 zone_count=len(zone_summaries),
             )

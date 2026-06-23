@@ -35,6 +35,7 @@ class CameraCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     rtsp_url: str
     area_id: Optional[UUID] = Field(None, description="Area chosen from dropdown (Entry, Exit, Billing, Medicine Pickup, ...)")
+    zone_id: Optional[UUID] = Field(None, description="Zone / position within the store (Entry, Checkout, Aisle 3, …)")
     skip_rtsp_test: bool = Field(default=False, description="Skip the RTSP connectivity probe (use when camera is offline)")
 
 
@@ -101,6 +102,9 @@ class CameraCreateV2(BaseModel):
     - The store's zone_gate (physical location) is auto-populated in the response
     - All cameras of a store can be queried via GET /api/v2/cameras?store_id=...
 
+    zone_id optionally links the camera to a specific store zone / position
+    (e.g. "Entry", "Checkout", "Aisle 3") chosen from the Zone/Position dropdown.
+
     The eye icon on the camera row opens the camera's live stream where
     the operator can draw polygon detection zones
     (POST /api/v2/cameras/{camera_id}/zones).
@@ -108,6 +112,7 @@ class CameraCreateV2(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     rtsp_url: str
     store_id: UUID = Field(..., description="Store chosen from dropdown — camera is linked to this store")
+    zone_id: Optional[UUID] = Field(None, description="Zone / position within the store (Entry, Checkout, Aisle 3, …)")
     skip_rtsp_test: bool = Field(default=False, description="Skip the RTSP connectivity probe (use when camera is offline)")
 
 
@@ -181,8 +186,8 @@ class CameraFeedZoneSummary(BaseModel):
 class CameraFeedResponse(BaseModel):
     """Camera data shaped for the Live Feeds grid card.
 
-    Includes stream URLs, store context, status badge label, resolution,
-    protocol, and a summary of detection zones drawn on this camera.
+    Includes stream URLs, store context, status badge label,
+    and a summary of detection zones drawn on this camera.
     """
     id: UUID
     name: str
@@ -203,10 +208,6 @@ class CameraFeedResponse(BaseModel):
     stream_path: Optional[str] = None
     webrtc_url: Optional[str] = None
     hls_url: Optional[str] = None
-
-    # Camera specs
-    protocol: str                                  # RTSP | HTTP | HTTPS | RTMP
-    resolution: Optional[str] = None              # e.g. "1920x1080"
 
     # Detection zones on this camera
     zones: List[CameraFeedZoneSummary] = []
