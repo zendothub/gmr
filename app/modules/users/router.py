@@ -85,27 +85,29 @@ async def invite_user(
     )
 
 
-@router.post("", response_model=UserDetailResponse, status_code=201)
+@router.post("", response_model=UserListItem, status_code=201)
 async def add_user(
-    data: UserAdd,
+    data: UserInvite,
     db: AsyncSession = Depends(get_db),
 ):
-    """**Add User** — password is auto-generated and stored for admin to view.
+    """**Add User** — pass your own password; it is stored encrypted but returned as plain text.
 
     - **name**: full name
     - **email**: email address
-    - **role**: `ADMIN` or `VIEWER`
+    - **password**: plain text password (stored as bcrypt hash internally)
+    - **role**: `SUPER_ADMIN`, `ADMIN` or `VIEWER`
 
     No auth required. Status is automatically `active`.
-    Password is auto-generated and returned in the list endpoint (`GET /api/users`).
+    The original `password` you provided is echoed back in the response.
     """
-    user = await UserService.create_user_auto_password(db, data)
-    return UserDetailResponse(
+    user = await UserService.create_user(db, data)
+    return UserListItem(
         id=user.id,
         name=user.name,
         email=user.email,
         status=user.status.value if hasattr(user.status, "value") else user.status,
         role=_first_role_name(user),
+        password=user.password_plain,   # original plain text echoed back
     )
 
 
