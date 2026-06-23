@@ -13,6 +13,7 @@ from app.modules.stores.schemas import (
     StoreCategoryCreate, StoreCategoryUpdate, StoreCategoryResponse,
     StoreLevelCreate, StoreLevelUpdate, StoreLevelResponse,
     StoreZoneCreate, StoreZoneUpdate, StoreZoneResponse,
+    StoreTerminalCreate, StoreTerminalUpdate, StoreTerminalResponse,
 )
 from app.modules.stores.service import StoreService
 
@@ -193,6 +194,64 @@ async def delete_store_zone(
 ):
     """Delete a physical airport zone."""
     return await StoreService.delete_store_zone(db, zone_id)
+
+
+# ===========================================================================
+# Terminals  — /api/stores/terminals
+# ===========================================================================
+
+@router.post("/terminals", response_model=StoreTerminalResponse, status_code=201)
+async def create_terminal(
+    data: StoreTerminalCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new airport terminal (e.g. Terminal 1, Terminal 2)."""
+    term = await StoreService.create_terminal(db, data)
+    return StoreTerminalResponse.model_validate(term)
+
+
+@router.get("/terminals", response_model=List[StoreTerminalResponse])
+async def list_terminals(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all airport terminals."""
+    terms = await StoreService.get_terminals(db)
+    return [StoreTerminalResponse.model_validate(t) for t in terms]
+
+
+@router.get("/terminals/{terminal_id}", response_model=StoreTerminalResponse)
+async def get_terminal(
+    terminal_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get an airport terminal by ID."""
+    term = await StoreService.get_terminal(db, terminal_id)
+    return StoreTerminalResponse.model_validate(term)
+
+
+@router.put("/terminals/{terminal_id}", response_model=StoreTerminalResponse)
+async def update_terminal(
+    terminal_id: UUID,
+    data: StoreTerminalUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update an airport terminal."""
+    term = await StoreService.update_terminal(db, terminal_id, data)
+    return StoreTerminalResponse.model_validate(term)
+
+
+@router.delete("/terminals/{terminal_id}")
+async def delete_terminal(
+    terminal_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete an airport terminal."""
+    return await StoreService.delete_terminal(db, terminal_id)
 
 
 # ===========================================================================

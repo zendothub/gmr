@@ -9,12 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.models.store import Store, StoreStatus
-from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone
+from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone, StoreTerminal
 from app.modules.stores.schemas import (
     StoreCreate, StoreUpdate, StoreStatusUpdate,
     StoreCategoryCreate, StoreCategoryUpdate,
     StoreLevelCreate, StoreLevelUpdate,
     StoreZoneCreate, StoreZoneUpdate,
+    StoreTerminalCreate, StoreTerminalUpdate,
 )
 
 
@@ -247,3 +248,47 @@ class StoreService:
         zone = await StoreService.get_store_zone(db, zone_id)
         await db.delete(zone)
         return {"message": f"Store zone '{zone.name}' deleted successfully"}
+
+    # ------------------------------------------------------------------
+    # StoreTerminal CRUD
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def create_terminal(db: AsyncSession, data: StoreTerminalCreate) -> StoreTerminal:
+        existing = await db.execute(select(StoreTerminal).where(StoreTerminal.name == data.name))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status.HTTP_409_CONFLICT, "Terminal already exists")
+        term = StoreTerminal(name=data.name)
+        db.add(term)
+        await db.flush()
+        await db.refresh(term)
+        logger.info(f"StoreTerminal created: {term.name}")
+        return term
+
+    @staticmethod
+    async def get_terminals(db: AsyncSession) -> List[StoreTerminal]:
+        result = await db.execute(select(StoreTerminal).order_by(StoreTerminal.name))
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_terminal(db: AsyncSession, terminal_id: UUID) -> StoreTerminal:
+        result = await db.execute(select(StoreTerminal).where(StoreTerminal.id == terminal_id))
+        term = result.scalar_one_or_none()
+        if not term:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Terminal not found")
+        return term
+
+    @staticmethod
+    async def update_terminal(db: AsyncSession, terminal_id: UUID, data: StoreTerminalUpdate) -> StoreTerminal:
+        term = await StoreService.get_terminal(db, terminal_id)
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(term, field, value)
+        await db.flush()
+        await db.refresh(term)
+        return term
+
+    @staticmethod
+    async def delete_terminal(db: AsyncSession, terminal_id: UUID) -> dict:
+        term = await StoreService.get_terminal(db, terminal_id)
+        await db.delete(term)
+        return {"message": f"Terminal '{term.name}' deleted successfully"}

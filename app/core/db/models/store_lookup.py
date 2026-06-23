@@ -1,4 +1,4 @@
-"""Store lookup tables - Category, Level, StoreZone.
+"""Store lookup tables - Category, Level, StoreZone, StoreTerminal.
 
 These are user-managed reference lists that populate the dropdowns when
 creating/editing a Store.  StoreZone here refers to a physical airport
@@ -41,3 +41,10 @@ class StoreZone(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     terminal: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class StoreTerminal(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """Airport terminals (e.g. Terminal 1, Terminal 2, Terminal 3)."""
+    __tablename__ = "store_terminals"
+
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)

@@ -104,6 +104,27 @@ class StoreZoneResponse(BaseModel):
 # Store
 # ---------------------------------------------------------------------------
 
+class StoreTerminalCreate(BaseModel):
+    """Schema for creating a new terminal."""
+    name: str = Field(..., min_length=1, max_length=100)
+
+
+class StoreTerminalUpdate(BaseModel):
+    """Schema for updating an existing terminal."""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
+class StoreTerminalResponse(BaseModel):
+    """Schema for terminal responses."""
+    id: UUID
+    name: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class StoreStatusUpdate(BaseModel):
     """Schema for toggling a store's active/inactive status."""
     status: str = Field(..., pattern="^(active|inactive)$")
