@@ -3,7 +3,7 @@
 import enum
 from typing import Optional
 
-from sqlalchemy import String, Enum, Text
+from sqlalchemy import String, Enum, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -30,3 +30,8 @@ class Store(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # Zone/Gate is a physical location label (e.g. "Gate B4"), NOT related to camera zones
     zone_gate: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Aggregated counters — updated by analytics/billing jobs
+    footfall_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    purchase_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    camera_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)

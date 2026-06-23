@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.stores.schemas import (
-    StoreCreate, StoreUpdate, StoreResponse,
+    StoreCreate, StoreUpdate, StoreStatusUpdate, StoreResponse,
     StoreCategoryCreate, StoreCategoryUpdate, StoreCategoryResponse,
     StoreLevelCreate, StoreLevelUpdate, StoreLevelResponse,
     StoreZoneCreate, StoreZoneUpdate, StoreZoneResponse,
@@ -196,6 +196,40 @@ async def delete_store_zone(
 
 
 # ===========================================================================
+# Search  — /api/stores/search
+# (static path — must remain BEFORE /{store_id})
+# ===========================================================================
+
+@router.get("/search", response_model=List[StoreResponse])
+async def search_stores(
+    status: Optional[str] = Query(
+        None,
+        pattern="^(active|inactive)$",
+        description="Filter by status. Omit or pass null for all stores.",
+    ),
+    name: Optional[str] = Query(
+        None,
+        description="Prefix search on store name — e.g. 'Apo' matches 'Apollo Pharmacy'.",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Search/filter stores.
+
+    - **status**: `active` | `inactive` | omit for all
+    - **name**: store name prefix (case-insensitive)
+
+    Examples:
+    - `GET /api/stores/search` → all stores
+    - `GET /api/stores/search?status=active` → active stores only
+    - `GET /api/stores/search?name=Apo` → stores starting with "Apo"
+    - `GET /api/stores/search?status=active&name=Apo` → active stores starting with "Apo"
+    """
+    stores = await StoreService.search_stores(db, status_filter=status, name_prefix=name)
+    return [StoreResponse.model_validate(s) for s in stores]
+
+
+# ===========================================================================
 # Stores  — /api/stores  (must come AFTER the static sub-paths above)
 # ===========================================================================
 
@@ -220,6 +254,18 @@ async def list_stores(
     """List all stores. Optionally filter by status or search by name."""
     stores = await StoreService.get_stores(db, status_filter=status, search=search)
     return [StoreResponse.model_validate(s) for s in stores]
+
+
+@router.patch("/{store_id}/status", response_model=StoreResponse)
+async def update_store_status(
+    store_id: UUID,
+    data: StoreStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Activate or deactivate a store.  Body: `{ \"status\": \"active\" | \"inactive\" }`"""
+    store = await StoreService.update_store_status(db, store_id, data)
+    return StoreResponse.model_validate(store)
 
 
 @router.get("/{store_id}", response_model=StoreResponse)

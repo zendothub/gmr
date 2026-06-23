@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db.models.store import Store, StoreStatus
 from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone
 from app.modules.stores.schemas import (
-    StoreCreate, StoreUpdate,
+    StoreCreate, StoreUpdate, StoreStatusUpdate,
     StoreCategoryCreate, StoreCategoryUpdate,
     StoreLevelCreate, StoreLevelUpdate,
     StoreZoneCreate, StoreZoneUpdate,
@@ -54,6 +54,27 @@ class StoreService:
         return list(result.scalars().all())
 
     @staticmethod
+    async def search_stores(
+        db: AsyncSession,
+        status_filter: Optional[str] = None,
+        name_prefix: Optional[str] = None,
+    ) -> List[Store]:
+        """Search stores by name prefix and/or status.
+
+        - status_filter=None  → return all statuses
+        - status_filter='active' | 'inactive'  → filter by that status
+        - name_prefix='Apo'  → returns stores whose name starts with 'Apo'
+        """
+        query = select(Store).order_by(Store.name)
+        if status_filter:
+            query = query.where(Store.status == StoreStatus(status_filter))
+        if name_prefix:
+            # Prefix (startswith) search  e.g. 'Apo%'
+            query = query.where(Store.name.ilike(f"{name_prefix}%"))
+        result = await db.execute(query)
+        return list(result.scalars().all())
+
+    @staticmethod
     async def get_store(db: AsyncSession, store_id: UUID) -> Store:
         """Get a single store by ID."""
         result = await db.execute(select(Store).where(Store.id == store_id))
@@ -75,6 +96,16 @@ class StoreService:
         await db.flush()
         await db.refresh(store)
         logger.info(f"Store updated: {store.name} (id={store_id})")
+        return store
+
+    @staticmethod
+    async def update_store_status(db: AsyncSession, store_id: UUID, data: StoreStatusUpdate) -> Store:
+        """Change only the active/inactive status of a store."""
+        store = await StoreService.get_store(db, store_id)
+        store.status = StoreStatus(data.status)
+        await db.flush()
+        await db.refresh(store)
+        logger.info(f"Store status changed to '{data.status}': {store.name} (id={store_id})")
         return store
 
     @staticmethod

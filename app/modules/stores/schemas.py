@@ -104,6 +104,11 @@ class StoreZoneResponse(BaseModel):
 # Store
 # ---------------------------------------------------------------------------
 
+class StoreStatusUpdate(BaseModel):
+    """Schema for toggling a store's active/inactive status."""
+    status: str = Field(..., pattern="^(active|inactive)$")
+
+
 class StoreResponse(BaseModel):
     """Schema for store responses."""
     id: UUID
@@ -114,6 +119,9 @@ class StoreResponse(BaseModel):
     level: Optional[str] = None
     zone_gate: Optional[str] = None
     description: Optional[str] = None
+    footfall_count: int = 0
+    purchase_count: int = 0
+    camera_count: int = 0
     created_at: datetime
     updated_at: datetime
 
