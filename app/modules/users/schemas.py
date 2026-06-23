@@ -14,15 +14,28 @@ class UserInvite(BaseModel):
     """Schema for inviting (creating) a new user by Super Admin.
 
     Status is always set to 'active' automatically — not required from client.
-    Role is limited to ADMIN or VIEWER; only one SUPER_ADMIN exists.
     """
     name: str = Field(..., min_length=1, max_length=255, description="Full name")
     email: str = Field(..., min_length=3, max_length=255, description="Email address")
     password: str = Field(..., min_length=6, max_length=128, description="Initial password")
     role: str = Field(
         ...,
-        pattern="^(ADMIN|VIEWER)$",
-        description="Role to assign: ADMIN or VIEWER",
+        pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$",
+        description="Role to assign: SUPER_ADMIN, ADMIN or VIEWER",
+    )
+
+
+class UserAdd(BaseModel):
+    """Schema for simply adding a user — password is auto-generated.
+
+    Used by POST /api/users.
+    """
+    name: str = Field(..., min_length=1, max_length=255, description="Full name")
+    email: str = Field(..., min_length=3, max_length=255, description="Email address")
+    role: str = Field(
+        ...,
+        pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$",
+        description="Role to assign: SUPER_ADMIN, ADMIN or VIEWER",
     )
 
 
@@ -35,7 +48,7 @@ class UserUpdate(BaseModel):
     email: Optional[str] = Field(None, min_length=3, max_length=255)
     password: Optional[str] = Field(None, min_length=6, max_length=128)
     status: Optional[str] = Field(None, pattern="^(active|inactive)$")
-    role: Optional[str] = Field(None, pattern="^(ADMIN|VIEWER)$")
+    role: Optional[str] = Field(None, pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$")
 
 
 class UserStatusUpdate(BaseModel):

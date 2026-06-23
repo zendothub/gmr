@@ -10,6 +10,7 @@ from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.users.schemas import (
     UserInvite,
+    UserAdd,
     UserUpdate,
     UserStatusUpdate,
     UserDetailResponse,
@@ -57,24 +58,48 @@ async def update_password(
 
 
 # ---------------------------------------------------------------------------
-# User Management  (Super Admin — invite, list, toggle status, delete)
+# User Management  (Super Admin — add, invite, list, toggle status, delete)
 # ---------------------------------------------------------------------------
 
-@router.post("", response_model=UserDetailResponse, status_code=201)
+@router.post("/invite", response_model=UserDetailResponse, status_code=201)
 async def invite_user(
     data: UserInvite,
     db: AsyncSession = Depends(get_db),
 ):
-    """Invite (create) a new user.  **No auth required** — called by Super Admin from the UI.
+    """**Invite User** — Super Admin sets the password explicitly.
 
     - **name**: full name
     - **email**: email address
-    - **password**: initial password
+    - **password**: password chosen by admin (min 6 chars)
     - **role**: `ADMIN` or `VIEWER`
 
-    Status is automatically set to `active`.
+    No auth required. Status is automatically `active`.
     """
     user = await UserService.create_user(db, data)
+    return UserDetailResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
+
+
+@router.post("", response_model=UserDetailResponse, status_code=201)
+async def add_user(
+    data: UserAdd,
+    db: AsyncSession = Depends(get_db),
+):
+    """**Add User** — password is auto-generated and stored for admin to view.
+
+    - **name**: full name
+    - **email**: email address
+    - **role**: `ADMIN` or `VIEWER`
+
+    No auth required. Status is automatically `active`.
+    Password is auto-generated and returned in the list endpoint (`GET /api/users`).
+    """
+    user = await UserService.create_user_auto_password(db, data)
     return UserDetailResponse(
         id=user.id,
         name=user.name,

@@ -11,7 +11,10 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db.models.user import User, Role, UserStatus
 from app.utils.encryption import hash_password, verify_password
-from app.modules.users.schemas import UserCreate, UserUpdate, UpdateProfile, UpdatePassword, UserStatusUpdate
+import secrets
+import string
+
+from app.modules.users.schemas import UserCreate, UserUpdate, UpdateProfile, UpdatePassword, UserStatusUpdate, UserAdd
 
 
 def _first_role_name(user: User) -> str:
@@ -62,6 +65,41 @@ class UserService:
         )
         user = result.scalar_one()
         logger.info(f"User invited: {user.name} <{user.email}> role={data.role} (id={user.id})")
+        return user
+
+    @staticmethod
+    async def create_user_auto_password(db: AsyncSession, data: UserAdd) -> User:
+        """Add a user with an auto-generated password (POST /api/users).
+
+        A random 10-character password is generated and stored in plain text
+        so the admin can view and share it.
+        """
+        result = await db.execute(select(User).where(User.email == data.email))
+        if result.scalar_one_or_none():
+            raise HTTPException(status.HTTP_409_CONFLICT, "Email already exists")
+
+        # Generate a readable random password: 8 alphanum chars
+        alphabet = string.ascii_letters + string.digits
+        auto_password = "".join(secrets.choice(alphabet) for _ in range(10))
+
+        role = await UserService._get_or_create_role(db, data.role)
+
+        user = User(
+            name=data.name,
+            email=data.email,
+            hashed_password=hash_password(auto_password),
+            password_plain=auto_password,   # stored so admin can see it
+            status=UserStatus.ACTIVE,
+        )
+        user.roles.append(role)
+        db.add(user)
+        await db.flush()
+
+        result = await db.execute(
+            select(User).options(selectinload(User.roles)).where(User.id == user.id)
+        )
+        user = result.scalar_one()
+        logger.info(f"User added (auto-pw): {user.name} <{user.email}> role={data.role} (id={user.id})")
         return user
 
     @staticmethod
