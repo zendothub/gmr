@@ -50,7 +50,12 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[UserStatus] = mapped_column(
-        Enum(UserStatus, name="user_status", create_type=False),
+        Enum(
+            UserStatus,
+            name="user_status",
+            create_type=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
         default=UserStatus.ACTIVE,
         server_default="active",
         nullable=False,

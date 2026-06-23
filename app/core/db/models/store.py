@@ -20,7 +20,12 @@ class Store(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[StoreStatus] = mapped_column(
-        Enum(StoreStatus, name="store_status", create_type=True),
+        Enum(
+            StoreStatus,
+            name="store_status",
+            create_type=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
         default=StoreStatus.ACTIVE,
         server_default="active",
         nullable=False,
