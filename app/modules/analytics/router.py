@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.analytics.schemas import (
+    AnalyticsMetricsResponse,
     FootfallResponse,
     BillingAnalyticsResponse,
     DwellAnalyticsResponse,
@@ -229,6 +230,85 @@ async def dashboard_v2(
     """
     return await AnalyticsService.get_dashboard_v2(
         db,
+        store_id=store_id,
+        time_range=time_range,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+# ---------------------------------------------------------------------------
+# V2 Analytics — per-tab metrics (Foot Fall / Gender / Age Groups / Purchase)
+# ---------------------------------------------------------------------------
+
+@v2_router.get("/metrics", response_model=AnalyticsMetricsResponse)
+async def analytics_metrics(
+    metric: str = Query(
+        ...,
+        pattern="^(footfall|gender|age_groups|purchase)$",
+        description=(
+            "Which metric tab to load — **exactly one** must be chosen:\n"
+            "- `footfall`   → Total Visitors, Peak Hour, Avg Daily, Busiest Day, "
+            "Foot Fall Over Time chart, This Period vs Last Period chart, Per-Camera Breakdown\n"
+            "- `gender`     → Male / Female / Unidentified counts & %, "
+            "Gender Trend stacked bars, comparison chart, Per-Camera Breakdown\n"
+            "- `age_groups` → Age Group Distribution bar chart, peak group label, "
+            "comparison chart, Per-Camera Breakdown\n"
+            "- `purchase`   → Total Purchases, Conversion %, Avg Daily, Busiest Day, "
+            "Purchases Over Time chart, comparison chart, Per-Camera Breakdown, Peak Hours banner"
+        ),
+    ),
+    store_id: Optional[UUID] = Query(
+        None,
+        description="All Stores when omitted; pass a UUID to scope to one store.",
+    ),
+    time_range: str = Query(
+        "today",
+        pattern="^(today|this_week|custom)$",
+        description="'today' | 'this_week' | 'custom' (requires start_time + end_time)",
+    ),
+    start_time: Optional[datetime] = Query(
+        None, description="Range start — only used when time_range='custom'."
+    ),
+    end_time: Optional[datetime] = Query(
+        None, description="Range end — only used when time_range='custom'."
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Analytics page — detailed data for the selected metric tab.
+
+    **Filters (top bar)**
+    | Param        | Values                                    |
+    |---|---|
+    | `store_id`   | omit = All Stores, UUID = specific store  |
+    | `time_range` | `today` \\| `this_week` \\| `custom`      |
+    | `metric`     | `footfall` \\| `gender` \\| `age_groups` \\| `purchase` |
+
+    **Common charts in every metric:**
+    - `period_comparison[]`     → This Period (solid line) vs Last Period (dashed) dual-line chart
+    - `per_camera_breakdown[]`  → Horizontal bar chart sorted by count descending
+
+    **Footfall tab fields** (`footfall_data`):
+    - `total_visitors`, `peak_hour` `{ count, time }`, `avg_daily`, `busiest_day` `{ count, date }`
+    - `footfall_over_time[]`, `peak_hours_label` (e.g. "12 PM – 2 PM and 6 PM – 8 PM")
+
+    **Gender tab fields** (`gender_data`):
+    - `total_male`, `total_female`, `total_unidentified`, `male_pct`, `female_pct`, `unidentified_pct`
+    - `gender_trend[]` (stacked bars)
+
+    **Age Groups tab fields** (`age_groups_data`):
+    - `total_identified`, `total_unidentified`, `peak_group`
+    - `age_group_distribution[]` (horizontal bar chart)
+
+    **Purchase tab fields** (`purchase_data`):
+    - `total_purchases`, `conversion_pct`, `avg_daily`, `busiest_day`
+    - `purchases_over_time[]`, `peak_hours_label`
+    """
+    return await AnalyticsService.get_analytics_metrics(
+        db,
+        metric=metric,
         store_id=store_id,
         time_range=time_range,
         start_time=start_time,

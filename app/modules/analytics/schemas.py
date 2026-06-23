@@ -213,6 +213,112 @@ class DashboardV2AgeGroupDistributionPoint(BaseModel):
     count: int = 0
 
 
+# ── Analytics Metrics (per-tab Analytics page) ──────────────────────────────
+
+class PeakHourInfo(BaseModel):
+    """Top-traffic hour summary card."""
+    count: int = 0
+    time: str = ""          # e.g. "18:00"
+
+
+class BusiestDayInfo(BaseModel):
+    """Top-traffic day summary card."""
+    count: int = 0
+    date: str = ""          # e.g. "06-21"
+
+
+class CameraBreakdownPoint(BaseModel):
+    """Single bar in the Per-Camera Breakdown horizontal bar chart."""
+    camera_id: UUID
+    camera_name: str
+    count: int = 0
+
+
+class PeriodComparisonPoint(BaseModel):
+    """Single slot for the This Period vs Last Period dual-line chart."""
+    label: str
+    slot_start: datetime
+    slot_end: datetime
+    current: int = 0
+    previous: int = 0
+
+
+class FootfallMetricData(BaseModel):
+    """Data payload when metric='footfall'."""
+    # Summary cards
+    total_visitors: int = 0
+    peak_hour: Optional[PeakHourInfo] = None
+    avg_daily: int = 0
+    busiest_day: Optional[BusiestDayInfo] = None
+    # Charts
+    footfall_over_time: List[DashboardV2FootfallPoint] = []
+    period_comparison: List[PeriodComparisonPoint] = []
+    per_camera_breakdown: List[CameraBreakdownPoint] = []
+    # Banner
+    peak_hours_label: Optional[str] = None
+
+
+class GenderMetricData(BaseModel):
+    """Data payload when metric='gender'."""
+    # Cards
+    total_male: int = 0
+    total_female: int = 0
+    total_unidentified: int = 0
+    male_pct: float = 0.0
+    female_pct: float = 0.0
+    unidentified_pct: float = 0.0
+    # Charts
+    gender_trend: List[DashboardV2GenderTrendPoint] = []
+    period_comparison: List[PeriodComparisonPoint] = []
+    per_camera_breakdown: List[CameraBreakdownPoint] = []
+
+
+class AgeGroupsMetricData(BaseModel):
+    """Data payload when metric='age_groups'."""
+    # Cards
+    total_identified: int = 0
+    total_unidentified: int = 0
+    peak_group: Optional[str] = None
+    # Charts
+    age_group_distribution: List[DashboardV2AgeGroupDistributionPoint] = []
+    period_comparison: List[PeriodComparisonPoint] = []
+    per_camera_breakdown: List[CameraBreakdownPoint] = []
+
+
+class PurchaseMetricData(BaseModel):
+    """Data payload when metric='purchase'."""
+    # Cards
+    total_purchases: int = 0
+    conversion_pct: float = 0.0
+    avg_daily: int = 0
+    busiest_day: Optional[BusiestDayInfo] = None
+    # Charts
+    purchases_over_time: List[DashboardV2FootfallPoint] = []
+    period_comparison: List[PeriodComparisonPoint] = []
+    per_camera_breakdown: List[CameraBreakdownPoint] = []
+    # Banner
+    peak_hours_label: Optional[str] = None
+
+
+class AnalyticsMetricsResponse(BaseModel):
+    """Top-level response for GET /api/v2/analytics/metrics.
+
+    Only one of the four *_data fields will be populated — the one matching
+    the requested `metric` parameter.
+    """
+    store_id: Optional[UUID] = None
+    store_name: str = "All Stores"
+    time_range: str
+    start_time: datetime
+    end_time: datetime
+    metric: str   # "footfall" | "gender" | "age_groups" | "purchase"
+
+    footfall_data: Optional[FootfallMetricData] = None
+    gender_data: Optional[GenderMetricData] = None
+    age_groups_data: Optional[AgeGroupsMetricData] = None
+    purchase_data: Optional[PurchaseMetricData] = None
+
+
 class DashboardV2Response(BaseModel):
     """Unified V2 dashboard response.
 

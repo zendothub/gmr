@@ -17,6 +17,15 @@ from app.core.db.models.person import PersonIdentity
 from app.core.db.models.store import Store
 from collections import defaultdict
 from app.modules.analytics.schemas import (
+    AnalyticsMetricsResponse,
+    FootfallMetricData,
+    GenderMetricData,
+    AgeGroupsMetricData,
+    PurchaseMetricData,
+    PeakHourInfo,
+    BusiestDayInfo,
+    CameraBreakdownPoint,
+    PeriodComparisonPoint,
     FootfallPoint,
     FootfallResponse,
     BillingAnalyticsResponse,
@@ -1013,6 +1022,412 @@ class AnalyticsService:
                     key="unidentified", label="Unidentified", count=age_cnt["unidentified"]
                 )
             ],
+        )
+
+    # ── helpers shared by get_analytics_metrics ───────────────────────────────
+
+    @classmethod
+    def _build_ff_slots(cls, start, end, resolved, ff_map) -> List[DashboardV2FootfallPoint]:
+        slots: List[DashboardV2FootfallPoint] = []
+        slot = cls._truncate_slot(start, resolved)
+        while slot <= end:
+            nxt = cls._next_slot(slot, resolved)
+            slots.append(DashboardV2FootfallPoint(
+                label=cls._slot_label(slot, resolved),
+                slot_start=slot, slot_end=nxt,
+                count=ff_map.get(slot, 0),
+            ))
+            slot = nxt
+        return slots
+
+    @staticmethod
+    def _peak_hours_label(hourly_map: dict) -> Optional[str]:
+        """Convert {hour: count} → 'HH PM – HH PM and HH PM – HH PM'."""
+        if not hourly_map:
+            return None
+        max_count = max(hourly_map.values()) or 1
+        threshold = max_count * 0.7          # hours with ≥70% of peak count
+        hot = sorted(h for h, c in hourly_map.items() if c >= threshold)
+        if not hot:
+            return None
+        # group consecutive hours
+        groups = []
+        group = [hot[0]]
+        for h in hot[1:]:
+            if h == group[-1] + 1:
+                group.append(h)
+            else:
+                groups.append(group)
+                group = [h]
+        groups.append(group)
+
+        def _fmt(h: int) -> str:
+            if h == 0:    return "12 AM"
+            if h < 12:    return f"{h} AM"
+            if h == 12:   return "12 PM"
+            return f"{h - 12} PM"
+
+        parts = [f"{_fmt(g[0])} – {_fmt(g[-1] + 1)}" for g in groups[:2]]
+        return " and ".join(parts)
+
+    @classmethod
+    async def get_analytics_metrics(
+        cls,
+        db: AsyncSession,
+        metric: str,
+        store_id: Optional[UUID] = None,
+        time_range: str = "today",
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> AnalyticsMetricsResponse:
+        """
+        Detailed analytics for the Analytics page, scoped to one metric tab.
+
+        `metric` must be one of: footfall | gender | age_groups | purchase
+
+        Common for all metrics:
+        - period_comparison  → This Period vs Last Period dual-line chart
+        - per_camera_breakdown → horizontal bar chart
+
+        Footfall-specific: total_visitors, peak_hour, avg_daily, busiest_day,
+                           footfall_over_time, peak_hours_label
+        Gender-specific:   total_male/female/unidentified + %, gender_trend
+        Age-Groups:        age_group_distribution, peak_group
+        Purchase:          total_purchases, conversion_pct, avg_daily, busiest_day,
+                           purchases_over_time, peak_hours_label
+        """
+        start, end, prev_start, prev_end = cls._v2_resolve_range(time_range, start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, store_id=store_id)
+        range_days = (end - start).total_seconds() / 86400
+        resolved = cls._resolve_group_by("auto", range_days)
+        duration = end - start  # length of one period
+
+        # ── store name ─────────────────────────────────────────────────
+        store_name = "All Stores"
+        if store_id:
+            row = await db.execute(select(Store.name).where(Store.id == store_id))
+            sn = row.scalar_one_or_none()
+            if sn:
+                store_name = sn
+
+        base_resp = dict(
+            store_id=store_id, store_name=store_name,
+            time_range=time_range, start_time=start, end_time=end,
+            metric=metric,
+        )
+
+        # ── Shared helpers ─────────────────────────────────────────────
+
+        def _ts_q(s, e):
+            q = select(func.count(TrackSession.id)).where(
+                TrackSession.started_at >= s, TrackSession.started_at <= e,
+            )
+            if cam_ids:
+                q = q.where(TrackSession.camera_id.in_(cam_ids))
+            return q
+
+        def _purchase_q(s, e):
+            q = select(func.count(BillingInteraction.id)).where(
+                BillingInteraction.entered_at >= s,
+                BillingInteraction.entered_at <= e,
+            )
+            if cam_ids:
+                q = q.where(BillingInteraction.camera_id.in_(cam_ids))
+            return q
+
+        async def _slot_map(model_col, s, e) -> dict:
+            """Return {slot_dt: count} for date_trunc(resolved, model_col) in [s, e]."""
+            bexpr = func.date_trunc(resolved, model_col)
+            q = (
+                select(bexpr.label("b"), func.count().label("c"))
+                .where(model_col >= s, model_col <= e)
+                .group_by("b").order_by("b")
+            )
+            if cam_ids:
+                tbl = model_col.class_
+                q = q.where(tbl.camera_id.in_(cam_ids))
+            rows = (await db.execute(q)).all()
+            return {r.b: r.c for r in rows}
+
+        async def _period_comparison(model_col) -> List[PeriodComparisonPoint]:
+            curr_map = await _slot_map(model_col, start, end)
+            prev_map = await _slot_map(model_col, prev_start, prev_end)
+            points: List[PeriodComparisonPoint] = []
+            slot = cls._truncate_slot(start, resolved)
+            prev_slot = cls._truncate_slot(prev_start, resolved)
+            while slot <= end:
+                nxt = cls._next_slot(slot, resolved)
+                points.append(PeriodComparisonPoint(
+                    label=cls._slot_label(slot, resolved),
+                    slot_start=slot, slot_end=nxt,
+                    current=curr_map.get(slot, 0),
+                    previous=prev_map.get(prev_slot, 0),
+                ))
+                slot = nxt
+                prev_slot = cls._next_slot(prev_slot, resolved)
+            return points
+
+        async def _per_camera(model, model_col) -> List[CameraBreakdownPoint]:
+            q = (
+                select(Camera.id, Camera.name, func.count(model.id).label("cnt"))
+                .join(Camera, Camera.id == model.camera_id)
+                .where(model_col >= start, model_col <= end)
+                .group_by(Camera.id, Camera.name)
+                .order_by(func.count(model.id).desc())
+            )
+            if cam_ids:
+                q = q.where(model.camera_id.in_(cam_ids))
+            rows = (await db.execute(q)).all()
+            return [CameraBreakdownPoint(camera_id=r[0], camera_name=r[1], count=r[2]) for r in rows]
+
+        # ── FOOTFALL ───────────────────────────────────────────────────
+        if metric == "footfall":
+            total_visitors = (await db.execute(_ts_q(start, end))).scalar() or 0
+
+            # Hourly map for peak hour + footfall_over_time
+            h_bexpr = func.date_trunc("hour", TrackSession.started_at)
+            hq = (
+                select(h_bexpr.label("b"), func.count(TrackSession.id).label("c"))
+                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
+                .group_by("b").order_by("b")
+            )
+            if cam_ids:
+                hq = hq.where(TrackSession.camera_id.in_(cam_ids))
+            h_rows = (await db.execute(hq)).all()
+            hourly_cnt = {r.b: r.c for r in h_rows}
+            hourly_int = {r.b.hour: r.c for r in h_rows}
+
+            # daily map for avg_daily + busiest_day
+            d_bexpr = func.date_trunc("day", TrackSession.started_at)
+            dq = (
+                select(d_bexpr.label("b"), func.count(TrackSession.id).label("c"))
+                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
+                .group_by("b").order_by("b")
+            )
+            if cam_ids:
+                dq = dq.where(TrackSession.camera_id.in_(cam_ids))
+            d_rows = (await db.execute(dq)).all()
+            daily_cnt = {r.b: r.c for r in d_rows}
+
+            peak_h_dt = max(hourly_cnt, key=lambda k: hourly_cnt[k]) if hourly_cnt else None
+            busiest_day_dt = max(daily_cnt, key=lambda k: daily_cnt[k]) if daily_cnt else None
+            avg_daily = (total_visitors // max(len(daily_cnt), 1)) if daily_cnt else 0
+
+            # footfall_over_time (resolved granularity)
+            ff_map = await _slot_map(TrackSession.started_at, start, end)
+            footfall_over_time = cls._build_ff_slots(start, end, resolved, ff_map)
+            period_comp = await _period_comparison(TrackSession.started_at)
+            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+
+            return AnalyticsMetricsResponse(
+                **base_resp,
+                footfall_data=FootfallMetricData(
+                    total_visitors=total_visitors,
+                    peak_hour=PeakHourInfo(
+                        count=hourly_cnt[peak_h_dt],
+                        time=peak_h_dt.strftime("%H:%M"),
+                    ) if peak_h_dt else None,
+                    avg_daily=avg_daily,
+                    busiest_day=BusiestDayInfo(
+                        count=daily_cnt[busiest_day_dt],
+                        date=busiest_day_dt.strftime("%m-%d"),
+                    ) if busiest_day_dt else None,
+                    footfall_over_time=footfall_over_time,
+                    period_comparison=period_comp,
+                    per_camera_breakdown=cam_breakdown,
+                    peak_hours_label=cls._peak_hours_label(hourly_int),
+                ),
+            )
+
+        # ── GENDER ─────────────────────────────────────────────────────
+        if metric == "gender":
+            # Distinct persons in range
+            person_subq = (
+                select(TrackSession.person_identity_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                ).distinct()
+            )
+            if cam_ids:
+                person_subq = person_subq.where(TrackSession.camera_id.in_(cam_ids))
+            person_subq = person_subq.subquery()
+            demo = (await db.execute(
+                select(PersonIdentity.id, PersonIdentity.gender)
+                .where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
+            )).all()
+
+            gcnt: dict = {"male": 0, "female": 0, "unidentified": 0}
+            seen2: set = set()
+            for pid, raw in demo:
+                if pid in seen2: continue
+                seen2.add(pid)
+                gcnt[cls._v2_gender(raw)] += 1
+            total_g = sum(gcnt.values()) or 1
+
+            # gender_trend
+            bexpr = func.date_trunc(resolved, TrackSession.started_at)
+            gt_q = (
+                select(bexpr.label("b"), PersonIdentity.gender, func.count(TrackSession.id).label("c"))
+                .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id, isouter=True)
+                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
+                .group_by("b", PersonIdentity.gender).order_by("b")
+            )
+            if cam_ids:
+                gt_q = gt_q.where(TrackSession.camera_id.in_(cam_ids))
+            gt_rows = (await db.execute(gt_q)).all()
+            gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
+            for r in gt_rows:
+                gt_map[r.b][cls._v2_gender(r.gender)] += r.c
+
+            gender_trend: List[DashboardV2GenderTrendPoint] = []
+            slot = cls._truncate_slot(start, resolved)
+            while slot <= end:
+                nxt = cls._next_slot(slot, resolved)
+                bd = gt_map.get(slot, {})
+                gender_trend.append(DashboardV2GenderTrendPoint(
+                    label=cls._slot_label(slot, resolved), slot_start=slot, slot_end=nxt,
+                    male=bd.get("male", 0), female=bd.get("female", 0),
+                    unidentified=bd.get("unidentified", 0),
+                ))
+                slot = nxt
+
+            period_comp = await _period_comparison(TrackSession.started_at)
+            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+
+            return AnalyticsMetricsResponse(
+                **base_resp,
+                gender_data=GenderMetricData(
+                    total_male=gcnt["male"],
+                    total_female=gcnt["female"],
+                    total_unidentified=gcnt["unidentified"],
+                    male_pct=round(gcnt["male"] / total_g * 100, 1),
+                    female_pct=round(gcnt["female"] / total_g * 100, 1),
+                    unidentified_pct=round(gcnt["unidentified"] / total_g * 100, 1),
+                    gender_trend=gender_trend,
+                    period_comparison=period_comp,
+                    per_camera_breakdown=cam_breakdown,
+                ),
+            )
+
+        # ── AGE GROUPS ─────────────────────────────────────────────────
+        if metric == "age_groups":
+            person_subq2 = (
+                select(TrackSession.person_identity_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                ).distinct()
+            )
+            if cam_ids:
+                person_subq2 = person_subq2.where(TrackSession.camera_id.in_(cam_ids))
+            person_subq2 = person_subq2.subquery()
+            age_demo = (await db.execute(
+                select(PersonIdentity.id, PersonIdentity.estimated_age)
+                .where(PersonIdentity.id.in_(select(person_subq2.c.person_identity_id)))
+            )).all()
+
+            age_cnt2: dict = {k: 0 for k, *_ in cls._V2_AGE_BINS}
+            age_cnt2["unidentified"] = 0
+            seen3: set = set()
+            for pid, estimated_age in age_demo:
+                if pid in seen3: continue
+                seen3.add(pid)
+                age_cnt2[cls._v2_age_bin(estimated_age)] += 1
+
+            named2 = {k: age_cnt2[k] for k, *_ in cls._V2_AGE_BINS}
+            pk = max(named2, key=lambda k: named2[k]) if any(named2.values()) else None
+            peak_lbl = None
+            if pk:
+                for k, lbl, *_ in cls._V2_AGE_BINS:
+                    if k == pk:
+                        peak_lbl = f"{lbl} dominant"
+                        break
+
+            total_identified = sum(named2.values())
+            distribution = [
+                DashboardV2AgeGroupDistributionPoint(key=k, label=lbl, count=age_cnt2[k])
+                for k, lbl, *_ in cls._V2_AGE_BINS
+            ] + [DashboardV2AgeGroupDistributionPoint(
+                key="unidentified", label="Unidentified", count=age_cnt2["unidentified"]
+            )]
+
+            period_comp = await _period_comparison(TrackSession.started_at)
+            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+
+            return AnalyticsMetricsResponse(
+                **base_resp,
+                age_groups_data=AgeGroupsMetricData(
+                    total_identified=total_identified,
+                    total_unidentified=age_cnt2["unidentified"],
+                    peak_group=peak_lbl,
+                    age_group_distribution=distribution,
+                    period_comparison=period_comp,
+                    per_camera_breakdown=cam_breakdown,
+                ),
+            )
+
+        # ── PURCHASE ───────────────────────────────────────────────────
+        if metric == "purchase":
+            total_purchases = (await db.execute(_purchase_q(start, end))).scalar() or 0
+            total_visitors_p = (await db.execute(_ts_q(start, end))).scalar() or 0
+            conv_pct = round(total_purchases / max(total_visitors_p, 1) * 100, 1)
+
+            # Daily map
+            d_bexpr2 = func.date_trunc("day", BillingInteraction.entered_at)
+            dq2 = (
+                select(d_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
+                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
+                .group_by("b").order_by("b")
+            )
+            if cam_ids:
+                dq2 = dq2.where(BillingInteraction.camera_id.in_(cam_ids))
+            d_rows2 = (await db.execute(dq2)).all()
+            daily2 = {r.b: r.c for r in d_rows2}
+
+            busiest2 = max(daily2, key=lambda k: daily2[k]) if daily2 else None
+            avg_daily2 = (total_purchases // max(len(daily2), 1)) if daily2 else 0
+
+            # Hourly map for peak_hours_label
+            h_bexpr2 = func.date_trunc("hour", BillingInteraction.entered_at)
+            hq2 = (
+                select(h_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
+                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
+                .group_by("b").order_by("b")
+            )
+            if cam_ids:
+                hq2 = hq2.where(BillingInteraction.camera_id.in_(cam_ids))
+            h_rows2 = (await db.execute(hq2)).all()
+            hourly_int2 = {r.b.hour: r.c for r in h_rows2}
+
+            # purchases_over_time
+            pur_map = await _slot_map(BillingInteraction.entered_at, start, end)
+            purchases_ot = cls._build_ff_slots(start, end, resolved, pur_map)
+            period_comp = await _period_comparison(BillingInteraction.entered_at)
+            cam_breakdown2 = await _per_camera(BillingInteraction, BillingInteraction.entered_at)
+
+            return AnalyticsMetricsResponse(
+                **base_resp,
+                purchase_data=PurchaseMetricData(
+                    total_purchases=total_purchases,
+                    conversion_pct=conv_pct,
+                    avg_daily=avg_daily2,
+                    busiest_day=BusiestDayInfo(
+                        count=daily2[busiest2],
+                        date=busiest2.strftime("%m-%d"),
+                    ) if busiest2 else None,
+                    purchases_over_time=purchases_ot,
+                    period_comparison=period_comp,
+                    per_camera_breakdown=cam_breakdown2,
+                    peak_hours_label=cls._peak_hours_label(hourly_int2),
+                ),
+            )
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid metric '{metric}'. Choose one of: footfall, gender, age_groups, purchase",
         )
 
     @staticmethod
