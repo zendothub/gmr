@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.db.models.user import User, Role, UserStatus
-from app.utils.encryption import hash_password
-from app.modules.users.schemas import UserCreate, UserUpdate
+from app.utils.encryption import hash_password, verify_password
+from app.modules.users.schemas import UserCreate, UserUpdate, UpdateProfile, UpdatePassword
 
 
 class UserService:
@@ -102,6 +102,36 @@ class UserService:
         await db.refresh(user)
         logger.info(f"User updated: {user.email} (id={user_id})")
         return user
+
+    @staticmethod
+    async def update_profile(db: AsyncSession, current_user: User, data: UpdateProfile) -> User:
+        """Allow the authenticated user to update their own profile details (name)."""
+        update_fields = data.model_dump(exclude_unset=True)
+        for field, value in update_fields.items():
+            setattr(current_user, field, value)
+
+        await db.flush()
+        await db.refresh(current_user)
+        logger.info(f"Profile updated for user: {current_user.email} (id={current_user.id})")
+        return current_user
+
+    @staticmethod
+    async def update_password(db: AsyncSession, current_user: User, data: UpdatePassword) -> dict:
+        """Allow the authenticated user to change their password."""
+        if not verify_password(data.current_password, current_user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is incorrect",
+            )
+        if data.new_password != data.confirm_new_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password and confirmation do not match",
+            )
+        current_user.hashed_password = hash_password(data.new_password)
+        await db.flush()
+        logger.info(f"Password changed for user: {current_user.email} (id={current_user.id})")
+        return {"message": "Password updated successfully"}
 
     @staticmethod
     async def delete_user(db: AsyncSession, user_id: UUID) -> dict:

@@ -32,6 +32,18 @@ class UserUpdate(BaseModel):
     role: Optional[str] = Field(None, pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$")
 
 
+class UpdateProfile(BaseModel):
+    """Schema for the authenticated user to update their own profile details."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+
+
+class UpdatePassword(BaseModel):
+    """Schema for the authenticated user to change their password."""
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6, max_length=128)
+    confirm_new_password: str = Field(..., min_length=6, max_length=128)
+
+
 class UserDetailResponse(BaseModel):
     id: UUID
     name: str
