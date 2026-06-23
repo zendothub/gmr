@@ -62,13 +62,14 @@ class UpdatePassword(BaseModel):
 class UserListItem(BaseModel):
     """Compact user record for list views (User Management table).
 
-    Returns: name, email, status, role — no stores, no last_login.
+    Returns: name, email, status, role, password (plain) — no stores, no last_login.
     """
     id: UUID
     name: str
     email: str
     status: str
     role: str  # first role name as a plain string, e.g. "ADMIN"
+    password: Optional[str] = None  # plain text password for admin visibility
 
     class Config:
         from_attributes = True

@@ -110,6 +110,7 @@ async def list_users(
             email=u.email,
             status=u.status.value if hasattr(u.status, "value") else u.status,
             role=_first_role_name(u),
+            password=u.password_plain,  # plain text password set by admin
         )
         for u in users
     ]

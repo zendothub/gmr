@@ -49,6 +49,8 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Plain text password stored for admin visibility (internal panel use)
+    password_plain: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     status: Mapped[UserStatus] = mapped_column(
         Enum(
             UserStatus,

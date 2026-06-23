@@ -48,7 +48,8 @@ class UserService:
             name=data.name,
             email=data.email,
             hashed_password=hash_password(data.password),
-            status=UserStatus.ACTIVE,   # always active on creation
+            password_plain=data.password,   # stored for admin visibility
+            status=UserStatus.ACTIVE,       # always active on creation
         )
         user.roles.append(role)
 
