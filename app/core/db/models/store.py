@@ -1,10 +1,10 @@
 """Store model - retail outlets across the airport."""
 
 import enum
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy import String, Enum, Text, Integer
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -40,3 +40,6 @@ class Store(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     footfall_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     purchase_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     camera_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+
+    # Cameras linked to this store
+    cameras: Mapped[List["Camera"]] = relationship("Camera", back_populates="store")

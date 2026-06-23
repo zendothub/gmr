@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from loguru import logger
 
 from app.core.db.models.camera import Camera, CameraStatus
+from app.core.db.models.store import Store
 from app.modules.cameras.schemas import (
     CameraCreate, CameraUpdate, CameraResponse, RTSPTestResponse, CameraHealthResponse
 )
@@ -37,6 +38,10 @@ class CameraService:
         resp.stream_path = camera.stream_path or endpoints.path
         resp.webrtc_url = endpoints.webrtc_url
         resp.hls_url = endpoints.hls_url
+        # Populate store-derived fields if a store is linked
+        if camera.store:
+            resp.store_name = camera.store.name
+            resp.store_zone_gate = camera.store.zone_gate
         return resp
 
 
@@ -90,6 +95,58 @@ class CameraService:
                 cap.release()
 
     @staticmethod
+    async def create_camera_v2(db: AsyncSession, data: "CameraCreateV2") -> Camera:
+        """Create a new camera linked to a store (V2).
+
+        Same logic as create_camera but store_id is required.
+        The store must exist — validated by the caller (router).
+        """
+        from app.modules.cameras.schemas import CameraCreateV2
+
+        resolution = None
+        test_result = None
+        if not data.skip_rtsp_test:
+            test_result = CameraService.test_rtsp_stream(data.rtsp_url)
+            if not test_result.success:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"RTSP stream test failed: {test_result.message}",
+                )
+            resolution = test_result.resolution
+
+        camera_kwargs: dict = {
+            "name": data.name,
+            "rtsp_url": data.rtsp_url,
+            "area_id": data.area_id,
+            "store_id": data.store_id,
+            "status": CameraStatus.INACTIVE,
+            "is_active": True,
+        }
+        if resolution:
+            camera_kwargs["resolution"] = resolution
+        camera = Camera(**camera_kwargs)
+
+        db.add(camera)
+        await db.flush()
+        camera.stream_path = camera_path(camera.id)
+        await db.flush()
+        await db.refresh(camera)
+
+        logger.info(f"Camera created (v2): {camera.name} (id={camera.id}, store_id={camera.store_id})")
+
+        # Auto-start stream publisher
+        try:
+            manager = StreamManager.get_instance()
+            await anyio.to_thread.run_sync(
+                manager.add_viewer, camera.id, camera.rtsp_url
+            )
+            logger.info(f"Stream publisher auto-started for new camera {camera.id}")
+        except Exception as e:
+            logger.warning(f"Could not auto-start stream publisher for new camera: {e}")
+
+        return camera
+
+    @staticmethod
     async def create_camera(db: AsyncSession, data: CameraCreate) -> Camera:
         """Create a new camera (name + rtsp_url + area). RTSP probe is optional."""
         resolution = None
@@ -103,7 +160,7 @@ class CameraService:
                 )
             resolution = test_result.resolution
 
-        # Only name + rtsp_url + area are sent by the frontend.
+        # Only name + rtsp_url + area + store are sent by the frontend.
         # All AI-config fields (fps_target, detection_model, reid_enabled, ...)
         # use the model's column defaults — never exposed to the client.
         camera_kwargs: dict = {
@@ -113,6 +170,16 @@ class CameraService:
             "status": CameraStatus.INACTIVE,
             "is_active": True,
         }
+        # If store_id is provided, validate and link store
+        if hasattr(data, "store_id") and data.store_id:
+            store_result = await db.execute(select(Store).where(Store.id == data.store_id))
+            store = store_result.scalar_one_or_none()
+            if not store:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Store not found: {data.store_id}",
+                )
+            camera_kwargs["store_id"] = data.store_id
         # Auto-detected resolution from RTSP probe (overrides model default).
         if resolution:
             camera_kwargs["resolution"] = resolution

@@ -29,12 +29,13 @@ async def footfall_analytics(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     camera_id: Optional[UUID] = Query(None),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     interval: str = Query("hour", pattern="^(hour|day|week)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get footfall (entry-line crossings) analytics."""
-    return await AnalyticsService.get_footfall(db, start_time, end_time, camera_id, interval)
+    return await AnalyticsService.get_footfall(db, start_time, end_time, camera_id, store_id, interval)
 
 
 @router.get("/billing", response_model=BillingAnalyticsResponse)
@@ -42,12 +43,13 @@ async def billing_analytics(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     camera_id: Optional[UUID] = Query(None),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     interval: str = Query("hour", pattern="^(hour|day|week)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get billing counter interaction analytics."""
-    return await AnalyticsService.get_billing_analytics(db, start_time, end_time, camera_id, interval)
+    return await AnalyticsService.get_billing_analytics(db, start_time, end_time, camera_id, store_id, interval)
 
 
 @router.get("/dwell", response_model=DwellAnalyticsResponse)
@@ -55,11 +57,12 @@ async def dwell_analytics(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     camera_id: Optional[UUID] = Query(None),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get average dwell time analytics."""
-    return await AnalyticsService.get_dwell_analytics(db, start_time, end_time, camera_id)
+    return await AnalyticsService.get_dwell_analytics(db, start_time, end_time, camera_id, store_id)
 
 
 @router.get("/zone-occupancy", response_model=ZoneOccupancyResponse)
@@ -78,6 +81,7 @@ async def dashboard_summary(
     start_time: Optional[datetime] = Query(None, description="Range start (default: 24h ago)"),
     end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
     camera_id: Optional[UUID] = Query(None, description="Optional camera filter"),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -91,7 +95,7 @@ async def dashboard_summary(
     - demographics: age-group (children, teenager, adult, senior citizen)
                     and gender (male, female) breakdown
     """
-    return await AnalyticsService.get_dashboard_summary(db, start_time, end_time, camera_id)
+    return await AnalyticsService.get_dashboard_summary(db, start_time, end_time, camera_id, store_id)
 
 
 @router.get("/demographics", response_model=DemographicsTableResponse)
@@ -99,6 +103,7 @@ async def demographics_table(
     start_time: Optional[datetime] = Query(None, description="Range start (default: 24h ago)"),
     end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
     camera_id: Optional[UUID] = Query(None, description="Optional camera filter"),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -110,7 +115,7 @@ async def demographics_table(
     Includes a summary row with overall totals.
     """
     return await AnalyticsService.get_demographics_table(
-        db, start_time=start_time, end_time=end_time, camera_id=camera_id
+        db, start_time=start_time, end_time=end_time, camera_id=camera_id, store_id=store_id
     )
 
 
@@ -129,6 +134,7 @@ async def visitor_entry_exit(
     start_time: Optional[datetime] = Query(None, description="Range start (default: 24 h ago)"),
     end_time: Optional[datetime] = Query(None, description="Range end (default: now)"),
     camera_id: Optional[UUID] = Query(None, description="Optional camera filter"),
+    store_id: Optional[UUID] = Query(None, description="Filter by store — overrides camera_id"),
     group_by: str = Query(
         "auto",
         pattern="^(hour|day|week|month|auto)$",
@@ -161,11 +167,15 @@ async def visitor_entry_exit(
     **Auto granularity rules:**
     - range ≤ 2 days → `hour` (24–48 points)
     - range > 2 days → `day`  (e.g. 7 points for last-7-days)
+
+    **Store filter:** When store_id is provided, only cameras linked to that
+    store are included — enables store-wise analytics.
     """
     return await AnalyticsService.get_entry_exit_hourly(
         db,
         start_time=start_time,
         end_time=end_time,
         camera_id=camera_id,
+        store_id=store_id,
         group_by=group_by,
     )

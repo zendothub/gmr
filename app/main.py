@@ -19,6 +19,7 @@ from app.lifecycle import lifespan
 from app.modules.auth.router import router as auth_router
 from app.modules.users.router import router as users_router
 from app.modules.cameras.router import router as cameras_router
+from app.modules.cameras.v2_router import v2_router as cameras_v2_router
 from app.modules.areas.router import router as areas_router
 
 from app.modules.zones.router import router as zones_router
@@ -99,6 +100,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(cameras_router)
+app.include_router(cameras_v2_router)
 app.include_router(areas_router)
 
 app.include_router(zones_router)

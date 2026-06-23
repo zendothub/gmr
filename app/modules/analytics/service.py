@@ -14,6 +14,7 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.person import PersonIdentity
+from app.core.db.models.store import Store
 from collections import defaultdict
 from app.modules.analytics.schemas import (
     FootfallPoint,
@@ -42,6 +43,29 @@ def _default_range(start_time: Optional[datetime], end_time: Optional[datetime])
     return start, end
 
 
+async def _resolve_camera_ids(
+    db: AsyncSession,
+    camera_id: Optional[UUID] = None,
+    store_id: Optional[UUID] = None,
+) -> Optional[list[UUID]]:
+    """Resolve camera_id/store_id to a list of camera UUIDs for filtering.
+
+    - If camera_id is provided, returns [camera_id] (explicit camera filter).
+    - If store_id is provided, returns all camera IDs linked to that store.
+    - If both are provided, camera_id takes precedence.
+    - If neither is provided, returns None (no camera filter).
+    """
+    if camera_id:
+        return [camera_id]
+    if store_id:
+        result = await db.execute(
+            select(Camera.id).where(Camera.store_id == store_id)
+        )
+        cam_ids = [row[0] for row in result.all()]
+        return cam_ids if cam_ids else None  # None if store has no cameras → no results
+    return None
+
+
 class AnalyticsService:
 
     @staticmethod
@@ -50,10 +74,12 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
         interval: str = "hour",
     ) -> FootfallResponse:
         """Footfall from entry-line crossing events (entry cameras)."""
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         query = select(Event).where(
             Event.event_type == "line_crossing",
@@ -61,8 +87,8 @@ class AnalyticsService:
             Event.occurred_at <= end,
             Event.is_false_positive.is_(False),
         )
-        if camera_id:
-            query = query.where(Event.camera_id == camera_id)
+        if cam_ids:
+            query = query.where(Event.camera_id.in_(cam_ids))
 
         total = (
             await db.execute(select(func.count()).select_from(query.subquery()))
@@ -76,8 +102,8 @@ class AnalyticsService:
             Event.person_identity_id.isnot(None),
             Event.is_false_positive.is_(False),
         )
-        if camera_id:
-            unique_q = unique_q.where(Event.camera_id == camera_id)
+        if cam_ids:
+            unique_q = unique_q.where(Event.camera_id.in_(cam_ids))
         unique_visitors = (await db.execute(unique_q)).scalar() or 0
 
         # Timeline buckets
@@ -93,8 +119,8 @@ class AnalyticsService:
             .group_by("bucket")
             .order_by("bucket")
         )
-        if camera_id:
-            timeline_q = timeline_q.where(Event.camera_id == camera_id)
+        if cam_ids:
+            timeline_q = timeline_q.where(Event.camera_id.in_(cam_ids))
         rows = (await db.execute(timeline_q)).all()
 
         return FootfallResponse(
@@ -111,17 +137,19 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
         interval: str = "hour",
     ) -> BillingAnalyticsResponse:
         """Billing counter interaction analytics."""
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         base = select(BillingInteraction).where(
             BillingInteraction.entered_at >= start,
             BillingInteraction.entered_at <= end,
         )
-        if camera_id:
-            base = base.where(BillingInteraction.camera_id == camera_id)
+        if cam_ids:
+            base = base.where(BillingInteraction.camera_id.in_(cam_ids))
 
         total = (
             await db.execute(select(func.count()).select_from(base.subquery()))
@@ -134,8 +162,8 @@ class AnalyticsService:
             BillingInteraction.entered_at >= start,
             BillingInteraction.entered_at <= end,
         )
-        if camera_id:
-            agg_q = agg_q.where(BillingInteraction.camera_id == camera_id)
+        if cam_ids:
+            agg_q = agg_q.where(BillingInteraction.camera_id.in_(cam_ids))
         avg_dwell, max_dwell = (await db.execute(agg_q)).one()
 
         bucket = func.date_trunc(interval, BillingInteraction.entered_at)
@@ -148,8 +176,8 @@ class AnalyticsService:
             .group_by("bucket")
             .order_by("bucket")
         )
-        if camera_id:
-            timeline_q = timeline_q.where(BillingInteraction.camera_id == camera_id)
+        if cam_ids:
+            timeline_q = timeline_q.where(BillingInteraction.camera_id.in_(cam_ids))
         rows = (await db.execute(timeline_q)).all()
 
         return BillingAnalyticsResponse(
@@ -167,9 +195,11 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
     ) -> DwellAnalyticsResponse:
         """Average dwell (track session duration) analytics."""
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         duration = func.extract(
             "epoch", TrackSession.last_seen_at - TrackSession.started_at
@@ -179,8 +209,8 @@ class AnalyticsService:
             TrackSession.started_at >= start,
             TrackSession.started_at <= end,
         )
-        if camera_id:
-            agg_q = agg_q.where(TrackSession.camera_id == camera_id)
+        if cam_ids:
+            agg_q = agg_q.where(TrackSession.camera_id.in_(cam_ids))
         avg_duration, total = (await db.execute(agg_q)).one()
 
         by_camera_q = (
@@ -249,6 +279,7 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
     ) -> DashboardSummaryResponse:
         """
         Unified dashboard summary within a datetime range.
@@ -260,6 +291,7 @@ class AnalyticsService:
         - demographics: age-group and gender breakdown from PersonIdentity
         """
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         # --- Unique persons (distinct person_identity_id in TrackSession) ---
         unique_q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
@@ -267,8 +299,8 @@ class AnalyticsService:
             TrackSession.started_at <= end,
             TrackSession.person_identity_id.isnot(None),
         )
-        if camera_id:
-            unique_q = unique_q.where(TrackSession.camera_id == camera_id)
+        if cam_ids:
+            unique_q = unique_q.where(TrackSession.camera_id.in_(cam_ids))
         unique_persons = (await db.execute(unique_q)).scalar() or 0
 
         # --- Total entries (line_crossing events — true footfall count) ---
@@ -278,8 +310,8 @@ class AnalyticsService:
             Event.occurred_at <= end,
             Event.is_false_positive.is_(False),
         )
-        if camera_id:
-            entries_q = entries_q.where(Event.camera_id == camera_id)
+        if cam_ids:
+            entries_q = entries_q.where(Event.camera_id.in_(cam_ids))
         total_entries = (await db.execute(entries_q)).scalar() or 0
 
         # --- Total purchases (billing interactions) ---
@@ -287,8 +319,8 @@ class AnalyticsService:
             BillingInteraction.entered_at >= start,
             BillingInteraction.entered_at <= end,
         )
-        if camera_id:
-            purchases_q = purchases_q.where(BillingInteraction.camera_id == camera_id)
+        if cam_ids:
+            purchases_q = purchases_q.where(BillingInteraction.camera_id.in_(cam_ids))
         total_purchases = (await db.execute(purchases_q)).scalar() or 0
 
         # --- Demographics: age-group & gender counts from PersonIdentity ---
@@ -303,9 +335,9 @@ class AnalyticsService:
             )
             .distinct()
         )
-        if camera_id:
+        if cam_ids:
             distinct_persons_subq = distinct_persons_subq.where(
-                TrackSession.camera_id == camera_id
+                TrackSession.camera_id.in_(cam_ids)
             )
         distinct_persons_subq = distinct_persons_subq.subquery()
 
@@ -394,6 +426,7 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
     ) -> DemographicsTableResponse:
         """
         Cross-tabulated demographics: age_group × gender, plus per-group purchases.
@@ -402,14 +435,15 @@ class AnalyticsService:
         time range.  ``summary.total_visitors`` is the total track session count.
         """
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         # ── 1. Total track sessions (visitors) ──────────────────────────
         sessions_q = select(func.count(TrackSession.id)).where(
             TrackSession.started_at >= start,
             TrackSession.started_at <= end,
         )
-        if camera_id:
-            sessions_q = sessions_q.where(TrackSession.camera_id == camera_id)
+        if cam_ids:
+            sessions_q = sessions_q.where(TrackSession.camera_id.in_(cam_ids))
         total_visitors = (await db.execute(sessions_q)).scalar() or 0
 
         # ── 2. Distinct person IDs seen in range ────────────────────────
@@ -422,8 +456,8 @@ class AnalyticsService:
             )
             .distinct()
         )
-        if camera_id:
-            person_subq = person_subq.where(TrackSession.camera_id == camera_id)
+        if cam_ids:
+            person_subq = person_subq.where(TrackSession.camera_id.in_(cam_ids))
         person_subq = person_subq.subquery()
 
         # ── 3. Fetch demographics for those persons ─────────────────────
@@ -444,8 +478,8 @@ class AnalyticsService:
                 BillingInteraction.person_identity_id.isnot(None),
             )
         )
-        if camera_id:
-            purchase_subq = purchase_subq.where(BillingInteraction.camera_id == camera_id)
+        if cam_ids:
+            purchase_subq = purchase_subq.where(BillingInteraction.camera_id.in_(cam_ids))
         purchase_subq = purchase_subq.subquery()
 
         purchase_q = select(
@@ -584,6 +618,7 @@ class AnalyticsService:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         camera_id: Optional[UUID] = None,
+        store_id: Optional[UUID] = None,
         group_by: str = "auto",
     ) -> VisitorEntryExitResponse:
         """
@@ -601,6 +636,7 @@ class AnalyticsService:
         slots) so the frontend gets a gapless series for the graph.
         """
         start, end = _default_range(start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
 
         range_days = (end - start).total_seconds() / 86400
         resolved = AnalyticsService._resolve_group_by(group_by, range_days)
@@ -625,8 +661,8 @@ class AnalyticsService:
             .group_by("bucket", Event.event_type)
             .order_by("bucket")
         )
-        if camera_id:
-            q = q.where(Event.camera_id == camera_id)
+        if cam_ids:
+            q = q.where(Event.camera_id.in_(cam_ids))
 
         rows = (await db.execute(q)).all()
 
