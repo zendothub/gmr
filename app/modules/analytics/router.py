@@ -18,10 +18,12 @@ from app.modules.analytics.schemas import (
     DashboardSummaryResponse,
     DemographicsTableResponse,
     VisitorEntryExitResponse,
+    DashboardV2Response,
 )
 from app.modules.analytics.service import AnalyticsService
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
+v2_router = APIRouter(prefix="/api/v2/analytics", tags=["Analytics V2"])
 
 
 @router.get("/footfall", response_model=FootfallResponse)
@@ -178,4 +180,57 @@ async def visitor_entry_exit(
         camera_id=camera_id,
         store_id=store_id,
         group_by=group_by,
+    )
+
+
+# ---------------------------------------------------------------------------
+# V2 Dashboard
+# ---------------------------------------------------------------------------
+
+@v2_router.get("/dashboard", response_model=DashboardV2Response)
+async def dashboard_v2(
+    store_id: Optional[UUID] = Query(
+        None,
+        description="Filter by store UUID. Omit (or leave blank) to include all stores.",
+    ),
+    time_range: str = Query(
+        "today",
+        pattern="^(today|this_week|custom)$",
+        description=(
+            "'today'     → from 00:00 today to now (hourly slots). "
+            "'this_week' → from Monday 00:00 to now (hourly slots). "
+            "'custom'    → use start_time / end_time; granularity auto-selected."
+        ),
+    ),
+    start_time: Optional[datetime] = Query(
+        None, description="Range start — only used when time_range='custom'."
+    ),
+    end_time: Optional[datetime] = Query(
+        None, description="Range end — only used when time_range='custom'."
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Unified V2 dashboard — single endpoint that powers the Retail Intelligence page.
+
+    **Filters**
+    - `store_id`   → omit for All Stores, pass a UUID to scope to one store
+    - `time_range` → `today` | `this_week` | `custom`
+
+    **Response highlights**
+    - `total_cameras` / `active_cameras` — camera badge ("6 / 8 Cameras")
+    - `footfall`      — total visitors + % change vs previous equivalent period
+    - `gender`        — male / female / unidentified counts and percentages
+    - `age_groups`    — 6 bins (Under 18, 18-24, 25-34, 35-44, 45-60, 60+) + peak label
+    - `purchase_count`— total purchases, conversion %, % vs previous period
+    - `footfall_over_time` — gapless hourly (or daily for long ranges) visitor counts
+    - `gender_trend`  — gapless hourly male / female / unidentified stacked bar data
+    """
+    return await AnalyticsService.get_dashboard_v2(
+        db,
+        store_id=store_id,
+        time_range=time_range,
+        start_time=start_time,
+        end_time=end_time,
     )

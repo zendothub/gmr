@@ -32,6 +32,14 @@ from app.modules.analytics.schemas import (
     DemographicsTableResponse,
     VisitorEntryExitPoint,
     VisitorEntryExitResponse,
+    DashboardV2Response,
+    DashboardV2FootfallMetric,
+    DashboardV2GenderMetric,
+    DashboardV2AgeGroupsMetric,
+    DashboardV2PurchaseMetric,
+    DashboardV2FootfallPoint,
+    DashboardV2GenderTrendPoint,
+    DashboardV2AgeGroupDistributionPoint,
 )
 from app.utils.time_utils import utc_now
 
@@ -706,6 +714,305 @@ class AnalyticsService:
             total_entry=total_entry,
             total_exit=total_exit,
             data=data,
+        )
+
+    # ── V2 Dashboard age-group bins (matches UI card) ─────────────────────────
+    _V2_AGE_BINS = [
+        ("under_18",   "Under 18",  0,   17),
+        ("age_18_24",  "18-24",    18,   24),
+        ("age_25_34",  "25-34",    25,   34),
+        ("age_35_44",  "35-44",    35,   44),
+        ("age_45_60",  "45-60",    45,   60),
+        ("age_60_plus","60+",      61,  999),
+    ]
+
+    @classmethod
+    def _v2_age_bin(cls, estimated_age: Optional[int]) -> str:
+        """Map estimated_age to the 6 UI age-group keys (or 'unidentified')."""
+        if estimated_age is None:
+            return "unidentified"
+        for key, _label, lo, hi in cls._V2_AGE_BINS:
+            if lo <= estimated_age <= hi:
+                return key
+        return "unidentified"
+
+    @staticmethod
+    def _v2_gender(raw: Optional[str]) -> str:
+        if not raw:
+            return "unidentified"
+        g = raw.strip().upper()
+        if g in ("M", "MALE"):
+            return "male"
+        if g in ("F", "FEMALE"):
+            return "female"
+        return "unidentified"
+
+    @staticmethod
+    def _v2_pct_change(current: int, prev: int) -> Optional[float]:
+        """Return % change rounded to 1 dp, or None if previous period is 0."""
+        if prev == 0:
+            return None
+        return round((current - prev) / prev * 100, 1)
+
+    @staticmethod
+    def _v2_resolve_range(time_range: str, start_time: Optional[datetime], end_time: Optional[datetime]):
+        """Return (start, end, prev_start, prev_end) for the requested time_range."""
+        now = utc_now()
+        if time_range == "today":
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = now
+            duration = end - start
+            return start, end, start - duration, start
+        if time_range == "this_week":
+            # Monday 00:00 of current week
+            monday = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            end = now
+            return monday, end, monday - timedelta(weeks=1), monday
+        # custom
+        end = end_time or now
+        start = start_time or (end - timedelta(hours=24))
+        duration = end - start
+        return start, end, start - duration, start
+
+    @classmethod
+    async def get_dashboard_v2(
+        cls,
+        db: AsyncSession,
+        store_id: Optional[UUID] = None,
+        time_range: str = "today",
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> DashboardV2Response:
+        """
+        Single consolidated V2 dashboard response.
+
+        Powers the Retail Intelligence page:
+        - Footfall card (total visitors + % vs prev period)
+        - Gender card   (male / female / unidentified %)
+        - Age Groups card (6 bins + peak label)
+        - Purchase Count card (total + conversion % + % vs prev)
+        - Foot Fall Over Time chart (hourly counts)
+        - Gender Classification Trend chart (hourly male/female/unidentified stacked bars)
+        - Camera badge (total / active cameras)
+        """
+        start, end, prev_start, prev_end = cls._v2_resolve_range(time_range, start_time, end_time)
+        cam_ids = await _resolve_camera_ids(db, store_id=store_id)
+
+        # ── 1. Store name ────────────────────────────────────────────────
+        store_name = "All Stores"
+        if store_id:
+            store_row = await db.execute(select(Store.name).where(Store.id == store_id))
+            sn = store_row.scalar_one_or_none()
+            if sn:
+                store_name = sn
+
+        # ── 2. Camera counts ─────────────────────────────────────────────
+        cam_base = select(func.count(Camera.id)).where(Camera.is_active.is_(True))
+        active_base = cam_base.where(Camera.status == "active")
+        if store_id:
+            cam_base = cam_base.where(Camera.store_id == store_id)
+            active_base = active_base.where(Camera.store_id == store_id)
+        total_cameras = (await db.execute(cam_base)).scalar() or 0
+        active_cameras = (await db.execute(active_base)).scalar() or 0
+
+        # ── 3. Footfall (TrackSessions as visitor proxy) ─────────────────
+        def _ff_q(s, e):
+            q = select(func.count(TrackSession.id)).where(
+                TrackSession.started_at >= s,
+                TrackSession.started_at <= e,
+            )
+            if cam_ids:
+                q = q.where(TrackSession.camera_id.in_(cam_ids))
+            return q
+
+        total_visitors = (await db.execute(_ff_q(start, end))).scalar() or 0
+        prev_visitors  = (await db.execute(_ff_q(prev_start, prev_end))).scalar() or 0
+
+        # ── 4. Fetch demographics (distinct persons in range) ─────────────
+        person_subq = (
+            select(TrackSession.person_identity_id)
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
+            )
+            .distinct()
+        )
+        if cam_ids:
+            person_subq = person_subq.where(TrackSession.camera_id.in_(cam_ids))
+        person_subq = person_subq.subquery()
+
+        demo_rows = (await db.execute(
+            select(PersonIdentity.id, PersonIdentity.gender, PersonIdentity.estimated_age)
+            .where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
+        )).all()
+
+        # Gender counts
+        gender_cnt: dict = {"male": 0, "female": 0, "unidentified": 0}
+        age_cnt: dict = {k: 0 for k, *_ in cls._V2_AGE_BINS}
+        age_cnt["unidentified"] = 0
+        seen: set = set()
+
+        for pid, raw_gender, estimated_age in demo_rows:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            gender_cnt[cls._v2_gender(raw_gender)] += 1
+            age_cnt[cls._v2_age_bin(estimated_age)] += 1
+
+        total_demo = sum(gender_cnt.values()) or 1  # avoid div/0
+
+        def _pct(n: int) -> float:
+            return round(n / total_demo * 100, 1)
+
+        # Peak age group label
+        named_bins = {k: age_cnt[k] for k, *_ in cls._V2_AGE_BINS}
+        peak_key = max(named_bins, key=lambda k: named_bins[k]) if any(named_bins.values()) else None
+        peak_label = None
+        if peak_key:
+            for k, label, *_ in cls._V2_AGE_BINS:
+                if k == peak_key:
+                    peak_label = f"{label} dominant"
+                    break
+
+        # ── 5. Purchases ──────────────────────────────────────────────────
+        def _purchase_q(s, e):
+            q = select(func.count(BillingInteraction.id)).where(
+                BillingInteraction.entered_at >= s,
+                BillingInteraction.entered_at <= e,
+            )
+            if cam_ids:
+                q = q.where(BillingInteraction.camera_id.in_(cam_ids))
+            return q
+
+        total_purchases = (await db.execute(_purchase_q(start, end))).scalar() or 0
+        prev_purchases  = (await db.execute(_purchase_q(prev_start, prev_end))).scalar() or 0
+        conversion_pct = round(total_purchases / max(total_visitors, 1) * 100, 1)
+
+        # ── 6. Footfall Over Time (hourly — always 'hour' for today/this_week, 'day' for longer) ──
+        range_days = (end - start).total_seconds() / 86400
+        resolved = cls._resolve_group_by("auto", range_days)
+
+        bucket_expr = func.date_trunc(resolved, TrackSession.started_at)
+        ff_timeline_q = (
+            select(bucket_expr.label("bucket"), func.count(TrackSession.id).label("cnt"))
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+            )
+            .group_by("bucket")
+            .order_by("bucket")
+        )
+        if cam_ids:
+            ff_timeline_q = ff_timeline_q.where(TrackSession.camera_id.in_(cam_ids))
+
+        ff_rows = (await db.execute(ff_timeline_q)).all()
+        ff_map = {row.bucket: row.cnt for row in ff_rows}
+
+        footfall_over_time: List[DashboardV2FootfallPoint] = []
+        slot = cls._truncate_slot(start, resolved)
+        while slot <= end:
+            next_slot = cls._next_slot(slot, resolved)
+            footfall_over_time.append(DashboardV2FootfallPoint(
+                label=cls._slot_label(slot, resolved),
+                slot_start=slot,
+                slot_end=next_slot,
+                count=ff_map.get(slot, 0),
+            ))
+            slot = next_slot
+
+        # ── 7. Gender Trend (hourly stacked bars) ─────────────────────────
+        gender_trend_q = (
+            select(
+                bucket_expr.label("bucket"),
+                PersonIdentity.gender,
+                func.count(TrackSession.id).label("cnt"),
+            )
+            .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id, isouter=True)
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+            )
+            .group_by("bucket", PersonIdentity.gender)
+            .order_by("bucket")
+        )
+        if cam_ids:
+            gender_trend_q = gender_trend_q.where(TrackSession.camera_id.in_(cam_ids))
+
+        gt_rows = (await db.execute(gender_trend_q)).all()
+        gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
+        for row in gt_rows:
+            g = cls._v2_gender(row.gender)
+            gt_map[row.bucket][g] += row.cnt
+
+        gender_trend: List[DashboardV2GenderTrendPoint] = []
+        slot = cls._truncate_slot(start, resolved)
+        while slot <= end:
+            next_slot = cls._next_slot(slot, resolved)
+            bucket_data = gt_map.get(slot, {})
+            gender_trend.append(DashboardV2GenderTrendPoint(
+                label=cls._slot_label(slot, resolved),
+                slot_start=slot,
+                slot_end=next_slot,
+                male=bucket_data.get("male", 0),
+                female=bucket_data.get("female", 0),
+                unidentified=bucket_data.get("unidentified", 0),
+            ))
+            slot = next_slot
+
+        logger.info(
+            f"V2 Dashboard: store={store_id or 'all'}, range={time_range}, "
+            f"visitors={total_visitors}, purchases={total_purchases}, "
+            f"cameras={active_cameras}/{total_cameras}"
+        )
+
+        return DashboardV2Response(
+            store_id=store_id,
+            store_name=store_name,
+            time_range=time_range,
+            start_time=start,
+            end_time=end,
+            total_cameras=total_cameras,
+            active_cameras=active_cameras,
+            footfall=DashboardV2FootfallMetric(
+                total_visitors=total_visitors,
+                vs_prev_pct=cls._v2_pct_change(total_visitors, prev_visitors),
+            ),
+            gender=DashboardV2GenderMetric(
+                male=gender_cnt["male"],
+                female=gender_cnt["female"],
+                unidentified=gender_cnt["unidentified"],
+                male_pct=_pct(gender_cnt["male"]),
+                female_pct=_pct(gender_cnt["female"]),
+                unidentified_pct=_pct(gender_cnt["unidentified"]),
+            ),
+            age_groups=DashboardV2AgeGroupsMetric(
+                under_18=age_cnt["under_18"],
+                age_18_24=age_cnt["age_18_24"],
+                age_25_34=age_cnt["age_25_34"],
+                age_35_44=age_cnt["age_35_44"],
+                age_45_60=age_cnt["age_45_60"],
+                age_60_plus=age_cnt["age_60_plus"],
+                unidentified=age_cnt["unidentified"],
+                peak_group=peak_label,
+            ),
+            purchase_count=DashboardV2PurchaseMetric(
+                total=total_purchases,
+                conversion_pct=conversion_pct,
+                vs_prev_pct=cls._v2_pct_change(total_purchases, prev_purchases),
+            ),
+            footfall_over_time=footfall_over_time,
+            gender_trend=gender_trend,
+            age_group_distribution=[
+                DashboardV2AgeGroupDistributionPoint(key=k, label=lbl, count=age_cnt[k])
+                for k, lbl, *_ in cls._V2_AGE_BINS
+            ] + [
+                DashboardV2AgeGroupDistributionPoint(
+                    key="unidentified", label="Unidentified", count=age_cnt["unidentified"]
+                )
+            ],
         )
 
     @staticmethod
