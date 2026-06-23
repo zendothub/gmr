@@ -11,7 +11,14 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db.models.user import User, Role, UserStatus
 from app.utils.encryption import hash_password, verify_password
-from app.modules.users.schemas import UserCreate, UserUpdate, UpdateProfile, UpdatePassword
+from app.modules.users.schemas import UserCreate, UserUpdate, UpdateProfile, UpdatePassword, UserStatusUpdate
+
+
+def _first_role_name(user: User) -> str:
+    """Return the first role name as a plain string, or empty string if none."""
+    if user.roles:
+        return user.roles[0].name
+    return ""
 
 
 class UserService:
@@ -29,7 +36,7 @@ class UserService:
 
     @staticmethod
     async def create_user(db: AsyncSession, data: UserCreate) -> User:
-        """Create a new user."""
+        """Create a new user. Status is always set to 'active' automatically."""
         # Check if email already exists
         result = await db.execute(select(User).where(User.email == data.email))
         if result.scalar_one_or_none():
@@ -41,7 +48,7 @@ class UserService:
             name=data.name,
             email=data.email,
             hashed_password=hash_password(data.password),
-            status=UserStatus(data.status),
+            status=UserStatus.ACTIVE,   # always active on creation
         )
         user.roles.append(role)
 
@@ -53,16 +60,33 @@ class UserService:
             select(User).options(selectinload(User.roles)).where(User.id == user.id)
         )
         user = result.scalar_one()
-        logger.info(f"User created: {user.name} <{user.email}> (id={user.id})")
+        logger.info(f"User invited: {user.name} <{user.email}> role={data.role} (id={user.id})")
         return user
 
     @staticmethod
-    async def get_users(db: AsyncSession) -> List[User]:
-        """List all users."""
-        result = await db.execute(
-            select(User).options(selectinload(User.roles)).order_by(User.created_at.desc())
+    async def get_users(
+        db: AsyncSession,
+        role_filter: Optional[str] = None,
+    ) -> List[User]:
+        """List all users, optionally filtered by role (ADMIN or VIEWER).
+
+        Excludes SUPER_ADMIN accounts from the management list.
+        """
+        query = (
+            select(User)
+            .options(selectinload(User.roles))
+            .order_by(User.created_at.desc())
         )
-        return list(result.scalars().all())
+        result = await db.execute(query)
+        users = list(result.scalars().all())
+
+        # Filter out SUPER_ADMIN from the management list
+        users = [u for u in users if _first_role_name(u) != "SUPER_ADMIN"]
+
+        if role_filter:
+            users = [u for u in users if _first_role_name(u) == role_filter]
+
+        return users
 
     @staticmethod
     async def get_user(db: AsyncSession, user_id: UUID) -> User:
@@ -76,11 +100,24 @@ class UserService:
         return user
 
     @staticmethod
+    async def update_user_status(
+        db: AsyncSession,
+        user_id: UUID,
+        data: UserStatusUpdate,
+    ) -> User:
+        """Activate or deactivate a user (toggle status)."""
+        user = await UserService.get_user(db, user_id)
+        user.status = UserStatus(data.status)
+        await db.flush()
+        await db.refresh(user)
+        logger.info(f"User status → '{data.status}': {user.email} (id={user_id})")
+        return user
+
+    @staticmethod
     async def update_user(db: AsyncSession, user_id: UUID, data: UserUpdate) -> User:
-        """Update a user."""
+        """Update a user's details (admin operation)."""
         user = await UserService.get_user(db, user_id)
 
-        # Handle role update separately
         role_name = data.role
         update_fields = data.model_dump(exclude_unset=True, exclude={"password", "role"})
 

@@ -1,43 +1,30 @@
-"""Users API routes."""
+"""Users API routes — User Management for Super Admin."""
 
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.users.schemas import (
-    UserCreate,
+    UserInvite,
     UserUpdate,
+    UserStatusUpdate,
     UserDetailResponse,
+    UserListItem,
     UpdateProfile,
     UpdatePassword,
 )
-from app.modules.users.service import UserService
+from app.modules.users.service import UserService, _first_role_name
 
 router = APIRouter(prefix="/api/users", tags=["Users"])
 
 
-@router.post("", response_model=UserDetailResponse, status_code=201)
-async def create_user(
-    data: UserCreate,
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a new user."""
-    user = await UserService.create_user(db, data)
-    return UserDetailResponse.model_validate(user)
-
-
-@router.get("", response_model=List[UserDetailResponse])
-async def list_users(
-    db: AsyncSession = Depends(get_db),
-):
-    """List all users."""
-    users = await UserService.get_users(db)
-    return [UserDetailResponse.model_validate(u) for u in users]
-
+# ---------------------------------------------------------------------------
+# Profile endpoints  (authenticated user manages their own account)
+# ---------------------------------------------------------------------------
 
 @router.put("/profile", response_model=UserDetailResponse)
 async def update_profile(
@@ -45,9 +32,15 @@ async def update_profile(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Update the authenticated user's profile details (e.g. name)."""
+    """Update the authenticated user's profile details (name)."""
     user = await UserService.update_profile(db, current_user, data)
-    return UserDetailResponse.model_validate(user)
+    return UserDetailResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
 
 
 @router.put("/profile/password")
@@ -56,18 +49,108 @@ async def update_password(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Change the authenticated user's password."""
+    """Change the authenticated user's password.
+
+    Body: `{ "current_password": "...", "new_password": "...", "confirm_new_password": "..." }`
+    """
     return await UserService.update_password(db, current_user, data)
+
+
+# ---------------------------------------------------------------------------
+# User Management  (Super Admin — invite, list, toggle status, delete)
+# ---------------------------------------------------------------------------
+
+@router.post("", response_model=UserDetailResponse, status_code=201)
+async def invite_user(
+    data: UserInvite,
+    db: AsyncSession = Depends(get_db),
+):
+    """Invite (create) a new user.  **No auth required** — called by Super Admin from the UI.
+
+    - **name**: full name
+    - **email**: email address
+    - **password**: initial password
+    - **role**: `ADMIN` or `VIEWER`
+
+    Status is automatically set to `active`.
+    """
+    user = await UserService.create_user(db, data)
+    return UserDetailResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
+
+
+@router.get("", response_model=List[UserListItem])
+async def list_users(
+    role: Optional[str] = Query(
+        None,
+        pattern="^(ADMIN|VIEWER)$",
+        description="Filter by role tab: ADMIN or VIEWER. Omit for all (excl. SUPER_ADMIN).",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List admins and viewers.
+
+    - `GET /api/users` → all non-super-admin users
+    - `GET /api/users?role=ADMIN` → admins tab
+    - `GET /api/users?role=VIEWER` → viewers tab
+
+    Returns: `id`, `name`, `email`, `status`, `role`
+    """
+    users = await UserService.get_users(db, role_filter=role)
+    return [
+        UserListItem(
+            id=u.id,
+            name=u.name,
+            email=u.email,
+            status=u.status.value if hasattr(u.status, "value") else u.status,
+            role=_first_role_name(u),
+        )
+        for u in users
+    ]
+
+
+@router.patch("/{user_id}/status", response_model=UserListItem)
+async def toggle_user_status(
+    user_id: UUID,
+    data: UserStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Activate or deactivate a user.
+
+    Body: `{ "status": "active" }` or `{ "status": "inactive" }`
+    """
+    user = await UserService.update_user_status(db, user_id, data)
+    return UserListItem(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
 
 
 @router.get("/{user_id}", response_model=UserDetailResponse)
 async def get_user(
     user_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Get a user by ID."""
+    """Get a single user by ID."""
     user = await UserService.get_user(db, user_id)
-    return UserDetailResponse.model_validate(user)
+    return UserDetailResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
 
 
 @router.put("/{user_id}", response_model=UserDetailResponse)
@@ -75,16 +158,24 @@ async def update_user(
     user_id: UUID,
     data: UserUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Update a user."""
+    """Update a user's name, email, password, role or status."""
     user = await UserService.update_user(db, user_id, data)
-    return UserDetailResponse.model_validate(user)
+    return UserDetailResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        status=user.status.value if hasattr(user.status, "value") else user.status,
+        role=_first_role_name(user),
+    )
 
 
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Delete a user."""
+    """Delete a user permanently."""
     return await UserService.delete_user(db, user_id)

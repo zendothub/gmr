@@ -1,27 +1,33 @@
 """Users module Pydantic schemas."""
 
-from typing import Optional, List
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
-class RoleResponse(BaseModel):
-    id: UUID
-    name: str
-    description: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Request schemas
+# ---------------------------------------------------------------------------
 
-    class Config:
-        from_attributes = True
+class UserInvite(BaseModel):
+    """Schema for inviting (creating) a new user by Super Admin.
+
+    Status is always set to 'active' automatically — not required from client.
+    Role is limited to ADMIN or VIEWER; only one SUPER_ADMIN exists.
+    """
+    name: str = Field(..., min_length=1, max_length=255, description="Full name")
+    email: str = Field(..., min_length=3, max_length=255, description="Email address")
+    password: str = Field(..., min_length=6, max_length=128, description="Initial password")
+    role: str = Field(
+        ...,
+        pattern="^(ADMIN|VIEWER)$",
+        description="Role to assign: ADMIN or VIEWER",
+    )
 
 
-class UserCreate(BaseModel):
-    """Schema for creating a user by an admin."""
-    name: str = Field(..., min_length=1, max_length=255)
-    email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=6, max_length=128)
-    status: str = Field(default="active", pattern="^(active|inactive)$")
-    role: str = Field(default="VIEWER", pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$")
+# Keep backward-compatible alias
+UserCreate = UserInvite
 
 
 class UserUpdate(BaseModel):
@@ -29,27 +35,52 @@ class UserUpdate(BaseModel):
     email: Optional[str] = Field(None, min_length=3, max_length=255)
     password: Optional[str] = Field(None, min_length=6, max_length=128)
     status: Optional[str] = Field(None, pattern="^(active|inactive)$")
-    role: Optional[str] = Field(None, pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$")
+    role: Optional[str] = Field(None, pattern="^(ADMIN|VIEWER)$")
+
+
+class UserStatusUpdate(BaseModel):
+    """Toggle a user's active/inactive status."""
+    status: str = Field(..., pattern="^(active|inactive)$")
 
 
 class UpdateProfile(BaseModel):
-    """Schema for the authenticated user to update their own profile details."""
+    """Authenticated user updates their own profile."""
     name: Optional[str] = Field(None, min_length=1, max_length=255)
 
 
 class UpdatePassword(BaseModel):
-    """Schema for the authenticated user to change their password."""
+    """Authenticated user changes their own password."""
     current_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6, max_length=128)
     confirm_new_password: str = Field(..., min_length=6, max_length=128)
 
 
-class UserDetailResponse(BaseModel):
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+class UserListItem(BaseModel):
+    """Compact user record for list views (User Management table).
+
+    Returns: name, email, status, role — no stores, no last_login.
+    """
     id: UUID
     name: str
     email: str
     status: str
-    roles: List[RoleResponse] = Field(default_factory=list)
+    role: str  # first role name as a plain string, e.g. "ADMIN"
+
+    class Config:
+        from_attributes = True
+
+
+class UserDetailResponse(BaseModel):
+    """Full user response (used for create / get-by-id)."""
+    id: UUID
+    name: str
+    email: str
+    status: str
+    role: str  # first role name
 
     class Config:
         from_attributes = True
