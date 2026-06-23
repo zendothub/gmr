@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.areas.schemas import AreaCreate, AreaUpdate, AreaResponse
 from app.modules.areas.service import AreaService
@@ -18,9 +18,9 @@ router = APIRouter(prefix="/api/areas", tags=["Areas"])
 async def create_area(
     data: AreaCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Create a new independent area (admin only)."""
+    """Create a new independent area."""
     area = await AreaService.create_area(db, data)
     return AreaResponse.model_validate(area)
 
@@ -51,9 +51,9 @@ async def update_area(
     area_id: UUID,
     data: AreaUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Update an area's name (admin only)."""
+    """Update an area's name."""
     area = await AreaService.update_area(db, area_id, data)
     return AreaResponse.model_validate(area)
 
@@ -62,7 +62,7 @@ async def update_area(
 async def delete_area(
     area_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Delete an area (admin only)."""
+    """Delete an area."""
     return await AreaService.delete_area(db, area_id)

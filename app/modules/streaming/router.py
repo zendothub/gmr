@@ -12,7 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.streaming.schemas import StreamEndpointsResponse, StreamStatusResponse
 from app.modules.streaming.service import StreamingService
@@ -25,9 +25,9 @@ async def start_stream(
     request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Start the live WebRTC/HLS preview (admin only).
+    """Start the live WebRTC/HLS preview.
 
     Returns URLs built against the requesting host so the frontend on another
     LAN laptop gets the correct IP (e.g. ``http://10.251.39.75:8889/...``)
@@ -41,9 +41,9 @@ async def stop_stream(
     camera_id: UUID,
     force: bool = Query(False, description="Force-stop even if other viewers remain"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Detach a viewer (admin only); the stream auto-stops once idle (or force-stop now)."""
+    """Detach a viewer; the stream auto-stops once idle (or force-stop now)."""
     return await StreamingService.stop_stream(db, camera_id, force=force)
 
 

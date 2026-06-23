@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.rules.schemas import RuleCreate, RuleUpdate, RuleResponse
 from app.modules.rules.service import RuleService
@@ -18,9 +18,9 @@ router = APIRouter(prefix="/api/rules", tags=["Rules"])
 async def create_rule(
     data: RuleCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Create a new rule (admin only)."""
+    """Create a new rule."""
     rule = await RuleService.create_rule(db, data)
     return RuleResponse.model_validate(rule)
 
@@ -52,9 +52,9 @@ async def update_rule(
     rule_id: UUID,
     data: RuleUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Update a rule (admin only)."""
+    """Update a rule."""
     rule = await RuleService.update_rule(db, rule_id, data)
     return RuleResponse.model_validate(rule)
 
@@ -63,9 +63,9 @@ async def update_rule(
 async def delete_rule(
     rule_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Delete a rule (admin only)."""
+    """Delete a rule."""
     return await RuleService.delete_rule(db, rule_id)
 
 
@@ -73,9 +73,9 @@ async def delete_rule(
 async def enable_rule(
     rule_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Enable a rule (admin only)."""
+    """Enable a rule."""
     rule = await RuleService.enable_rule(db, rule_id)
     return RuleResponse.model_validate(rule)
 
@@ -84,8 +84,8 @@ async def enable_rule(
 async def disable_rule(
     rule_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Disable a rule (admin only)."""
+    """Disable a rule."""
     rule = await RuleService.disable_rule(db, rule_id)
     return RuleResponse.model_validate(rule)

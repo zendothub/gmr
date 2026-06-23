@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.feature_requests.schemas import (
     FeatureRequestCreate,
@@ -24,9 +24,9 @@ router = APIRouter(prefix="/api/feature-requests", tags=["Feature Requests"])
 async def create_feature_request(
     payload: FeatureRequestCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Submit a new feature request (admin only).
+    """Submit a new feature request.
 
     An email notification is sent to the developer team (configured via SMTP_* env vars).
     Priority defaults to 'low'; pass 'high' for urgent requests.
@@ -114,9 +114,9 @@ async def update_feature_request(
     feature_id: str,
     payload: FeatureRequestUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Admin updates status, forecast_message, and/or priority on a feature request.
+    """Updates status, forecast_message, and/or priority on a feature request.
 
     **Auto-activation rule**: when `status` is set to `"live"`, `is_active` is
     automatically set to `true` — no extra call needed.
@@ -136,9 +136,9 @@ async def toggle_feature_request_active(
     feature_id: str,
     payload: FeatureRequestActiveToggle,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Admin manually toggles is_active for a feature request.
+    """Manually toggles is_active for a feature request.
 
     Use this to deactivate a live feature or re-activate a previously disabled one
     without changing its status.
@@ -154,9 +154,9 @@ async def toggle_feature_request_active(
 async def delete_feature_request(
     feature_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Hard-delete a single feature request by ID (admin only).
+    """Hard-delete a single feature request by ID.
 
     Works regardless of status (queued / in_progress / live).
     Returns 204 No Content on success.
@@ -167,9 +167,9 @@ async def delete_feature_request(
 @router.delete("", status_code=200)
 async def delete_all_feature_requests(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Hard-delete ALL feature requests regardless of status (admin only).
+    """Hard-delete ALL feature requests regardless of status.
 
     ⚠️ This is a destructive, irreversible operation.
     Returns the count of deleted records.

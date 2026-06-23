@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.events.schemas import EventResponse, EventListResponse
 from app.modules.events.service import EventService
@@ -67,9 +67,9 @@ async def get_event(
 async def acknowledge_event(
     alert_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Acknowledge an event (admin only)."""
+    """Acknowledge an event."""
     event = await EventService.acknowledge_event(db, alert_id, current_user.id)
     return EventResponse.model_validate(event)
 
@@ -78,8 +78,8 @@ async def acknowledge_event(
 async def mark_false_positive(
     alert_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Mark an event as a false positive (admin only)."""
+    """Mark an event as a false positive."""
     event = await EventService.mark_false_positive(db, alert_id, current_user.id)
     return EventResponse.model_validate(event)

@@ -1,4 +1,4 @@
-"""Auth service - handles signup, login, token creation."""
+"""Auth service - handles login and token management."""
 
 from typing import Optional
 from uuid import UUID
@@ -11,93 +11,55 @@ from loguru import logger
 
 from jose import JWTError
 
-from app.core.db.models.user import User, Role
+from app.core.db.models.user import User
 from app.utils.encryption import (
-    hash_password,
     verify_password,
     create_access_token,
     create_refresh_token,
     decode_token,
 )
 from app.modules.auth.schemas import (
-    UserSignup,
     UserLogin,
     TokenResponse,
     RefreshTokenResponse,
 )
 
 
-
 class AuthService:
 
     @staticmethod
-    async def signup(db: AsyncSession, data: UserSignup) -> User:
-        """Register a new user with default 'user' role."""
-        # Check if username exists
-        result = await db.execute(select(User).where(User.username == data.username))
-        if result.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Username already exists",
-            )
-
-        # Ensure the default "user" role exists (create if missing)
-        role_result = await db.execute(select(Role).where(Role.name == "user"))
-        default_role = role_result.scalar_one_or_none()
-        if not default_role:
-            default_role = Role(name="user", description="Default read-only user role")
-            db.add(default_role)
-            await db.flush()
-
-        user = User(
-            username=data.username,
-            hashed_password=hash_password(data.password),
-            full_name=data.full_name,
-        )
-        user.roles.append(default_role)
-        db.add(user)
-        await db.flush()
-        
-        # Reload user with roles eagerly loaded for Pydantic serialization
-        result = await db.execute(
-            select(User).options(selectinload(User.roles)).where(User.id == user.id)
-        )
-        user = result.scalar_one()
-        
-        logger.info(f"New user registered: {user.username} (id={user.id})")
-        return user
-
-    @staticmethod
     async def login(db: AsyncSession, data: UserLogin) -> TokenResponse:
-        """Authenticate user and return both access and refresh tokens."""
+        """Authenticate user by email and return access + refresh tokens."""
         result = await db.execute(
-            select(User).options(selectinload(User.roles)).where(User.username == data.username)
+            select(User).options(selectinload(User.roles)).where(User.email == data.email)
         )
         user = result.scalar_one_or_none()
 
         if not user or not verify_password(data.password, user.hashed_password):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username or password",
+                detail="Invalid email or password",
+            )
+
+        if user.status.value != "active":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is inactive",
             )
 
         access_token = create_access_token(data={"sub": str(user.id)})
         refresh_token = create_refresh_token(data={"sub": str(user.id)})
-        logger.info(f"User logged in: {user.username}")
+        logger.info(f"User logged in: {user.email}")
         return TokenResponse(
             access_token=access_token,
             refresh_token=refresh_token,
             user_id=user.id,
-            username=user.username,
+            email=user.email,
         )
 
     @staticmethod
     async def refresh_access_token(db: AsyncSession, refresh_token: str) -> RefreshTokenResponse:
-        """Exchange a valid refresh token for a freshly rotated token pair.
-
-        Returns a NEW access token and a NEW refresh token (refresh-token
-        rotation), so the client always moves forward with fresh credentials.
-        """
+        """Exchange a valid refresh token for a freshly rotated token pair."""
         invalid = HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
@@ -121,12 +83,11 @@ class AuthService:
 
         access_token = create_access_token(data={"sub": str(user.id)})
         new_refresh_token = create_refresh_token(data={"sub": str(user.id)})
-        logger.info(f"Token pair refreshed: {user.username}")
+        logger.info(f"Token pair refreshed: {user.email}")
         return RefreshTokenResponse(
             access_token=access_token,
             refresh_token=new_refresh_token,
         )
-
 
     @staticmethod
     async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:

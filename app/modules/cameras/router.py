@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, get_current_user, require_role
+from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.cameras.schemas import (
     RTSPTestRequest, RTSPTestResponse, CameraCreate, CameraUpdate,
@@ -20,9 +20,9 @@ router = APIRouter(prefix="/api/cameras", tags=["Cameras"])
 @router.post("/test-rtsp", response_model=RTSPTestResponse)
 async def test_rtsp(
     data: RTSPTestRequest,
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Test RTSP stream connectivity before adding a camera (admin only).
+    """Test RTSP stream connectivity before adding a camera.
 
     Opens the RTSP URL with OpenCV, grabs one frame, and returns resolution/fps.
     Does NOT create a camera — use this to validate the URL before saving.
@@ -35,9 +35,9 @@ async def create_camera(
     request: Request,
     data: CameraCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Add a new RTSP camera (admin only).
+    """Add a new RTSP camera.
 
     Saves the camera and returns it with MediaMTX feed URLs
     (webrtc_url / hls_url) built against the request's own host, so LAN
@@ -76,9 +76,9 @@ async def update_camera(
     camera_id: UUID,
     data: CameraUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Update camera settings (admin only)."""
+    """Update camera settings."""
     camera = await CameraService.update_camera(db, camera_id, data)
     return CameraService.build_response(camera, public_host=request.url.hostname)
 
@@ -87,9 +87,9 @@ async def update_camera(
 async def delete_camera(
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Delete a camera and all its zones (admin only)."""
+    """Delete a camera and all its zones."""
     return await CameraService.delete_camera(db, camera_id)
 
 
@@ -98,9 +98,9 @@ async def start_camera(
     request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Start camera AI processing (admin only).
+    """Start camera AI processing.
 
     After this call the backend begins pulling RTSP, running YOLO detection,
     tracking, and evaluating rules. The stream is also published to MediaMTX so
@@ -115,9 +115,9 @@ async def stop_camera(
     request: Request,
     camera_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
-    """Stop camera AI processing (admin only).
+    """Stop camera AI processing.
 
     RTSP connection is released and MediaMTX publishing stops (stream is reaped
     after STREAM_IDLE_TIMEOUT_SECONDS). No further detections or events are

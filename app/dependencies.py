@@ -59,7 +59,7 @@ async def get_current_user(
 def require_role(role_name: str):
     """Dependency factory: only allow users with the given role.
 
-    Usage: ``current_user: User = Depends(require_role("admin"))``
+    Usage: ``current_user: User = Depends(require_role("SUPER_ADMIN"))``
     """
     async def dependency(current_user: User = Depends(get_current_user)) -> User:
         user_role_names = {r.name for r in current_user.roles}

@@ -6,29 +6,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.auth.schemas import (
-    UserSignup,
     UserLogin,
     TokenResponse,
     RefreshTokenResponse,
     RefreshRequest,
     UserResponse,
 )
-
 from app.modules.auth.service import AuthService
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 
-@router.post("/signup", response_model=UserResponse, status_code=201)
-async def signup(data: UserSignup, db: AsyncSession = Depends(get_db)):
-    """Register a new user account."""
-    user = await AuthService.signup(db, data)
-    return UserResponse.model_validate(user)
-
-
 @router.post("/login", response_model=TokenResponse)
 async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
-    """Authenticate and get access + refresh tokens."""
+    """Authenticate with email and password to get access + refresh tokens."""
     return await AuthService.login(db, data)
 
 
@@ -36,8 +27,6 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
 async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_db)):
     """Rotate tokens: exchange a valid refresh token for a new access + refresh pair."""
     return await AuthService.refresh_access_token(db, data.refresh_token)
-
-
 
 
 @router.get("/me", response_model=UserResponse)

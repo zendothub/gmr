@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import asyncio
 import uuid
 from app.core.db.session import AsyncSessionLocal
-from app.core.db.models.user import User, Role
+from app.core.db.models.user import User, Role, UserStatus
 from app.utils.encryption import hash_password
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -15,72 +15,50 @@ from sqlalchemy.orm import selectinload
 
 async def seed():
     async with AsyncSessionLocal() as db:
-        # Ensure roles exist
-        admin_role = None
-        user_role = None
+        # Ensure roles exist: SUPER_ADMIN, ADMIN, VIEWER
+        roles_data = [
+            ("SUPER_ADMIN", "Full access to everything"),
+            ("ADMIN", "Administrative access"),
+            ("VIEWER", "Read-only access"),
+        ]
 
-        result = await db.execute(select(Role).where(Role.name == "admin"))
-        admin_role = result.scalar_one_or_none()
-        if not admin_role:
-            admin_role = Role(name="admin", description="Full access to all APIs and feature requests")
-            db.add(admin_role)
-            await db.flush()
-            print("[Role Seeded] Created 'admin' role")
-
-        result = await db.execute(select(Role).where(Role.name == "user"))
-        user_role = result.scalar_one_or_none()
-        if not user_role:
-            user_role = Role(name="user", description="Read-only access to GET APIs")
-            db.add(user_role)
-            await db.flush()
-            print("[Role Seeded] Created 'user' role")
+        created_roles = {}
+        for role_name, description in roles_data:
+            result = await db.execute(select(Role).where(Role.name == role_name))
+            role = result.scalar_one_or_none()
+            if not role:
+                role = Role(name=role_name, description=description)
+                db.add(role)
+                await db.flush()
+                print(f"[Role Seeded] Created '{role_name}' role")
+            else:
+                print(f"[Role Exists] '{role_name}' role already exists")
+            created_roles[role_name] = role
 
         await db.flush()
 
-        # Create admin user
+        # Seed a default SUPER_ADMIN user
         result = await db.execute(
-            select(User).options(selectinload(User.roles)).where(User.username == "admin")
+            select(User).options(selectinload(User.roles)).where(User.email == "admin@gmr.com")
         )
         admin_user = result.scalar_one_or_none()
         if not admin_user:
             admin_user = User(
                 id=uuid.uuid4(),
-                username="admin",
+                name="Administrator",
+                email="admin@gmr.com",
                 hashed_password=hash_password("admin"),
-                full_name="Administrator",
+                status=UserStatus.ACTIVE,
             )
-            admin_user.roles.append(admin_role)
+            admin_user.roles.append(created_roles["SUPER_ADMIN"])
             db.add(admin_user)
-            print("[User Seeded] Created admin user 'admin' with password 'admin'")
+            print("[User Seeded] Created SUPER_ADMIN user 'admin@gmr.com' with password 'admin'")
         else:
-            # Ensure admin role is assigned
-            if admin_role not in admin_user.roles:
-                admin_user.roles.append(admin_role)
-                print("[User Updated] Assigned 'admin' role to existing admin user")
+            if created_roles["SUPER_ADMIN"] not in admin_user.roles:
+                admin_user.roles.append(created_roles["SUPER_ADMIN"])
+                print("[User Updated] Assigned 'SUPER_ADMIN' role to existing admin user")
             else:
-                print("[User Exists] Admin user 'admin' already exists with admin role")
-
-        # Create rocky user (admin)
-        result = await db.execute(
-            select(User).options(selectinload(User.roles)).where(User.username == "rocky")
-        )
-        rocky_user = result.scalar_one_or_none()
-        if not rocky_user:
-            rocky_user = User(
-                id=uuid.uuid4(),
-                username="rocky",
-                hashed_password=hash_password("rocky"),
-                full_name="Rocky",
-            )
-            rocky_user.roles.append(admin_role)
-            db.add(rocky_user)
-            print("[User Seeded] Created admin user 'rocky' with password 'rocky'")
-        else:
-            if admin_role not in rocky_user.roles:
-                rocky_user.roles.append(admin_role)
-                print("[User Updated] Assigned 'admin' role to existing user 'rocky'")
-            else:
-                print("[User Exists] User 'rocky' already exists with admin role")
+                print("[User Exists] SUPER_ADMIN user 'admin@gmr.com' already exists")
 
         await db.commit()
         print("\nDatabase seeded successfully!")
