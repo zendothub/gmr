@@ -125,6 +125,7 @@ class CameraUpdateV2(BaseModel):
     store_id: Optional[UUID] = Field(None, description="Re-link camera to a different store")
     is_active: Optional[bool] = None
     burnin_enabled: Optional[bool] = None
+    skip_rtsp_test: bool = Field(default=True, description="Skip the RTSP connectivity probe on update (use when camera is offline)")
 
 
 class CameraByStoreResponse(BaseModel):

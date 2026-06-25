@@ -419,8 +419,12 @@ async def update_camera_v2(
 
     update_data = data.model_dump(exclude_unset=True)
 
-    # If RTSP URL changed, test the new URL
-    if "rtsp_url" in update_data and update_data["rtsp_url"] != camera.rtsp_url:
+    # If RTSP URL changed, test the new URL (unless skip_rtsp_test is set)
+    if (
+        "rtsp_url" in update_data
+        and update_data["rtsp_url"] != camera.rtsp_url
+        and not data.skip_rtsp_test
+    ):
         test_result = CameraService.test_rtsp_stream(update_data["rtsp_url"])
         if not test_result.success:
             raise HTTPException(
