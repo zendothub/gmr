@@ -42,6 +42,10 @@ class CameraService:
         if camera.store:
             resp.store_name = camera.store.name
             resp.store_zone_gate = camera.store.zone_gate
+        # Populate store-zone (position) fields if linked
+        if camera.store_zone:
+            resp.zone_id = camera.zone_id
+            resp.zone_name = camera.store_zone.name
         return resp
 
 
@@ -121,6 +125,8 @@ class CameraService:
             "status": CameraStatus.INACTIVE,
             "is_active": True,
         }
+        if data.zone_id:
+            camera_kwargs["zone_id"] = data.zone_id
         if resolution:
             camera_kwargs["resolution"] = resolution
         camera = Camera(**camera_kwargs)

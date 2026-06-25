@@ -63,9 +63,11 @@ class CameraResponse(BaseModel):
     store_id: Optional[UUID] = None
     store_name: Optional[str] = None
     store_zone_gate: Optional[str] = None
+    zone_id: Optional[UUID] = None
+    zone_name: Optional[str] = None
     status: str
     is_active: bool
-    # MediaMTX path the backend republishes the feed into.
+    # MediaMTX path the backend republishes into.
     stream_path: Optional[str] = None
     # Browser-playable feed URLs (served by MediaMTX, derived from stream_path).
     webrtc_url: Optional[str] = None

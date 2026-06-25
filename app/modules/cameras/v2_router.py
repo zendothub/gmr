@@ -95,15 +95,16 @@ def _available_event_types() -> List[Dict[str, str]]:
 
 
 async def _get_camera_or_404(db: AsyncSession, camera_id: UUID) -> Camera:
-    """Fetch camera by ID with store relationship eagerly loaded.
+    """Fetch camera by ID with store + store_zone relationships eagerly loaded.
 
     In async SQLAlchemy, lazy-loading a relationship (camera.store) raises
     MissingGreenlet when store_id is set.  We use selectinload so that
-    ``camera.store`` is always available without a second round-trip.
+    ``camera.store`` and ``camera.store_zone`` are always available without
+    extra round-trips.
     """
     result = await db.execute(
         select(Camera)
-        .options(selectinload(Camera.store))
+        .options(selectinload(Camera.store), selectinload(Camera.store_zone))
         .where(Camera.id == camera_id)
     )
     camera = result.scalar_one_or_none()
@@ -209,7 +210,7 @@ async def list_cameras_v2(
 
     query = (
         select(Camera)
-        .options(selectinload(Camera.store))
+        .options(selectinload(Camera.store), selectinload(Camera.store_zone))
         .order_by(Camera.created_at.desc())
     )
 
@@ -254,8 +255,8 @@ async def cameras_by_store(
     for store in stores:
         cam_result = await db.execute(
             select(Camera)
-            # Eagerly load store so build_response can access camera.store
-            .options(selectinload(Camera.store))
+            # Eagerly load store + store_zone so build_response can access both
+            .options(selectinload(Camera.store), selectinload(Camera.store_zone))
             .where(Camera.store_id == store.id)
             .order_by(Camera.created_at.desc())
         )

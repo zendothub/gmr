@@ -97,6 +97,14 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     store: Mapped[Optional["Store"]] = relationship("Store", back_populates="cameras")
 
+    # Store zone / position within the store (e.g. "Entry", "Checkout", "Aisle 3").
+    # References the store_zones lookup table — NOT the camera detection zones table.
+    zone_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("store_zones.id", ondelete="SET NULL"), nullable=True
+    )
+
+    store_zone: Mapped[Optional["StoreZone"]] = relationship("StoreZone")
+
     track_sessions: Mapped[List["TrackSession"]] = relationship(
         "TrackSession", back_populates="camera", passive_deletes=True
     )
@@ -141,4 +149,3 @@ class Zone(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     camera: Mapped[Optional["Camera"]] = relationship("Camera", back_populates="zones")
     rules: Mapped[List["Rule"]] = relationship("Rule", back_populates="zone")
-
