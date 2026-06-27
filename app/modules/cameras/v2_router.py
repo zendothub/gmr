@@ -60,6 +60,7 @@ from app.modules.cameras.schemas import (
     DETECTION_EVENT_TYPES,
     DETECTION_EVENT_LABELS,
 )
+from loguru import logger
 from app.modules.cameras.service import CameraService
 from app.modules.streaming.mediamtx import MediaMTXManager
 
@@ -155,6 +156,41 @@ async def create_camera_v2(
     camera = await CameraService.create_camera_v2(db, data)
     # Re-fetch with store eagerly loaded so build_response can access camera.store
     camera = await _get_camera_or_404(db, camera.id)
+
+    logger.info(
+        "=== CAMERA CREATED SUCCESSFULLY ==="
+        f" | id={camera.id}"
+        f" | name='{camera.name}'"
+        f" | store_id={camera.store_id}"
+        f" | stream_path={camera.stream_path}"
+        f" | status={camera.status}"
+    )
+
+    # Commit the DB transaction so the new camera row is visible to the
+    # WorkerSupervisor, which opens its own DB connection in start_camera().
+    # Without this, WorkerSupervisor sees "Camera not found" because the
+    # router's flush hasn't been committed yet.
+    await db.commit()
+
+    # Auto-start the AI pipeline so the camera is immediately functional —
+    # no separate /start call required from the frontend.
+    logger.info(f"Starting AI pipeline for camera {camera.id} ({camera.name})...")
+    try:
+        camera = await CameraService.start_camera(db, camera.id)
+        camera = await _get_camera_or_404(db, camera.id)
+        logger.info(
+            f"=== AI PIPELINE STARTED ==="
+            f" | camera_id={camera.id}"
+            f" | name='{camera.name}'"
+            f" | status={camera.status}"
+            f" | stream_path={camera.stream_path}"
+        )
+    except Exception as e:
+        logger.error(
+            f"!!! AI PIPELINE FAILED TO START for camera {camera.id} ({camera.name}): {e}",
+            exc_info=True,
+        )
+
     return CameraService.build_response(camera, public_host=request.url.hostname)
 
 

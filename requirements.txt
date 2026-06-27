@@ -1,56 +1,57 @@
-# FastAPI & Server
+setuptools
+wheel
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 
-# Database
+
 sqlalchemy[asyncio]==2.0.35
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
 alembic==1.13.2
 pgvector==0.3.4
 
-# Auth
+
 python-jose[cryptography]==3.3.0
 bcrypt==4.2.0
 
-# Pydantic
+
 pydantic==2.9.2
 pydantic-settings==2.5.2
 
-# AI/ML
+
 ultralytics==8.3.2
-torch>=2.0.0
-torchvision>=0.15.0
+
 torchreid==0.2.5
 gdown
 tensorboard
-numpy>=1.24.0
+
+numpy==1.26.4
 opencv-python-headless==4.10.0.84
 scipy>=1.11.0
 lapx
 
-# Background Jobs
+
 apscheduler==3.10.4
 
-# Object Storage
+
 minio==7.2.10
 
-# Utilities
+
 python-dotenv==1.0.1
 aiofiles==24.1.0
 Pillow>=10.0.0
 shapely==2.0.6
 
-# Logging
+
 loguru==0.7.2
 
-# Testing
+
 pytest==8.3.3
 pytest-asyncio==0.24.0
 httpx==0.27.2
 
-# Demographics
-insightface>=0.7.3
-onnxruntime>=1.16.0
 
+insightface>=0.7.3
+onnxruntime==1.17.3

@@ -139,15 +139,12 @@ class CameraService:
 
         logger.info(f"Camera created (v2): {camera.name} (id={camera.id}, store_id={camera.store_id})")
 
-        # Auto-start stream publisher
-        try:
-            manager = StreamManager.get_instance()
-            await anyio.to_thread.run_sync(
-                manager.add_viewer, camera.id, camera.rtsp_url
-            )
-            logger.info(f"Stream publisher auto-started for new camera {camera.id}")
-        except Exception as e:
-            logger.warning(f"Could not auto-start stream publisher for new camera: {e}")
+        # Do NOT auto-start the StreamManager publisher here — the router
+        # calls start_camera() immediately after, which handles stream setup:
+        #   - burnin_enabled=True  → StreamBroadcaster in CameraWorker pushes to MediaMTX
+        #   - burnin_enabled=False → StreamManager.add_viewer() pulls RTSP → MediaMTX
+        # Starting both simultaneously causes dual-ffmpeg conflicts (exit code 224)
+        # because most cameras/NVRs only allow one RTSP connection.
 
         return camera
 
@@ -288,12 +285,33 @@ class CameraService:
 
         Stops the camera worker + stream publisher (ffmpeg + watchdog) first,
         then removes the database row.
+
+        Also cleans up referencing rows in person_face_embeddings and
+        person_embeddings — those FKs lack ON DELETE CASCADE, so PostgreSQL
+        would otherwise block the deletion with a foreign-key violation.
         """
+        from app.core.db.models.person import PersonFaceEmbedding, PersonEmbedding
+        from sqlalchemy import update
+
         camera = await CameraService.get_camera(db, camera_id)
 
         # Tear down worker and stream publisher so no orphaned subprocesses
         # or watchdog threads linger after the DB row is gone.
         await CameraService._teardown_resources(camera_id)
+
+        # Nullify or remove embedding rows that still reference this camera.
+        # person_face_embeddings.camera_id and person_embeddings.camera_id have
+        # ForeignKey("cameras.id") without ON DELETE, so we must unlink them first.
+        await db.execute(
+            update(PersonFaceEmbedding)
+            .where(PersonFaceEmbedding.camera_id == camera_id)
+            .values(camera_id=None)
+        )
+        await db.execute(
+            update(PersonEmbedding)
+            .where(PersonEmbedding.camera_id == camera_id)
+            .values(camera_id=None)
+        )
 
         await db.delete(camera)
         await db.flush()
@@ -304,35 +322,65 @@ class CameraService:
     async def start_camera(db: AsyncSession, camera_id: UUID) -> Camera:
         """Mark camera as active and start worker."""
         camera = await CameraService.get_camera(db, camera_id)
+        logger.info(
+            ">>> start_camera: BEGIN"
+            f" | camera_id={camera.id}"
+            f" | name='{camera.name}'"
+            f" | current_status={camera.status}"
+            f" | burnin_enabled={camera.burnin_enabled}"
+        )
+
         camera.status = CameraStatus.ACTIVE
         await db.flush()
         await db.refresh(camera)
+        logger.info(f">>> start_camera: status set to ACTIVE for {camera.id}")
 
-        # Start camera worker
+        # Start camera worker (YOLO detection + ByteTrack tracking + rule evaluation)
+        logger.info(f">>> start_camera: launching camera worker for {camera.id}...")
         try:
             from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
             supervisor = WorkerSupervisor.get_instance()
             if supervisor:
                 await supervisor.start_camera(camera_id)
+                logger.info(
+                    f">>> start_camera: worker supervisor launched for {camera.id}"
+                )
+            else:
+                logger.error(
+                    f">>> start_camera: WorkerSupervisor instance is None for {camera.id}"
+                )
         except Exception as e:
-            logger.warning(f"Could not start camera worker: {e}")
+            logger.error(
+                f">>> start_camera: failed to start camera worker for {camera.id}: {e}",
+                exc_info=True,
+            )
 
         # Start MediaMTX stream publisher so WHEP/HLS endpoints resolve.
         # Skip if burnin_enabled — the CameraWorker's StreamBroadcaster handles it.
         if not camera.burnin_enabled:
+            logger.info(
+                f">>> start_camera: starting stream publisher (non-burnin) for {camera.id}..."
+            )
             try:
                 manager = StreamManager.get_instance()
                 await anyio.to_thread.run_sync(
                     manager.add_viewer, camera.id, camera.rtsp_url
                 )
-                logger.info(f"Stream publisher started for camera {camera_id}")
+                logger.info(
+                    f">>> start_camera: stream publisher started for {camera.id}"
+                )
             except Exception as e:
-                logger.warning(f"Could not start stream publisher: {e}")
+                logger.error(
+                    f">>> start_camera: stream publisher failed for {camera.id}: {e}",
+                    exc_info=True,
+                )
         else:
             # Wait for the CameraWorker's StreamBroadcaster to push the first
             # annotated frame to MediaMTX before returning stream URLs — otherwise
             # the frontend gets a 404 on WHEP/HLS for the first few seconds.
-            logger.info(f"Waiting for StreamBroadcaster to become ready for camera {camera_id}")
+            logger.info(
+                f">>> start_camera: waiting for StreamBroadcaster (burn-in mode) for {camera_id}..."
+            )
             try:
                 from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
                 supervisor = WorkerSupervisor.get_instance()
@@ -343,16 +391,29 @@ class CameraService:
                             worker.stream_broadcaster.wait_until_ready, 15.0
                         )
                         if ready:
-                            logger.info(f"StreamBroadcaster ready for camera {camera_id}")
+                            logger.info(
+                                f">>> start_camera: StreamBroadcaster ready for {camera_id}"
+                            )
                         else:
                             logger.warning(
-                                f"StreamBroadcaster not ready after timeout for camera {camera_id}; "
-                                f"stream may return 404 briefly"
+                                f">>> start_camera: StreamBroadcaster NOT ready after timeout for {camera_id}"
                             )
+                    else:
+                        logger.warning(
+                            f">>> start_camera: no worker/stream_broadcaster found for {camera_id} yet"
+                        )
             except Exception as e:
-                logger.warning(f"Could not wait for StreamBroadcaster: {e}")
+                logger.error(
+                    f">>> start_camera: StreamBroadcaster wait failed for {camera_id}: {e}",
+                    exc_info=True,
+                )
 
-        logger.info(f"Camera started: {camera.name}")
+        logger.info(
+            f">>> start_camera: COMPLETE"
+            f" | camera_id={camera.id}"
+            f" | name='{camera.name}'"
+            f" | status={camera.status}"
+        )
         return camera
 
     @staticmethod

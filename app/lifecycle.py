@@ -32,6 +32,68 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not start background job scheduler: {e}")
 
+    # Auto-restart camera workers + stream publishers for all cameras
+    # that were active before the server was restarted.  Without this step
+    # every camera shows "404 path not found" after restart because:
+    #   - Workers were stopped on shutdown
+    #   - Stream publishers (ffmpeg → MediaMTX) were killed on shutdown
+    #   - The DB still says status=active but nothing is actually running
+    try:
+        from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
+        from app.modules.streaming.manager import StreamManager
+        from app.core.db.session import AsyncSessionLocal
+        from app.core.db.models.camera import Camera, CameraStatus
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Camera).where(Camera.status == CameraStatus.ACTIVE)
+            )
+            active_cameras = list(result.scalars().all())
+
+        if active_cameras:
+            logger.info(
+                f"Restoring {len(active_cameras)} active camera(s) after server restart..."
+            )
+            supervisor = WorkerSupervisor.get_instance()
+            stream_mgr = StreamManager.get_instance()
+            import anyio
+
+            for camera in active_cameras:
+                try:
+                    # Restart camera worker (YOLO + tracking + rules).
+                    # The worker's StreamBroadcaster handles stream publishing
+                    # when burnin_enabled=True — do NOT call add_viewer as well,
+                    # or two ffmpeg processes will fight over the same RTSP URL.
+                    if supervisor:
+                        await supervisor.start_camera(camera.id)
+                        logger.info(
+                            f"Restored camera worker: {camera.name} ({camera.id})"
+                        )
+
+                    # Only start a separate stream publisher if burn-in is off.
+                    # When burnin_enabled=True, the CameraWorker's StreamBroadcaster
+                    # already pushes annotated frames → MediaMTX.
+                    if not camera.burnin_enabled:
+                        await anyio.to_thread.run_sync(
+                            stream_mgr.add_viewer, camera.id, camera.rtsp_url
+                        )
+                        logger.info(
+                            f"Restored stream publisher: {camera.name} ({camera.id})"
+                        )
+                    else:
+                        logger.info(
+                            f"Stream publishing handled by CameraWorker (burn-in mode) for {camera.name}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to restore camera {camera.name} ({camera.id}): {e}"
+                    )
+        else:
+            logger.info("No active cameras to restore after restart")
+    except Exception as e:
+        logger.warning(f"Could not restore active cameras on startup: {e}")
+
     logger.info("Application startup complete")
 
     yield
