@@ -153,21 +153,13 @@ class CameraByStoreResponse(BaseModel):
 
 # Friendly event-type labels shown in the polygon-editor zone dropdown.
 DETECTION_EVENT_TYPES = [
-    "footfall",
-    "dwell_time",
-    "queue_length",
     "entry_exit",
-    "heatmap",
-    "purchase_intent",
+    "billing_zone",
 ]
 
 DETECTION_EVENT_LABELS: Dict[str, str] = {
-    "footfall":       "Footfall",
-    "dwell_time":     "Dwell Time",
-    "queue_length":   "Queue Length",
     "entry_exit":     "Entry/Exit",
-    "heatmap":        "Heatmap",
-    "purchase_intent": "Purchase Intent",
+    "billing_zone":   "Billing Zone",
 }
 
 
@@ -254,11 +246,11 @@ class DetectionZoneCreate(BaseModel):
     """
     name: str = Field(..., min_length=1, max_length=255, description='Zone label, e.g. "Zone 1", "Counter Area"')
     zone_type: str = Field(
-        default="footfall",
+        default="entry_exit",
         description=(
             "Detection event type for this polygon. "
-            "One of: footfall, dwell_time, queue_length, entry_exit, heatmap, purchase_intent. "
-            "Defaults to 'footfall'."
+            "One of: entry_exit, billing_zone. "
+            "Defaults to 'entry_exit'."
         ),
     )
     shape: str = Field(default="polygon", description="polygon | line")
@@ -275,7 +267,7 @@ class DetectionZoneUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     zone_type: Optional[str] = Field(
         None,
-        description="Change the detection event type: footfall | dwell_time | queue_length | entry_exit | heatmap | purchase_intent",
+        description="Change the detection event type: entry_exit | billing_zone",
     )
     shape: Optional[str] = None
     polygon: Optional[Dict[str, Any]] = Field(

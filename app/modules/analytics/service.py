@@ -826,11 +826,12 @@ class AnalyticsService:
         total_cameras = (await db.execute(cam_base)).scalar() or 0
         active_cameras = (await db.execute(active_base)).scalar() or 0
 
-        # ── 3. Footfall (TrackSessions as visitor proxy) ─────────────────
+        # ── 3. Footfall (Unique persons based on person_identity_id) ─────────────────
         def _ff_q(s, e):
-            q = select(func.count(TrackSession.id)).where(
+            q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
                 TrackSession.started_at >= s,
                 TrackSession.started_at <= e,
+                TrackSession.person_identity_id.isnot(None),
             )
             if cam_ids:
                 q = q.where(TrackSession.camera_id.in_(cam_ids))
@@ -900,55 +901,132 @@ class AnalyticsService:
         prev_purchases  = (await db.execute(_purchase_q(prev_start, prev_end))).scalar() or 0
         conversion_pct = round(total_purchases / max(total_visitors, 1) * 100, 1)
 
-        # ── 6. Footfall Over Time (hourly — always 'hour' for today/this_week, 'day' for longer) ──
+        # ── 6. Footfall Over Time (unique persons per time bucket) ──
         range_days = (end - start).total_seconds() / 86400
         resolved = cls._resolve_group_by("auto", range_days)
 
-        bucket_expr = func.date_trunc(resolved, TrackSession.started_at)
-        ff_timeline_q = (
-            select(bucket_expr.label("bucket"), func.count(TrackSession.id).label("cnt"))
+        # Force date_trunc to operate in UTC timezone to get proper hour buckets (0:00, 1:00, etc.)
+        # Then convert back to timestamptz to maintain timezone info
+        bucket_expr = func.timezone('UTC', func.date_trunc(resolved, func.timezone('UTC', TrackSession.started_at)))
+        
+        # Subquery: Get distinct person_identity_id per bucket
+        distinct_persons_subq = (
+            select(
+                bucket_expr.label("bucket"),
+                TrackSession.person_identity_id
+            )
             .where(
                 TrackSession.started_at >= start,
                 TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
             )
-            .group_by("bucket")
-            .order_by("bucket")
+            .distinct()
         )
         if cam_ids:
-            ff_timeline_q = ff_timeline_q.where(TrackSession.camera_id.in_(cam_ids))
+            distinct_persons_subq = distinct_persons_subq.where(TrackSession.camera_id.in_(cam_ids))
+        
+        # Debug: Check actual TrackSession timestamps first
+        debug_ts_query = select(TrackSession.started_at, TrackSession.person_identity_id).where(
+            TrackSession.started_at >= start,
+            TrackSession.started_at <= end,
+            TrackSession.person_identity_id.isnot(None),
+        ).limit(5)
+        debug_ts_rows = (await db.execute(debug_ts_query)).all()
+        logger.info(f"🔍 DEBUG: Query range: {start} to {end}")
+        logger.info(f"🔍 DEBUG: Found {len(debug_ts_rows)} TrackSessions in range")
+        if debug_ts_rows:
+            logger.info(f"🔍 DEBUG: Sample timestamps: {[(r.started_at, r.person_identity_id) for r in debug_ts_rows]}")
+        
+        # Debug: Check what the subquery returns before converting to subquery
+        debug_rows = (await db.execute(distinct_persons_subq)).all()
+        logger.info(f"🔍 DEBUG: Distinct persons query returned {len(debug_rows)} rows")
+        if debug_rows:
+            logger.info(f"🔍 DEBUG: Sample rows with buckets: {[(r.bucket, r.person_identity_id) for r in debug_rows[:5]]}")
+        
+        # Recreate the query to convert to subquery (can't reuse after execute)
+        distinct_persons_subq = (
+            select(
+                bucket_expr.label("bucket"),
+                TrackSession.person_identity_id
+            )
+            .where(
+                TrackSession.started_at >= start,
+                TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
+            )
+            .distinct()
+        )
+        if cam_ids:
+            distinct_persons_subq = distinct_persons_subq.where(TrackSession.camera_id.in_(cam_ids))
+        
+        distinct_persons_subq = distinct_persons_subq.subquery()
+        
+        # Main query: Count distinct persons per bucket
+        ff_timeline_q = (
+            select(
+                distinct_persons_subq.c.bucket,
+                func.count(distinct_persons_subq.c.person_identity_id).label("cnt")
+            )
+            .group_by(distinct_persons_subq.c.bucket)
+            .order_by(distinct_persons_subq.c.bucket)
+        )
 
         ff_rows = (await db.execute(ff_timeline_q)).all()
         ff_map = {row.bucket: row.cnt for row in ff_rows}
+        logger.info(f"🔍 DEBUG: Footfall timeline query returned {len(ff_rows)} buckets: {ff_map}")
 
         footfall_over_time: List[DashboardV2FootfallPoint] = []
         slot = cls._truncate_slot(start, resolved)
-        while slot <= end:
+        
+        # For "today" and "this_week", extend to end of period for complete charts
+        # For hourly: extend to end of current day (23:59)
+        # For daily: use the actual end
+        display_end = end
+        if resolved == "hour" and time_range in ("today", "this_week"):
+            # Extend to end of current day (23:59:59 UTC)
+            display_end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        while slot <= display_end:
             next_slot = cls._next_slot(slot, resolved)
             footfall_over_time.append(DashboardV2FootfallPoint(
                 label=cls._slot_label(slot, resolved),
                 slot_start=slot,
                 slot_end=next_slot,
-                count=ff_map.get(slot, 0),
+                count=ff_map.get(slot, 0),  # Future hours will get 0
             ))
             slot = next_slot
 
-        # ── 7. Gender Trend (hourly stacked bars) ─────────────────────────
-        gender_trend_q = (
+        # ── 7. Gender Trend (unique persons by gender per time bucket) ─────────────────────────
+        # Subquery: Get distinct person_identity_id per bucket with gender
+        distinct_gender_subq = (
             select(
                 bucket_expr.label("bucket"),
-                PersonIdentity.gender,
-                func.count(TrackSession.id).label("cnt"),
+                TrackSession.person_identity_id,
+                PersonIdentity.gender
             )
-            .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id, isouter=True)
+            .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id)
             .where(
                 TrackSession.started_at >= start,
                 TrackSession.started_at <= end,
+                TrackSession.person_identity_id.isnot(None),
             )
-            .group_by("bucket", PersonIdentity.gender)
-            .order_by("bucket")
+            .distinct()
         )
         if cam_ids:
-            gender_trend_q = gender_trend_q.where(TrackSession.camera_id.in_(cam_ids))
+            distinct_gender_subq = distinct_gender_subq.where(TrackSession.camera_id.in_(cam_ids))
+        
+        distinct_gender_subq = distinct_gender_subq.subquery()
+        
+        # Main query: Count distinct persons per bucket per gender
+        gender_trend_q = (
+            select(
+                distinct_gender_subq.c.bucket,
+                distinct_gender_subq.c.gender,
+                func.count(distinct_gender_subq.c.person_identity_id).label("cnt"),
+            )
+            .group_by(distinct_gender_subq.c.bucket, distinct_gender_subq.c.gender)
+            .order_by(distinct_gender_subq.c.bucket)
+        )
 
         gt_rows = (await db.execute(gender_trend_q)).all()
         gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
@@ -958,7 +1036,9 @@ class AnalyticsService:
 
         gender_trend: List[DashboardV2GenderTrendPoint] = []
         slot = cls._truncate_slot(start, resolved)
-        while slot <= end:
+        
+        # Use same display_end as footfall_over_time for consistency
+        while slot <= display_end:
             next_slot = cls._next_slot(slot, resolved)
             bucket_data = gt_map.get(slot, {})
             gender_trend.append(DashboardV2GenderTrendPoint(

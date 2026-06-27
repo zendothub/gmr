@@ -16,8 +16,8 @@ Eye icon → Polygon Editor
     DELETE /api/v2/cameras/{camera_id}/zones/{zone_id} → remove a zone
 
 Zone types in this context  (camera-feed polygon types):
-  footfall | dwell_time | queue_length | entry_exit | heatmap | purchase_intent
-  Default: footfall — the zone is immediately functional before the operator
+  entry_exit | billing_zone
+  Default: entry_exit — the zone is immediately functional before the operator
   picks an event from the dropdown.
 
 Store-wise analytics:
@@ -623,14 +623,15 @@ async def create_detection_zone(
     - `polygon` format: `{"points": [[x1,y1],[x2,y2],...]}`
 
     Valid `zone_type` values:
-    `footfall` | `dwell_time` | `queue_length` | `entry_exit` | `heatmap` | `purchase_intent`
+    `entry_exit` | `billing_zone`
     """
     await _get_camera_or_404(db, camera_id)
 
     # Validate zone_type is a recognised detection event type
     valid_types = set(DETECTION_EVENT_TYPES) | {
         # Also allow legacy zone_type values for backward compat
-        "entry_line", "exit_line", "billing_zone", "queue_zone",
+        "footfall", "dwell_time", "queue_length", "heatmap", "purchase_intent",
+        "entry_line", "exit_line", "queue_zone",
         "product_zone", "ignore_zone", "restricted_zone", "medicine_pickup_zone",
     }
     if data.zone_type not in valid_types:
