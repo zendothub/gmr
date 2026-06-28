@@ -1,6 +1,6 @@
 """Analytics service - aggregated metrics for the dashboard."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -51,6 +51,9 @@ from app.modules.analytics.schemas import (
     DashboardV2AgeGroupDistributionPoint,
 )
 from app.utils.time_utils import utc_now
+
+# IST timezone (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _default_range(start_time: Optional[datetime], end_time: Optional[datetime]):
@@ -765,23 +768,44 @@ class AnalyticsService:
 
     @staticmethod
     def _v2_resolve_range(time_range: str, start_time: Optional[datetime], end_time: Optional[datetime]):
-        """Return (start, end, prev_start, prev_end) for the requested time_range."""
-        now = utc_now()
+        """Return (start, end, prev_start, prev_end) for the requested time_range.
+        
+        All times are computed in IST (Asia/Calcutta, UTC+5:30) to match user expectations.
+        """
+        now = datetime.now(IST)  # Current time in IST
+        
         if time_range == "today":
+            # Start of today in IST (00:00 IST)
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = now
             duration = end - start
             return start, end, start - duration, start
+        
         if time_range == "this_week":
-            # Monday 00:00 of current week
+            # Monday 00:00 in IST of current week
             monday = (now - timedelta(days=now.weekday())).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
             end = now
             return monday, end, monday - timedelta(weeks=1), monday
-        # custom
-        end = end_time or now
-        start = start_time or (end - timedelta(hours=24))
+        
+        # custom range: treat naive datetimes as IST
+        if end_time is None:
+            end = now
+        elif end_time.tzinfo is None:
+            # Naive datetime from frontend → assume IST
+            end = end_time.replace(tzinfo=IST)
+        else:
+            end = end_time
+        
+        if start_time is None:
+            start = end - timedelta(hours=24)
+        elif start_time.tzinfo is None:
+            # Naive datetime from frontend → assume IST
+            start = start_time.replace(tzinfo=IST)
+        else:
+            start = start_time
+        
         duration = end - start
         return start, end, start - duration, start
 
@@ -905,9 +929,8 @@ class AnalyticsService:
         range_days = (end - start).total_seconds() / 86400
         resolved = cls._resolve_group_by("auto", range_days)
 
-        # Force date_trunc to operate in UTC timezone to get proper hour buckets (0:00, 1:00, etc.)
-        # Then convert back to timestamptz to maintain timezone info
-        bucket_expr = func.timezone('UTC', func.date_trunc(resolved, func.timezone('UTC', TrackSession.started_at)))
+        # Truncate in IST timezone to get proper IST hour buckets (0:00 IST, 1:00 IST, etc.)
+        bucket_expr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
         
         # Subquery: Get distinct person_identity_id per bucket
         distinct_persons_subq = (
@@ -979,11 +1002,11 @@ class AnalyticsService:
         slot = cls._truncate_slot(start, resolved)
         
         # For "today" and "this_week", extend to end of period for complete charts
-        # For hourly: extend to end of current day (23:59)
+        # For hourly: extend to end of current day (23:59 in same timezone)
         # For daily: use the actual end
         display_end = end
         if resolved == "hour" and time_range in ("today", "this_week"):
-            # Extend to end of current day (23:59:59 UTC)
+            # Extend to end of current day (23:59:59 in same timezone as end)
             display_end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
         
         while slot <= display_end:
@@ -1198,9 +1221,12 @@ class AnalyticsService:
 
         # ── Shared helpers ─────────────────────────────────────────────
 
-        def _ts_q(s, e):
-            q = select(func.count(TrackSession.id)).where(
-                TrackSession.started_at >= s, TrackSession.started_at <= e,
+        def _unique_persons_q(s, e):
+            """Count unique persons (distinct person_identity_id) in range."""
+            q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
+                TrackSession.started_at >= s,
+                TrackSession.started_at <= e,
+                TrackSession.person_identity_id.isnot(None),
             )
             if cam_ids:
                 q = q.where(TrackSession.camera_id.in_(cam_ids))
@@ -1217,7 +1243,8 @@ class AnalyticsService:
 
         async def _slot_map(model_col, s, e) -> dict:
             """Return {slot_dt: count} for date_trunc(resolved, model_col) in [s, e]."""
-            bexpr = func.date_trunc(resolved, model_col)
+            # Use IST timezone for bucketing
+            bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', model_col))
             q = (
                 select(bexpr.label("b"), func.count().label("c"))
                 .where(model_col >= s, model_col <= e)
@@ -1262,30 +1289,72 @@ class AnalyticsService:
 
         # ── FOOTFALL ───────────────────────────────────────────────────
         if metric == "footfall":
-            total_visitors = (await db.execute(_ts_q(start, end))).scalar() or 0
+            # Count unique persons (distinct person_identity_id)
+            total_visitors = (await db.execute(_unique_persons_q(start, end))).scalar() or 0
 
-            # Hourly map for peak hour + footfall_over_time
-            h_bexpr = func.date_trunc("hour", TrackSession.started_at)
-            hq = (
-                select(h_bexpr.label("b"), func.count(TrackSession.id).label("c"))
-                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
-                .group_by("b").order_by("b")
+            # Hourly map for peak hour (unique persons per hour)
+            h_bexpr = func.date_trunc("hour", func.timezone('Asia/Calcutta', TrackSession.started_at))
+            
+            # Subquery: distinct person_identity_id per hour
+            h_subq = (
+                select(
+                    h_bexpr.label("bucket"),
+                    TrackSession.person_identity_id
+                )
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .distinct()
             )
             if cam_ids:
-                hq = hq.where(TrackSession.camera_id.in_(cam_ids))
+                h_subq = h_subq.where(TrackSession.camera_id.in_(cam_ids))
+            h_subq = h_subq.subquery()
+            
+            # Count distinct persons per hour
+            hq = (
+                select(
+                    h_subq.c.bucket.label("b"),
+                    func.count(h_subq.c.person_identity_id).label("c")
+                )
+                .group_by(h_subq.c.bucket)
+                .order_by(h_subq.c.bucket)
+            )
             h_rows = (await db.execute(hq)).all()
             hourly_cnt = {r.b: r.c for r in h_rows}
+            # Extract hour as integer for peak_hours_label (need to handle timezone-aware datetime)
             hourly_int = {r.b.hour: r.c for r in h_rows}
 
-            # daily map for avg_daily + busiest_day
-            d_bexpr = func.date_trunc("day", TrackSession.started_at)
-            dq = (
-                select(d_bexpr.label("b"), func.count(TrackSession.id).label("c"))
-                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
-                .group_by("b").order_by("b")
+            # daily map for avg_daily + busiest_day (unique persons per day)
+            d_bexpr = func.date_trunc("day", func.timezone('Asia/Calcutta', TrackSession.started_at))
+            
+            # Subquery: distinct person_identity_id per day
+            d_subq = (
+                select(
+                    d_bexpr.label("bucket"),
+                    TrackSession.person_identity_id
+                )
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .distinct()
             )
             if cam_ids:
-                dq = dq.where(TrackSession.camera_id.in_(cam_ids))
+                d_subq = d_subq.where(TrackSession.camera_id.in_(cam_ids))
+            d_subq = d_subq.subquery()
+            
+            # Count distinct persons per day
+            dq = (
+                select(
+                    d_subq.c.bucket.label("b"),
+                    func.count(d_subq.c.person_identity_id).label("c")
+                )
+                .group_by(d_subq.c.bucket)
+                .order_by(d_subq.c.bucket)
+            )
             d_rows = (await db.execute(dq)).all()
             daily_cnt = {r.b: r.c for r in d_rows}
 
@@ -1293,11 +1362,110 @@ class AnalyticsService:
             busiest_day_dt = max(daily_cnt, key=lambda k: daily_cnt[k]) if daily_cnt else None
             avg_daily = (total_visitors // max(len(daily_cnt), 1)) if daily_cnt else 0
 
-            # footfall_over_time (resolved granularity)
-            ff_map = await _slot_map(TrackSession.started_at, start, end)
+            # footfall_over_time (resolved granularity) - unique persons per slot
+            # Need to use distinct person_identity_id per slot
+            slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+            
+            ff_subq = (
+                select(
+                    slot_bexpr.label("bucket"),
+                    TrackSession.person_identity_id
+                )
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .distinct()
+            )
+            if cam_ids:
+                ff_subq = ff_subq.where(TrackSession.camera_id.in_(cam_ids))
+            ff_subq = ff_subq.subquery()
+            
+            ffq = (
+                select(
+                    ff_subq.c.bucket.label("b"),
+                    func.count(ff_subq.c.person_identity_id).label("c")
+                )
+                .group_by(ff_subq.c.bucket)
+                .order_by(ff_subq.c.bucket)
+            )
+            ff_rows = (await db.execute(ffq)).all()
+            ff_map = {r.b: r.c for r in ff_rows}
+            
             footfall_over_time = cls._build_ff_slots(start, end, resolved, ff_map)
-            period_comp = await _period_comparison(TrackSession.started_at)
-            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+            
+            # Period comparison - unique persons per slot for both periods
+            async def _footfall_period_comparison() -> List[PeriodComparisonPoint]:
+                # Current period
+                curr_map = ff_map  # Already computed above
+                
+                # Previous period
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_subq = (
+                    select(
+                        prev_bexpr.label("bucket"),
+                        TrackSession.person_identity_id
+                    )
+                    .where(
+                        TrackSession.started_at >= prev_start,
+                        TrackSession.started_at <= prev_end,
+                        TrackSession.person_identity_id.isnot(None),
+                    )
+                    .distinct()
+                )
+                if cam_ids:
+                    prev_subq = prev_subq.where(TrackSession.camera_id.in_(cam_ids))
+                prev_subq = prev_subq.subquery()
+                
+                prevq = (
+                    select(
+                        prev_subq.c.bucket.label("b"),
+                        func.count(prev_subq.c.person_identity_id).label("c")
+                    )
+                    .group_by(prev_subq.c.bucket)
+                    .order_by(prev_subq.c.bucket)
+                )
+                prev_rows = (await db.execute(prevq)).all()
+                prev_map = {r.b: r.c for r in prev_rows}
+                
+                points: List[PeriodComparisonPoint] = []
+                slot = cls._truncate_slot(start, resolved)
+                prev_slot = cls._truncate_slot(prev_start, resolved)
+                while slot <= end:
+                    nxt = cls._next_slot(slot, resolved)
+                    points.append(PeriodComparisonPoint(
+                        label=cls._slot_label(slot, resolved),
+                        slot_start=slot, slot_end=nxt,
+                        current=curr_map.get(slot, 0),
+                        previous=prev_map.get(prev_slot, 0),
+                    ))
+                    slot = nxt
+                    prev_slot = cls._next_slot(prev_slot, resolved)
+                return points
+            
+            period_comp = await _footfall_period_comparison()
+            
+            # Per-camera breakdown - unique persons per camera
+            cam_q = (
+                select(
+                    Camera.id,
+                    Camera.name,
+                    func.count(func.distinct(TrackSession.person_identity_id)).label("cnt")
+                )
+                .join(Camera, Camera.id == TrackSession.camera_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .group_by(Camera.id, Camera.name)
+                .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
+            )
+            if cam_ids:
+                cam_q = cam_q.where(TrackSession.camera_id.in_(cam_ids))
+            cam_rows = (await db.execute(cam_q)).all()
+            cam_breakdown = [CameraBreakdownPoint(camera_id=r[0], camera_name=r[1], count=r[2]) for r in cam_rows]
 
             return AnalyticsMetricsResponse(
                 **base_resp,
@@ -1346,16 +1514,36 @@ class AnalyticsService:
                 gcnt[cls._v2_gender(raw)] += 1
             total_g = sum(gcnt.values()) or 1
 
-            # gender_trend
-            bexpr = func.date_trunc(resolved, TrackSession.started_at)
-            gt_q = (
-                select(bexpr.label("b"), PersonIdentity.gender, func.count(TrackSession.id).label("c"))
-                .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id, isouter=True)
-                .where(TrackSession.started_at >= start, TrackSession.started_at <= end)
-                .group_by("b", PersonIdentity.gender).order_by("b")
+            # gender_trend - unique persons by gender per slot
+            bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+            
+            gt_subq = (
+                select(
+                    bexpr.label("bucket"),
+                    TrackSession.person_identity_id,
+                    PersonIdentity.gender
+                )
+                .join(PersonIdentity, PersonIdentity.id == TrackSession.person_identity_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .distinct()
             )
             if cam_ids:
-                gt_q = gt_q.where(TrackSession.camera_id.in_(cam_ids))
+                gt_subq = gt_subq.where(TrackSession.camera_id.in_(cam_ids))
+            gt_subq = gt_subq.subquery()
+            
+            gt_q = (
+                select(
+                    gt_subq.c.bucket.label("b"),
+                    gt_subq.c.gender,
+                    func.count(gt_subq.c.person_identity_id).label("c")
+                )
+                .group_by(gt_subq.c.bucket, gt_subq.c.gender)
+                .order_by(gt_subq.c.bucket)
+            )
             gt_rows = (await db.execute(gt_q)).all()
             gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
             for r in gt_rows:
@@ -1373,8 +1561,79 @@ class AnalyticsService:
                 ))
                 slot = nxt
 
-            period_comp = await _period_comparison(TrackSession.started_at)
-            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+            # Period comparison and per-camera for gender use unique persons
+            async def _gender_period_comparison() -> List[PeriodComparisonPoint]:
+                # Current already computed in gt_map, need to aggregate across genders
+                curr_totals: dict = {}
+                for bucket, genders in gt_map.items():
+                    curr_totals[bucket] = sum(genders.values())
+                
+                # Previous period
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_subq = (
+                    select(
+                        prev_bexpr.label("bucket"),
+                        TrackSession.person_identity_id
+                    )
+                    .where(
+                        TrackSession.started_at >= prev_start,
+                        TrackSession.started_at <= prev_end,
+                        TrackSession.person_identity_id.isnot(None),
+                    )
+                    .distinct()
+                )
+                if cam_ids:
+                    prev_subq = prev_subq.where(TrackSession.camera_id.in_(cam_ids))
+                prev_subq = prev_subq.subquery()
+                
+                prevq = (
+                    select(
+                        prev_subq.c.bucket.label("b"),
+                        func.count(prev_subq.c.person_identity_id).label("c")
+                    )
+                    .group_by(prev_subq.c.bucket)
+                    .order_by(prev_subq.c.bucket)
+                )
+                prev_rows = (await db.execute(prevq)).all()
+                prev_totals = {r.b: r.c for r in prev_rows}
+                
+                points: List[PeriodComparisonPoint] = []
+                slot = cls._truncate_slot(start, resolved)
+                prev_slot = cls._truncate_slot(prev_start, resolved)
+                while slot <= end:
+                    nxt = cls._next_slot(slot, resolved)
+                    points.append(PeriodComparisonPoint(
+                        label=cls._slot_label(slot, resolved),
+                        slot_start=slot, slot_end=nxt,
+                        current=curr_totals.get(slot, 0),
+                        previous=prev_totals.get(prev_slot, 0),
+                    ))
+                    slot = nxt
+                    prev_slot = cls._next_slot(prev_slot, resolved)
+                return points
+            
+            period_comp = await _gender_period_comparison()
+            
+            # Per-camera breakdown
+            cam_q = (
+                select(
+                    Camera.id,
+                    Camera.name,
+                    func.count(func.distinct(TrackSession.person_identity_id)).label("cnt")
+                )
+                .join(Camera, Camera.id == TrackSession.camera_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .group_by(Camera.id, Camera.name)
+                .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
+            )
+            if cam_ids:
+                cam_q = cam_q.where(TrackSession.camera_id.in_(cam_ids))
+            cam_rows = (await db.execute(cam_q)).all()
+            cam_breakdown = [CameraBreakdownPoint(camera_id=r[0], camera_name=r[1], count=r[2]) for r in cam_rows]
 
             return AnalyticsMetricsResponse(
                 **base_resp,
@@ -1434,8 +1693,103 @@ class AnalyticsService:
                 key="unidentified", label="Unidentified", count=age_cnt2["unidentified"]
             )]
 
-            period_comp = await _period_comparison(TrackSession.started_at)
-            cam_breakdown = await _per_camera(TrackSession, TrackSession.started_at)
+            # Period comparison and per-camera for age groups
+            async def _age_period_comparison() -> List[PeriodComparisonPoint]:
+                # Current period - aggregate total unique persons per slot
+                curr_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                curr_subq = (
+                    select(
+                        curr_bexpr.label("bucket"),
+                        TrackSession.person_identity_id
+                    )
+                    .where(
+                        TrackSession.started_at >= start,
+                        TrackSession.started_at <= end,
+                        TrackSession.person_identity_id.isnot(None),
+                    )
+                    .distinct()
+                )
+                if cam_ids:
+                    curr_subq = curr_subq.where(TrackSession.camera_id.in_(cam_ids))
+                curr_subq = curr_subq.subquery()
+                
+                currq = (
+                    select(
+                        curr_subq.c.bucket.label("b"),
+                        func.count(curr_subq.c.person_identity_id).label("c")
+                    )
+                    .group_by(curr_subq.c.bucket)
+                    .order_by(curr_subq.c.bucket)
+                )
+                curr_rows = (await db.execute(currq)).all()
+                curr_map = {r.b: r.c for r in curr_rows}
+                
+                # Previous period
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_subq = (
+                    select(
+                        prev_bexpr.label("bucket"),
+                        TrackSession.person_identity_id
+                    )
+                    .where(
+                        TrackSession.started_at >= prev_start,
+                        TrackSession.started_at <= prev_end,
+                        TrackSession.person_identity_id.isnot(None),
+                    )
+                    .distinct()
+                )
+                if cam_ids:
+                    prev_subq = prev_subq.where(TrackSession.camera_id.in_(cam_ids))
+                prev_subq = prev_subq.subquery()
+                
+                prevq = (
+                    select(
+                        prev_subq.c.bucket.label("b"),
+                        func.count(prev_subq.c.person_identity_id).label("c")
+                    )
+                    .group_by(prev_subq.c.bucket)
+                    .order_by(prev_subq.c.bucket)
+                )
+                prev_rows = (await db.execute(prevq)).all()
+                prev_map = {r.b: r.c for r in prev_rows}
+                
+                points: List[PeriodComparisonPoint] = []
+                slot = cls._truncate_slot(start, resolved)
+                prev_slot = cls._truncate_slot(prev_start, resolved)
+                while slot <= end:
+                    nxt = cls._next_slot(slot, resolved)
+                    points.append(PeriodComparisonPoint(
+                        label=cls._slot_label(slot, resolved),
+                        slot_start=slot, slot_end=nxt,
+                        current=curr_map.get(slot, 0),
+                        previous=prev_map.get(prev_slot, 0),
+                    ))
+                    slot = nxt
+                    prev_slot = cls._next_slot(prev_slot, resolved)
+                return points
+            
+            period_comp = await _age_period_comparison()
+            
+            # Per-camera breakdown
+            cam_q = (
+                select(
+                    Camera.id,
+                    Camera.name,
+                    func.count(func.distinct(TrackSession.person_identity_id)).label("cnt")
+                )
+                .join(Camera, Camera.id == TrackSession.camera_id)
+                .where(
+                    TrackSession.started_at >= start,
+                    TrackSession.started_at <= end,
+                    TrackSession.person_identity_id.isnot(None),
+                )
+                .group_by(Camera.id, Camera.name)
+                .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
+            )
+            if cam_ids:
+                cam_q = cam_q.where(TrackSession.camera_id.in_(cam_ids))
+            cam_rows = (await db.execute(cam_q)).all()
+            cam_breakdown = [CameraBreakdownPoint(camera_id=r[0], camera_name=r[1], count=r[2]) for r in cam_rows]
 
             return AnalyticsMetricsResponse(
                 **base_resp,
@@ -1452,11 +1806,11 @@ class AnalyticsService:
         # ── PURCHASE ───────────────────────────────────────────────────
         if metric == "purchase":
             total_purchases = (await db.execute(_purchase_q(start, end))).scalar() or 0
-            total_visitors_p = (await db.execute(_ts_q(start, end))).scalar() or 0
+            total_visitors_p = (await db.execute(_unique_persons_q(start, end))).scalar() or 0
             conv_pct = round(total_purchases / max(total_visitors_p, 1) * 100, 1)
 
-            # Daily map
-            d_bexpr2 = func.date_trunc("day", BillingInteraction.entered_at)
+            # Daily map - use IST timezone
+            d_bexpr2 = func.date_trunc("day", func.timezone('Asia/Calcutta', BillingInteraction.entered_at))
             dq2 = (
                 select(d_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
                 .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
@@ -1470,8 +1824,8 @@ class AnalyticsService:
             busiest2 = max(daily2, key=lambda k: daily2[k]) if daily2 else None
             avg_daily2 = (total_purchases // max(len(daily2), 1)) if daily2 else 0
 
-            # Hourly map for peak_hours_label
-            h_bexpr2 = func.date_trunc("hour", BillingInteraction.entered_at)
+            # Hourly map for peak_hours_label - use IST timezone
+            h_bexpr2 = func.date_trunc("hour", func.timezone('Asia/Calcutta', BillingInteraction.entered_at))
             hq2 = (
                 select(h_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
                 .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
