@@ -1,6 +1,7 @@
 """Zone service - CRUD for zones bound to a camera (camera -> many zones)."""
 
-from typing import List
+import asyncio
+from typing import List, Optional
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,25 @@ from loguru import logger
 
 from app.core.db.models.camera import Zone, Camera
 from app.modules.zones.schemas import ZoneCreate, ZoneUpdate
+
+
+def _schedule_config_reload(camera_id: Optional[UUID] = None):
+    """Fire-and-forget config reload for running workers.
+    
+    This triggers camera workers to reload their zones/rules configuration
+    from the database without restarting the worker process.
+    """
+    try:
+        from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
+        supervisor = WorkerSupervisor.get_instance()
+        loop = asyncio.get_running_loop()
+        loop.create_task(supervisor.reload_config())
+        logger.info(
+            f"Scheduled runtime config reload "
+            f"{'for all cameras' if camera_id is None else f'triggered by camera {camera_id}'}"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to schedule config reload: {e}")
 
 
 class ZoneService:
@@ -39,6 +59,7 @@ class ZoneService:
         await db.flush()
         await db.refresh(zone)
         logger.info(f"Zone created: {zone.name} (type={zone.zone_type}) on camera {camera_id}")
+        _schedule_config_reload(camera_id)
         return zone
 
     @staticmethod
@@ -73,12 +94,15 @@ class ZoneService:
         await db.flush()
         await db.refresh(zone)
         logger.info(f"Zone updated: {zone.name} (id={zone_id})")
+        _schedule_config_reload(zone.camera_id)
         return zone
 
     @staticmethod
     async def delete_zone(db: AsyncSession, zone_id: UUID) -> dict:
         """Delete a zone."""
         zone = await ZoneService.get_zone(db, zone_id)
+        camera_id = zone.camera_id
         await db.delete(zone)
         logger.info(f"Zone deleted: {zone.name} (id={zone_id})")
+        _schedule_config_reload(camera_id)
         return {"message": f"Zone '{zone.name}' deleted successfully"}

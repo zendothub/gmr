@@ -1,43 +1,100 @@
 """Users module Pydantic schemas."""
 
-from typing import Optional, List
+from typing import Optional
 from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
-class RoleResponse(BaseModel):
-    id: UUID
-    name: str
-    description: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Request schemas
+# ---------------------------------------------------------------------------
 
-    class Config:
-        from_attributes = True
+class UserInvite(BaseModel):
+    """Schema for inviting (creating) a new user by Super Admin.
+
+    Status is always set to 'active' automatically — not required from client.
+    """
+    name: str = Field(..., min_length=1, max_length=255, description="Full name")
+    email: str = Field(..., min_length=3, max_length=255, description="Email address")
+    password: str = Field(..., min_length=6, max_length=128, description="Initial password")
+    role: str = Field(
+        ...,
+        pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$",
+        description="Role to assign: SUPER_ADMIN, ADMIN or VIEWER",
+    )
 
 
-class UserCreate(BaseModel):
-    username: str = Field(..., min_length=3, max_length=100)
-    password: str = Field(..., min_length=6, max_length=128)
-    full_name: Optional[str] = None
-    role_names: List[str] = Field(default_factory=list)
+class UserAdd(BaseModel):
+    """Schema for simply adding a user — password is auto-generated.
+
+    Used by POST /api/users.
+    """
+    name: str = Field(..., min_length=1, max_length=255, description="Full name")
+    email: str = Field(..., min_length=3, max_length=255, description="Email address")
+    role: str = Field(
+        ...,
+        pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$",
+        description="Role to assign: SUPER_ADMIN, ADMIN or VIEWER",
+    )
+
+
+# Keep backward-compatible alias
+UserCreate = UserInvite
 
 
 class UserUpdate(BaseModel):
-    full_name: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    email: Optional[str] = Field(None, min_length=3, max_length=255)
     password: Optional[str] = Field(None, min_length=6, max_length=128)
+    status: Optional[str] = Field(None, pattern="^(active|inactive)$")
+    role: Optional[str] = Field(None, pattern="^(SUPER_ADMIN|ADMIN|VIEWER)$")
 
 
-class UserDetailResponse(BaseModel):
+class UserStatusUpdate(BaseModel):
+    """Toggle a user's active/inactive status."""
+    status: str = Field(..., pattern="^(active|inactive)$")
+
+
+class UpdateProfile(BaseModel):
+    """Authenticated user updates their own profile."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+
+
+class UpdatePassword(BaseModel):
+    """Authenticated user changes their own password."""
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6, max_length=128)
+    confirm_new_password: str = Field(..., min_length=6, max_length=128)
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+class UserListItem(BaseModel):
+    """Compact user record for list views (User Management table).
+
+    Returns: name, email, status, role, password (plain) — no stores, no last_login.
+    """
     id: UUID
-    username: str
-    full_name: Optional[str] = None
-    roles: List[RoleResponse] = Field(default_factory=list)
-
+    name: str
+    email: str
+    status: str
+    role: str  # first role name as a plain string, e.g. "ADMIN"
+    password: Optional[str] = None  # plain text password for admin visibility
 
     class Config:
         from_attributes = True
 
 
+class UserDetailResponse(BaseModel):
+    """Full user response (used for create / get-by-id)."""
+    id: UUID
+    name: str
+    email: str
+    status: str
+    role: str  # first role name
 
-class RoleCreate(BaseModel):
-    name: str = Field(..., min_length=2, max_length=50)
-    description: Optional[str] = None
+    class Config:
+        from_attributes = True

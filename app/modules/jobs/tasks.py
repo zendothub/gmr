@@ -2,10 +2,12 @@
 
 from datetime import datetime, timedelta, date
 
+import anyio
 from loguru import logger
 from sqlalchemy import select, func, update
 
 from app.core.db.session import AsyncSessionLocal
+from app.core.db.models.camera import Camera, CameraStatus
 from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
@@ -158,3 +160,91 @@ async def cleanup_old_storage(retention_days: int = 30):
         except Exception as e:
             await db.rollback()
             logger.error(f"Storage cleanup job failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Camera status probe (runs every 2 minutes)
+# ---------------------------------------------------------------------------
+
+def _probe_rtsp(rtsp_url: str, timeout: int = 8) -> bool:
+    """Synchronous RTSP connectivity probe. Returns True if stream is reachable."""
+    import cv2
+    cap = None
+    try:
+        cap = cv2.VideoCapture(rtsp_url)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout * 1000)
+        if not cap.isOpened():
+            return False
+        ret, frame = cap.read()
+        return ret and frame is not None
+    except Exception:
+        return False
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+async def probe_camera_statuses():
+    """Check every camera's RTSP stream and update its status in the database.
+
+    Runs every 2 minutes via APScheduler.
+
+    Status update rules:
+    - Camera in MAINTENANCE → skipped (operator-set status, do not override).
+    - RTSP reachable → ACTIVE
+    - RTSP unreachable → INACTIVE
+
+    Uses anyio.to_thread.run_sync so the blocking cv2 probe does not stall
+    the async event loop.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            # Fetch all cameras except those in MAINTENANCE status
+            result = await db.execute(
+                select(Camera).where(Camera.status != CameraStatus.MAINTENANCE)
+            )
+            cameras = list(result.scalars().all())
+
+            if not cameras:
+                return
+
+            active_count = 0
+            inactive_count = 0
+
+            for camera in cameras:
+                try:
+                    # Run blocking RTSP probe in a thread
+                    reachable: bool = await anyio.to_thread.run_sync(
+                        lambda url=camera.rtsp_url: _probe_rtsp(url)
+                    )
+                    new_status = CameraStatus.ACTIVE if reachable else CameraStatus.INACTIVE
+
+                    if camera.status != new_status:
+                        camera.status = new_status
+                        logger.info(
+                            f"Camera status updated: {camera.name} (id={camera.id}) "
+                            f"→ {new_status}"
+                        )
+
+                    if new_status == CameraStatus.ACTIVE:
+                        active_count += 1
+                    else:
+                        inactive_count += 1
+
+                except Exception as cam_err:
+                    logger.warning(
+                        f"RTSP probe error for camera {camera.id} ({camera.name}): {cam_err}"
+                    )
+                    # Mark as inactive on probe error
+                    if camera.status not in (CameraStatus.INACTIVE, CameraStatus.ERROR):
+                        camera.status = CameraStatus.INACTIVE
+
+            await db.commit()
+            logger.debug(
+                f"Camera status probe complete: {len(cameras)} checked, "
+                f"{active_count} active, {inactive_count} inactive"
+            )
+
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Camera status probe job failed: {e}")

@@ -48,7 +48,11 @@ class Settings(BaseSettings):
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
-    FACE_MATCH_THRESHOLD: float = 0.50
+    FACE_MATCH_THRESHOLD: float = 0.55  # Face contradiction threshold (increased from 0.50)
+    
+    # YOLO-Pose for enhanced ReID quality assessment
+    YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
+    YOLO_POSE_CONFIDENCE: float = 0.3  # Keypoint confidence threshold
 
     # Runtime
     DEFAULT_FPS_TARGET: int = 10

@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from loguru import logger
 
 from app.core.db.models.camera import Camera, CameraStatus
+from app.core.db.models.store import Store
 from app.modules.cameras.schemas import (
     CameraCreate, CameraUpdate, CameraResponse, RTSPTestResponse, CameraHealthResponse
 )
@@ -37,6 +38,14 @@ class CameraService:
         resp.stream_path = camera.stream_path or endpoints.path
         resp.webrtc_url = endpoints.webrtc_url
         resp.hls_url = endpoints.hls_url
+        # Populate store-derived fields if a store is linked
+        if camera.store:
+            resp.store_name = camera.store.name
+            resp.store_zone_gate = camera.store.zone_gate
+        # Populate store-zone (position) fields if linked
+        if camera.store_zone:
+            resp.zone_id = camera.zone_id
+            resp.zone_name = camera.store_zone.name
         return resp
 
 
@@ -90,6 +99,56 @@ class CameraService:
                 cap.release()
 
     @staticmethod
+    async def create_camera_v2(db: AsyncSession, data: "CameraCreateV2") -> Camera:
+        """Create a new camera linked to a store (V2).
+
+        Same logic as create_camera but store_id is required.
+        The store must exist — validated by the caller (router).
+        """
+        from app.modules.cameras.schemas import CameraCreateV2
+
+        resolution = None
+        test_result = None
+        if not data.skip_rtsp_test:
+            test_result = CameraService.test_rtsp_stream(data.rtsp_url)
+            if not test_result.success:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"RTSP stream test failed: {test_result.message}",
+                )
+            resolution = test_result.resolution
+
+        camera_kwargs: dict = {
+            "name": data.name,
+            "rtsp_url": data.rtsp_url,
+            "store_id": data.store_id,
+            "status": CameraStatus.INACTIVE,
+            "is_active": True,
+        }
+        if data.zone_id:
+            camera_kwargs["zone_id"] = data.zone_id
+        if resolution:
+            camera_kwargs["resolution"] = resolution
+        camera = Camera(**camera_kwargs)
+
+        db.add(camera)
+        await db.flush()
+        camera.stream_path = camera_path(camera.id)
+        await db.flush()
+        await db.refresh(camera)
+
+        logger.info(f"Camera created (v2): {camera.name} (id={camera.id}, store_id={camera.store_id})")
+
+        # Do NOT auto-start the StreamManager publisher here — the router
+        # calls start_camera() immediately after, which handles stream setup:
+        #   - burnin_enabled=True  → StreamBroadcaster in CameraWorker pushes to MediaMTX
+        #   - burnin_enabled=False → StreamManager.add_viewer() pulls RTSP → MediaMTX
+        # Starting both simultaneously causes dual-ffmpeg conflicts (exit code 224)
+        # because most cameras/NVRs only allow one RTSP connection.
+
+        return camera
+
+    @staticmethod
     async def create_camera(db: AsyncSession, data: CameraCreate) -> Camera:
         """Create a new camera (name + rtsp_url + area). RTSP probe is optional."""
         resolution = None
@@ -103,7 +162,7 @@ class CameraService:
                 )
             resolution = test_result.resolution
 
-        # Only name + rtsp_url + area are sent by the frontend.
+        # Only name + rtsp_url + area + zone + store are sent by the frontend.
         # All AI-config fields (fps_target, detection_model, reid_enabled, ...)
         # use the model's column defaults — never exposed to the client.
         camera_kwargs: dict = {
@@ -113,6 +172,18 @@ class CameraService:
             "status": CameraStatus.INACTIVE,
             "is_active": True,
         }
+        if hasattr(data, "zone_id") and data.zone_id:
+            camera_kwargs["zone_id"] = data.zone_id
+        # If store_id is provided, validate and link store
+        if hasattr(data, "store_id") and data.store_id:
+            store_result = await db.execute(select(Store).where(Store.id == data.store_id))
+            store = store_result.scalar_one_or_none()
+            if not store:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Store not found: {data.store_id}",
+                )
+            camera_kwargs["store_id"] = data.store_id
         # Auto-detected resolution from RTSP probe (overrides model default).
         if resolution:
             camera_kwargs["resolution"] = resolution
@@ -214,12 +285,33 @@ class CameraService:
 
         Stops the camera worker + stream publisher (ffmpeg + watchdog) first,
         then removes the database row.
+
+        Also cleans up referencing rows in person_face_embeddings and
+        person_embeddings — those FKs lack ON DELETE CASCADE, so PostgreSQL
+        would otherwise block the deletion with a foreign-key violation.
         """
+        from app.core.db.models.person import PersonFaceEmbedding, PersonEmbedding
+        from sqlalchemy import update
+
         camera = await CameraService.get_camera(db, camera_id)
 
         # Tear down worker and stream publisher so no orphaned subprocesses
         # or watchdog threads linger after the DB row is gone.
         await CameraService._teardown_resources(camera_id)
+
+        # Nullify or remove embedding rows that still reference this camera.
+        # person_face_embeddings.camera_id and person_embeddings.camera_id have
+        # ForeignKey("cameras.id") without ON DELETE, so we must unlink them first.
+        await db.execute(
+            update(PersonFaceEmbedding)
+            .where(PersonFaceEmbedding.camera_id == camera_id)
+            .values(camera_id=None)
+        )
+        await db.execute(
+            update(PersonEmbedding)
+            .where(PersonEmbedding.camera_id == camera_id)
+            .values(camera_id=None)
+        )
 
         await db.delete(camera)
         await db.flush()
@@ -230,35 +322,65 @@ class CameraService:
     async def start_camera(db: AsyncSession, camera_id: UUID) -> Camera:
         """Mark camera as active and start worker."""
         camera = await CameraService.get_camera(db, camera_id)
+        logger.info(
+            ">>> start_camera: BEGIN"
+            f" | camera_id={camera.id}"
+            f" | name='{camera.name}'"
+            f" | current_status={camera.status}"
+            f" | burnin_enabled={camera.burnin_enabled}"
+        )
+
         camera.status = CameraStatus.ACTIVE
         await db.flush()
         await db.refresh(camera)
+        logger.info(f">>> start_camera: status set to ACTIVE for {camera.id}")
 
-        # Start camera worker
+        # Start camera worker (YOLO detection + ByteTrack tracking + rule evaluation)
+        logger.info(f">>> start_camera: launching camera worker for {camera.id}...")
         try:
             from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
             supervisor = WorkerSupervisor.get_instance()
             if supervisor:
                 await supervisor.start_camera(camera_id)
+                logger.info(
+                    f">>> start_camera: worker supervisor launched for {camera.id}"
+                )
+            else:
+                logger.error(
+                    f">>> start_camera: WorkerSupervisor instance is None for {camera.id}"
+                )
         except Exception as e:
-            logger.warning(f"Could not start camera worker: {e}")
+            logger.error(
+                f">>> start_camera: failed to start camera worker for {camera.id}: {e}",
+                exc_info=True,
+            )
 
         # Start MediaMTX stream publisher so WHEP/HLS endpoints resolve.
         # Skip if burnin_enabled — the CameraWorker's StreamBroadcaster handles it.
         if not camera.burnin_enabled:
+            logger.info(
+                f">>> start_camera: starting stream publisher (non-burnin) for {camera.id}..."
+            )
             try:
                 manager = StreamManager.get_instance()
                 await anyio.to_thread.run_sync(
                     manager.add_viewer, camera.id, camera.rtsp_url
                 )
-                logger.info(f"Stream publisher started for camera {camera_id}")
+                logger.info(
+                    f">>> start_camera: stream publisher started for {camera.id}"
+                )
             except Exception as e:
-                logger.warning(f"Could not start stream publisher: {e}")
+                logger.error(
+                    f">>> start_camera: stream publisher failed for {camera.id}: {e}",
+                    exc_info=True,
+                )
         else:
             # Wait for the CameraWorker's StreamBroadcaster to push the first
             # annotated frame to MediaMTX before returning stream URLs — otherwise
             # the frontend gets a 404 on WHEP/HLS for the first few seconds.
-            logger.info(f"Waiting for StreamBroadcaster to become ready for camera {camera_id}")
+            logger.info(
+                f">>> start_camera: waiting for StreamBroadcaster (burn-in mode) for {camera_id}..."
+            )
             try:
                 from app.modules.ai_runtime.worker_supervisor import WorkerSupervisor
                 supervisor = WorkerSupervisor.get_instance()
@@ -269,16 +391,29 @@ class CameraService:
                             worker.stream_broadcaster.wait_until_ready, 15.0
                         )
                         if ready:
-                            logger.info(f"StreamBroadcaster ready for camera {camera_id}")
+                            logger.info(
+                                f">>> start_camera: StreamBroadcaster ready for {camera_id}"
+                            )
                         else:
                             logger.warning(
-                                f"StreamBroadcaster not ready after timeout for camera {camera_id}; "
-                                f"stream may return 404 briefly"
+                                f">>> start_camera: StreamBroadcaster NOT ready after timeout for {camera_id}"
                             )
+                    else:
+                        logger.warning(
+                            f">>> start_camera: no worker/stream_broadcaster found for {camera_id} yet"
+                        )
             except Exception as e:
-                logger.warning(f"Could not wait for StreamBroadcaster: {e}")
+                logger.error(
+                    f">>> start_camera: StreamBroadcaster wait failed for {camera_id}: {e}",
+                    exc_info=True,
+                )
 
-        logger.info(f"Camera started: {camera.name}")
+        logger.info(
+            f">>> start_camera: COMPLETE"
+            f" | camera_id={camera.id}"
+            f" | name='{camera.name}'"
+            f" | status={camera.status}"
+        )
         return camera
 
     @staticmethod

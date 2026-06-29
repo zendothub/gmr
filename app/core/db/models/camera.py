@@ -29,7 +29,7 @@ class CameraStatus(str, enum.Enum):
 
 
 class ZoneType(str, enum.Enum):
-
+    # ── Legacy / store-area types ── kept for backward compatibility.
     ENTRY_LINE = "entry_line"
     EXIT_LINE = "exit_line"
     BILLING_ZONE = "billing_zone"
@@ -39,6 +39,16 @@ class ZoneType(str, enum.Enum):
     RESTRICTED_ZONE = "restricted_zone"
     # Where medicine is taken / dispensed (Apollo pharmacy pickup point)
     MEDICINE_PICKUP_ZONE = "medicine_pickup_zone"
+
+    # ── Camera-feed detection-polygon event types (V2 polygon editor) ──
+    # These are set when the operator draws a polygon on the live camera feed.
+    # The zone_type drives which AI analytics event is measured in that polygon.
+    FOOTFALL = "footfall"
+    DWELL_TIME = "dwell_time"
+    QUEUE_LENGTH = "queue_length"
+    ENTRY_EXIT = "entry_exit"
+    HEATMAP = "heatmap"
+    PURCHASE_INTENT = "purchase_intent"
 
 
 
@@ -78,6 +88,22 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
     area: Mapped[Optional["Area"]] = relationship("Area", back_populates="cameras")
+
+    # Store the camera belongs to — replaces area for V2 API.
+    # When a store is selected, the store's zone_gate (physical location) is auto-populated.
+    store_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stores.id", ondelete="SET NULL"), nullable=True
+    )
+
+    store: Mapped[Optional["Store"]] = relationship("Store", back_populates="cameras")
+
+    # Store zone / position within the store (e.g. "Entry", "Checkout", "Aisle 3").
+    # References the store_zones lookup table — NOT the camera detection zones table.
+    zone_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("store_zones.id", ondelete="SET NULL"), nullable=True
+    )
+
+    store_zone: Mapped[Optional["StoreZone"]] = relationship("StoreZone")
 
     track_sessions: Mapped[List["TrackSession"]] = relationship(
         "TrackSession", back_populates="camera", passive_deletes=True
@@ -123,4 +149,3 @@ class Zone(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     camera: Mapped[Optional["Camera"]] = relationship("Camera", back_populates="zones")
     rules: Mapped[List["Rule"]] = relationship("Rule", back_populates="zone")
-

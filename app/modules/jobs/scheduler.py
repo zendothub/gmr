@@ -11,6 +11,7 @@ from app.modules.jobs.tasks import (
     aggregate_daily_analytics,
     close_stale_track_sessions,
     cleanup_old_storage,
+    probe_camera_statuses,
 )
 
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -53,8 +54,18 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Camera RTSP status probe every 2 minutes
+    # Updates camera.status → ACTIVE or INACTIVE based on live RTSP connectivity.
+    # Cameras with MAINTENANCE status are skipped so operators are not overridden.
+    _scheduler.add_job(
+        probe_camera_statuses,
+        IntervalTrigger(minutes=2),
+        id="camera_status_probe",
+        replace_existing=True,
+    )
+
     _scheduler.start()
-    logger.info("Background job scheduler started (3 jobs registered)")
+    logger.info("Background job scheduler started (4 jobs registered)")
     return _scheduler
 
 

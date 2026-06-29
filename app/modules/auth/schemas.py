@@ -2,17 +2,12 @@
 
 from typing import List, Optional
 from uuid import UUID
+
 from pydantic import BaseModel, Field, field_validator
 
 
-class UserSignup(BaseModel):
-    username: str = Field(..., min_length=3, max_length=100)
-    password: str = Field(..., min_length=6, max_length=128)
-    full_name: Optional[str] = None
-
-
 class UserLogin(BaseModel):
-    username: str
+    email: str
     password: str
 
 
@@ -25,7 +20,7 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user_id: UUID
-    username: str
+    email: str
 
 
 class RefreshTokenResponse(BaseModel):
@@ -35,11 +30,11 @@ class RefreshTokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-
 class UserResponse(BaseModel):
     id: UUID
-    username: str
-    full_name: Optional[str] = None
+    name: str
+    email: str
+    status: str
     roles: List[str] = []
 
     @field_validator("roles", mode="before")
@@ -52,4 +47,3 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
-

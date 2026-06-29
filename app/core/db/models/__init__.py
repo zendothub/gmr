@@ -20,6 +20,8 @@ from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.analytics import DailyAnalyticsSummary
 from app.core.db.models.feature_request import FeatureRequest, FeatureStatus
 from app.core.db.models.storage import StorageObject, StorageType
+from app.core.db.models.store import Store, StoreStatus
+from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone, StoreTerminal
 
 __all__ = [
     "User",
@@ -47,4 +49,10 @@ __all__ = [
     "StorageType",
     "FeatureRequest",
     "FeatureStatus",
+    "Store",
+    "StoreStatus",
+    "StoreCategory",
+    "StoreLevel",
+    "StoreZone",
+    "StoreTerminal",
 ]

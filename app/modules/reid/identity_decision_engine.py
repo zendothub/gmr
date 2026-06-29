@@ -39,7 +39,13 @@ class IdentityDecisionEngine:
         face_crop_path: Optional[str] = None,
     ) -> Tuple[uuid.UUID, float, bool, bool, Optional[uuid.UUID]]:
         """
-        Decide identity based on face embedding (highest priority) and accumulated mean body embedding.
+        Decide identity with face contradiction gate and disassociation logic.
+        
+        Enhanced logic from reid_logic_explanation.md:
+        1. Face Contradiction Check: If track has face, check against all DB faces
+        2. Face Matching Priority: Face similarity checked first (higher confidence)
+        3. Body ReID Matching: With face contradiction gate (exclude contradicting candidates)
+        4. Refinement Disassociation: If assigned ID face contradicts → disassociate → re-search
 
         Returns:
             Tuple of:
@@ -54,6 +60,20 @@ class IdentityDecisionEngine:
             best_similarity = -1.0
             used_face = False
             
+            # === FACE CONTRADICTION GATE ===
+            # Check if current_person_id face embedding contradicts track face
+            current_id_contradicted = False
+            if current_person_id is not None and face_embedding is not None:
+                current_face = await self._get_person_face_embedding(db, current_person_id)
+                if current_face is not None:
+                    sim = float(np.dot(current_face, face_embedding))
+                    if sim < self.settings.FACE_MATCH_THRESHOLD:
+                        current_id_contradicted = True
+                        logger.warning(
+                            f"[CONTRADICTION] Current ID {str(current_person_id)[:8]} face contradicts track face! "
+                            f"Sim={sim:.3f} < {self.settings.FACE_MATCH_THRESHOLD}"
+                        )
+            
             # Step 1: Face matching (highest priority)
             if face_embedding is not None:
                 face_candidate = await self._search_similar_face(db, face_embedding)
@@ -64,13 +84,28 @@ class IdentityDecisionEngine:
                         best_candidate = face_candidate
                         best_similarity = face_sim
                         used_face = True
-                        logger.info(f"Face match found! Score: {face_sim:.3f}")
+                        logger.info(f"[Face Match] Score: {face_sim:.3f}, Person: {str(face_candidate['person_identity_id'])[:8]}")
 
-            # Step 2: Fallback to Body ReID matching
-            if not used_face:
+            # Step 2: Fallback to Body ReID matching (with face contradiction gate)
+            if not used_face and mean_embedding is not None:
                 # Search for similar embeddings using pgvector cosine distance (limit 5 candidates)
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
                 for candidate in candidates:
+                    candidate_id = candidate["person_identity_id"]
+                    
+                    # === FACE CONTRADICTION GATE FOR BODY MATCHING ===
+                    # Skip candidates whose face contradicts the track's face
+                    if face_embedding is not None:
+                        candidate_face = await self._get_person_face_embedding(db, candidate_id)
+                        if candidate_face is not None:
+                            f_sim = float(np.dot(candidate_face, face_embedding))
+                            if f_sim < self.settings.FACE_MATCH_THRESHOLD:
+                                logger.debug(
+                                    f"[Body Match] Candidate {str(candidate_id)[:8]} EXCLUDED due to face contradiction "
+                                    f"(Face Sim={f_sim:.3f} < {self.settings.FACE_MATCH_THRESHOLD})"
+                                )
+                                continue  # Skip this candidate
+                    
                     similarity = 1.0 - candidate["distance"]  # cosine distance -> similarity
                     if similarity > best_similarity:
                         best_similarity = similarity
@@ -249,6 +284,32 @@ class IdentityDecisionEngine:
             return None
         except Exception as e:
             logger.error(f"Face similarity search failed: {e}")
+            return None
+
+    async def _get_person_face_embedding(self, db: AsyncSession, person_id: uuid.UUID) -> Optional[np.ndarray]:
+        """
+        Retrieve stored face embedding for a person (for contradiction checking).
+        
+        Args:
+            db: Database session
+            person_id: Person identity ID
+            
+        Returns:
+            Face embedding as numpy array, or None if not found
+        """
+        try:
+            from app.core.db.models.person import PersonFaceEmbedding
+            
+            result = await db.execute(
+                select(PersonFaceEmbedding).where(PersonFaceEmbedding.person_identity_id == person_id)
+            )
+            face_emb = result.scalar_one_or_none()
+            
+            if face_emb and face_emb.embedding:
+                return np.array(face_emb.embedding, dtype=np.float32)
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to retrieve face embedding for person {person_id}: {e}")
             return None
 
     async def _update_person(self, db: AsyncSession, person_id: uuid.UUID):
