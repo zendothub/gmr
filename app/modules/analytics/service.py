@@ -770,7 +770,7 @@ class AnalyticsService:
     def _v2_resolve_range(time_range: str, start_time: Optional[datetime], end_time: Optional[datetime]):
         """Return (start, end, prev_start, prev_end) for the requested time_range.
         
-        All times are computed in IST (Asia/Calcutta, UTC+5:30) to match user expectations.
+        All times are computed in IST (Asia/Kolkata, UTC+5:30) to match user expectations.
         """
         now = datetime.now(IST)  # Current time in IST
         
@@ -930,7 +930,7 @@ class AnalyticsService:
         resolved = cls._resolve_group_by("auto", range_days)
 
         # Truncate in IST timezone to get proper IST hour buckets (0:00 IST, 1:00 IST, etc.)
-        bucket_expr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+        bucket_expr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
         
         # Subquery: Get distinct person_identity_id per bucket
         distinct_persons_subq = (
@@ -995,7 +995,14 @@ class AnalyticsService:
         )
 
         ff_rows = (await db.execute(ff_timeline_q)).all()
-        ff_map = {row.bucket: row.cnt for row in ff_rows}
+        # Convert timezone-naive buckets to IST timezone-aware for matching with slots
+        ff_map = {}
+        for row in ff_rows:
+            # PostgreSQL date_trunc returns naive datetime, but it represents IST time
+            # Convert to timezone-aware IST datetime
+            if row.bucket is not None:
+                bucket_ist = row.bucket.replace(tzinfo=IST) if row.bucket.tzinfo is None else row.bucket
+                ff_map[bucket_ist] = row.cnt
         logger.info(f"🔍 DEBUG: Footfall timeline query returned {len(ff_rows)} buckets: {ff_map}")
 
         footfall_over_time: List[DashboardV2FootfallPoint] = []
@@ -1055,7 +1062,9 @@ class AnalyticsService:
         gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
         for row in gt_rows:
             g = cls._v2_gender(row.gender)
-            gt_map[row.bucket][g] += row.cnt
+            # Convert timezone-naive bucket to IST timezone-aware
+            bucket_ist = row.bucket.replace(tzinfo=IST) if row.bucket and row.bucket.tzinfo is None else row.bucket
+            gt_map[bucket_ist][g] += row.cnt
 
         gender_trend: List[DashboardV2GenderTrendPoint] = []
         slot = cls._truncate_slot(start, resolved)
@@ -1244,7 +1253,7 @@ class AnalyticsService:
         async def _slot_map(model_col, s, e) -> dict:
             """Return {slot_dt: count} for date_trunc(resolved, model_col) in [s, e]."""
             # Use IST timezone for bucketing
-            bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', model_col))
+            bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', model_col))
             q = (
                 select(bexpr.label("b"), func.count().label("c"))
                 .where(model_col >= s, model_col <= e)
@@ -1254,7 +1263,13 @@ class AnalyticsService:
                 tbl = model_col.class_
                 q = q.where(tbl.camera_id.in_(cam_ids))
             rows = (await db.execute(q)).all()
-            return {r.b: r.c for r in rows}
+            # Convert timezone-naive buckets to IST timezone-aware
+            result = {}
+            for r in rows:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    result[bucket_ist] = r.c
+            return result
 
         async def _period_comparison(model_col) -> List[PeriodComparisonPoint]:
             curr_map = await _slot_map(model_col, start, end)
@@ -1293,7 +1308,7 @@ class AnalyticsService:
             total_visitors = (await db.execute(_unique_persons_q(start, end))).scalar() or 0
 
             # Hourly map for peak hour (unique persons per hour)
-            h_bexpr = func.date_trunc("hour", func.timezone('Asia/Calcutta', TrackSession.started_at))
+            h_bexpr = func.date_trunc("hour", func.timezone('Asia/Kolkata', TrackSession.started_at))
             
             # Subquery: distinct person_identity_id per hour
             h_subq = (
@@ -1322,12 +1337,18 @@ class AnalyticsService:
                 .order_by(h_subq.c.bucket)
             )
             h_rows = (await db.execute(hq)).all()
-            hourly_cnt = {r.b: r.c for r in h_rows}
-            # Extract hour as integer for peak_hours_label (need to handle timezone-aware datetime)
-            hourly_int = {r.b.hour: r.c for r in h_rows}
+            # Convert timezone-naive buckets to IST timezone-aware
+            hourly_cnt = {}
+            hourly_int = {}
+            for r in h_rows:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    hourly_cnt[bucket_ist] = r.c
+                    # Extract hour as integer for peak_hours_label
+                    hourly_int[bucket_ist.hour] = r.c
 
             # daily map for avg_daily + busiest_day (unique persons per day)
-            d_bexpr = func.date_trunc("day", func.timezone('Asia/Calcutta', TrackSession.started_at))
+            d_bexpr = func.date_trunc("day", func.timezone('Asia/Kolkata', TrackSession.started_at))
             
             # Subquery: distinct person_identity_id per day
             d_subq = (
@@ -1356,7 +1377,12 @@ class AnalyticsService:
                 .order_by(d_subq.c.bucket)
             )
             d_rows = (await db.execute(dq)).all()
-            daily_cnt = {r.b: r.c for r in d_rows}
+            # Convert timezone-naive buckets to IST timezone-aware
+            daily_cnt = {}
+            for r in d_rows:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    daily_cnt[bucket_ist] = r.c
 
             peak_h_dt = max(hourly_cnt, key=lambda k: hourly_cnt[k]) if hourly_cnt else None
             busiest_day_dt = max(daily_cnt, key=lambda k: daily_cnt[k]) if daily_cnt else None
@@ -1364,7 +1390,7 @@ class AnalyticsService:
 
             # footfall_over_time (resolved granularity) - unique persons per slot
             # Need to use distinct person_identity_id per slot
-            slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+            slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
             
             ff_subq = (
                 select(
@@ -1391,7 +1417,12 @@ class AnalyticsService:
                 .order_by(ff_subq.c.bucket)
             )
             ff_rows = (await db.execute(ffq)).all()
-            ff_map = {r.b: r.c for r in ff_rows}
+            # Convert timezone-naive buckets to IST timezone-aware
+            ff_map = {}
+            for r in ff_rows:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    ff_map[bucket_ist] = r.c
             
             footfall_over_time = cls._build_ff_slots(start, end, resolved, ff_map)
             
@@ -1401,7 +1432,7 @@ class AnalyticsService:
                 curr_map = ff_map  # Already computed above
                 
                 # Previous period
-                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
                 prev_subq = (
                     select(
                         prev_bexpr.label("bucket"),
@@ -1427,7 +1458,12 @@ class AnalyticsService:
                     .order_by(prev_subq.c.bucket)
                 )
                 prev_rows = (await db.execute(prevq)).all()
-                prev_map = {r.b: r.c for r in prev_rows}
+                # Convert timezone-naive buckets to IST timezone-aware
+                prev_map = {}
+                for r in prev_rows:
+                    if r.b is not None:
+                        bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                        prev_map[bucket_ist] = r.c
                 
                 points: List[PeriodComparisonPoint] = []
                 slot = cls._truncate_slot(start, resolved)
@@ -1515,7 +1551,7 @@ class AnalyticsService:
             total_g = sum(gcnt.values()) or 1
 
             # gender_trend - unique persons by gender per slot
-            bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+            bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
             
             gt_subq = (
                 select(
@@ -1569,7 +1605,7 @@ class AnalyticsService:
                     curr_totals[bucket] = sum(genders.values())
                 
                 # Previous period
-                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
                 prev_subq = (
                     select(
                         prev_bexpr.label("bucket"),
@@ -1696,7 +1732,7 @@ class AnalyticsService:
             # Period comparison and per-camera for age groups
             async def _age_period_comparison() -> List[PeriodComparisonPoint]:
                 # Current period - aggregate total unique persons per slot
-                curr_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                curr_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
                 curr_subq = (
                     select(
                         curr_bexpr.label("bucket"),
@@ -1725,7 +1761,7 @@ class AnalyticsService:
                 curr_map = {r.b: r.c for r in curr_rows}
                 
                 # Previous period
-                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Calcutta', TrackSession.started_at))
+                prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
                 prev_subq = (
                     select(
                         prev_bexpr.label("bucket"),
@@ -1810,7 +1846,7 @@ class AnalyticsService:
             conv_pct = round(total_purchases / max(total_visitors_p, 1) * 100, 1)
 
             # Daily map - use IST timezone
-            d_bexpr2 = func.date_trunc("day", func.timezone('Asia/Calcutta', BillingInteraction.entered_at))
+            d_bexpr2 = func.date_trunc("day", func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
             dq2 = (
                 select(d_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
                 .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
@@ -1825,7 +1861,7 @@ class AnalyticsService:
             avg_daily2 = (total_purchases // max(len(daily2), 1)) if daily2 else 0
 
             # Hourly map for peak_hours_label - use IST timezone
-            h_bexpr2 = func.date_trunc("hour", func.timezone('Asia/Calcutta', BillingInteraction.entered_at))
+            h_bexpr2 = func.date_trunc("hour", func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
             hq2 = (
                 select(h_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
                 .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
