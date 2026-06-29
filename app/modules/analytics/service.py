@@ -1583,7 +1583,9 @@ class AnalyticsService:
             gt_rows = (await db.execute(gt_q)).all()
             gt_map: dict = defaultdict(lambda: {"male": 0, "female": 0, "unidentified": 0})
             for r in gt_rows:
-                gt_map[r.b][cls._v2_gender(r.gender)] += r.c
+                # Convert timezone-naive bucket to IST timezone-aware
+                bucket_ist = r.b.replace(tzinfo=IST) if r.b and r.b.tzinfo is None else r.b
+                gt_map[bucket_ist][cls._v2_gender(r.gender)] += r.c
 
             gender_trend: List[DashboardV2GenderTrendPoint] = []
             slot = cls._truncate_slot(start, resolved)
@@ -1631,7 +1633,12 @@ class AnalyticsService:
                     .order_by(prev_subq.c.bucket)
                 )
                 prev_rows = (await db.execute(prevq)).all()
-                prev_totals = {r.b: r.c for r in prev_rows}
+                # Convert timezone-naive buckets to IST timezone-aware
+                prev_totals = {}
+                for r in prev_rows:
+                    if r.b is not None:
+                        bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                        prev_totals[bucket_ist] = r.c
                 
                 points: List[PeriodComparisonPoint] = []
                 slot = cls._truncate_slot(start, resolved)
@@ -1758,7 +1765,12 @@ class AnalyticsService:
                     .order_by(curr_subq.c.bucket)
                 )
                 curr_rows = (await db.execute(currq)).all()
-                curr_map = {r.b: r.c for r in curr_rows}
+                # Convert timezone-naive buckets to IST timezone-aware
+                curr_map = {}
+                for r in curr_rows:
+                    if r.b is not None:
+                        bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                        curr_map[bucket_ist] = r.c
                 
                 # Previous period
                 prev_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
@@ -1787,7 +1799,12 @@ class AnalyticsService:
                     .order_by(prev_subq.c.bucket)
                 )
                 prev_rows = (await db.execute(prevq)).all()
-                prev_map = {r.b: r.c for r in prev_rows}
+                # Convert timezone-naive buckets to IST timezone-aware
+                prev_map = {}
+                for r in prev_rows:
+                    if r.b is not None:
+                        bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                        prev_map[bucket_ist] = r.c
                 
                 points: List[PeriodComparisonPoint] = []
                 slot = cls._truncate_slot(start, resolved)
@@ -1855,7 +1872,12 @@ class AnalyticsService:
             if cam_ids:
                 dq2 = dq2.where(BillingInteraction.camera_id.in_(cam_ids))
             d_rows2 = (await db.execute(dq2)).all()
-            daily2 = {r.b: r.c for r in d_rows2}
+            # Convert timezone-naive buckets to IST timezone-aware
+            daily2 = {}
+            for r in d_rows2:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    daily2[bucket_ist] = r.c
 
             busiest2 = max(daily2, key=lambda k: daily2[k]) if daily2 else None
             avg_daily2 = (total_purchases // max(len(daily2), 1)) if daily2 else 0
@@ -1870,7 +1892,12 @@ class AnalyticsService:
             if cam_ids:
                 hq2 = hq2.where(BillingInteraction.camera_id.in_(cam_ids))
             h_rows2 = (await db.execute(hq2)).all()
-            hourly_int2 = {r.b.hour: r.c for r in h_rows2}
+            # Convert timezone-naive buckets to IST timezone-aware for hour extraction
+            hourly_int2 = {}
+            for r in h_rows2:
+                if r.b is not None:
+                    bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    hourly_int2[bucket_ist.hour] = r.c
 
             # purchases_over_time
             pur_map = await _slot_map(BillingInteraction.entered_at, start, end)
