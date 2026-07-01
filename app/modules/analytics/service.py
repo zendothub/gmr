@@ -13,7 +13,7 @@ from app.core.db.models.camera import Camera, Zone
 from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
-from app.core.db.models.person import PersonIdentity
+from app.core.db.models.person import PersonIdentity, PersonEmbedding
 from app.core.db.models.store import Store
 from collections import defaultdict
 from app.modules.analytics.schemas import (
@@ -850,38 +850,41 @@ class AnalyticsService:
         total_cameras = (await db.execute(cam_base)).scalar() or 0
         active_cameras = (await db.execute(active_base)).scalar() or 0
 
-        # ── 3. Footfall (Unique persons based on person_identity_id) ─────────────────
+        # ── 3. Footfall (Unique persons based on PersonIdentity.last_seen_at) ─────────────────
         def _ff_q(s, e):
-            q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
-                TrackSession.started_at >= s,
-                TrackSession.started_at <= e,
-                TrackSession.person_identity_id.isnot(None),
+            q = select(func.count(PersonIdentity.id)).where(
+                PersonIdentity.last_seen_at >= s,
+                PersonIdentity.last_seen_at <= e,
             )
             if cam_ids:
-                q = q.where(TrackSession.camera_id.in_(cam_ids))
+                # Filter by persons who have embeddings from cameras in cam_ids
+                q = q.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
             return q
 
         total_visitors = (await db.execute(_ff_q(start, end))).scalar() or 0
         prev_visitors  = (await db.execute(_ff_q(prev_start, prev_end))).scalar() or 0
 
         # ── 4. Fetch demographics (distinct persons in range) ─────────────
-        person_subq = (
-            select(TrackSession.person_identity_id)
-            .where(
-                TrackSession.started_at >= start,
-                TrackSession.started_at <= end,
-                TrackSession.person_identity_id.isnot(None),
-            )
-            .distinct()
+        # Query persons directly by last_seen_at to include orphaned persons
+        demo_q = select(PersonIdentity.id, PersonIdentity.gender, PersonIdentity.estimated_age).where(
+            PersonIdentity.last_seen_at >= start,
+            PersonIdentity.last_seen_at <= end,
         )
         if cam_ids:
-            person_subq = person_subq.where(TrackSession.camera_id.in_(cam_ids))
-        person_subq = person_subq.subquery()
-
-        demo_rows = (await db.execute(
-            select(PersonIdentity.id, PersonIdentity.gender, PersonIdentity.estimated_age)
-            .where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
-        )).all()
+            # Filter by persons who have embeddings from cameras in cam_ids
+            demo_q = demo_q.where(
+                PersonIdentity.id.in_(
+                    select(PersonEmbedding.person_identity_id)
+                    .where(PersonEmbedding.camera_id.in_(cam_ids))
+                )
+            )
+        
+        demo_rows = (await db.execute(demo_q)).all()
 
         # Gender counts
         gender_cnt: dict = {"male": 0, "female": 0, "unidentified": 0}
@@ -1231,14 +1234,19 @@ class AnalyticsService:
         # ── Shared helpers ─────────────────────────────────────────────
 
         def _unique_persons_q(s, e):
-            """Count unique persons (distinct person_identity_id) in range."""
-            q = select(func.count(func.distinct(TrackSession.person_identity_id))).where(
-                TrackSession.started_at >= s,
-                TrackSession.started_at <= e,
-                TrackSession.person_identity_id.isnot(None),
+            """Count unique persons by PersonIdentity.last_seen_at (includes orphaned persons)."""
+            q = select(func.count(PersonIdentity.id)).where(
+                PersonIdentity.last_seen_at >= s,
+                PersonIdentity.last_seen_at <= e,
             )
             if cam_ids:
-                q = q.where(TrackSession.camera_id.in_(cam_ids))
+                # Filter by persons who have embeddings from cameras in cam_ids
+                q = q.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
             return q
 
         def _purchase_q(s, e):
@@ -1307,35 +1315,28 @@ class AnalyticsService:
             # Count unique persons (distinct person_identity_id)
             total_visitors = (await db.execute(_unique_persons_q(start, end))).scalar() or 0
 
-            # Hourly map for peak hour (unique persons per hour)
-            h_bexpr = func.date_trunc("hour", func.timezone('Asia/Kolkata', TrackSession.started_at))
+            # Hourly map for peak hour (unique persons per hour) - use PersonIdentity.last_seen_at
+            h_bexpr = func.date_trunc("hour", func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
-            # Subquery: distinct person_identity_id per hour
-            h_subq = (
-                select(
-                    h_bexpr.label("bucket"),
-                    TrackSession.person_identity_id
-                )
-                .where(
-                    TrackSession.started_at >= start,
-                    TrackSession.started_at <= end,
-                    TrackSession.person_identity_id.isnot(None),
-                )
-                .distinct()
-            )
-            if cam_ids:
-                h_subq = h_subq.where(TrackSession.camera_id.in_(cam_ids))
-            h_subq = h_subq.subquery()
-            
-            # Count distinct persons per hour
             hq = (
                 select(
-                    h_subq.c.bucket.label("b"),
-                    func.count(h_subq.c.person_identity_id).label("c")
+                    h_bexpr.label("b"),
+                    func.count(PersonIdentity.id).label("c")
                 )
-                .group_by(h_subq.c.bucket)
-                .order_by(h_subq.c.bucket)
+                .where(
+                    PersonIdentity.last_seen_at >= start,
+                    PersonIdentity.last_seen_at <= end,
+                )
+                .group_by("b")
+                .order_by("b")
             )
+            if cam_ids:
+                hq = hq.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
             h_rows = (await db.execute(hq)).all()
             # Convert timezone-naive buckets to IST timezone-aware
             hourly_cnt = {}
@@ -1347,35 +1348,28 @@ class AnalyticsService:
                     # Extract hour as integer for peak_hours_label
                     hourly_int[bucket_ist.hour] = r.c
 
-            # daily map for avg_daily + busiest_day (unique persons per day)
-            d_bexpr = func.date_trunc("day", func.timezone('Asia/Kolkata', TrackSession.started_at))
+            # daily map for avg_daily + busiest_day (unique persons per day) - use PersonIdentity.last_seen_at
+            d_bexpr = func.date_trunc("day", func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
-            # Subquery: distinct person_identity_id per day
-            d_subq = (
-                select(
-                    d_bexpr.label("bucket"),
-                    TrackSession.person_identity_id
-                )
-                .where(
-                    TrackSession.started_at >= start,
-                    TrackSession.started_at <= end,
-                    TrackSession.person_identity_id.isnot(None),
-                )
-                .distinct()
-            )
-            if cam_ids:
-                d_subq = d_subq.where(TrackSession.camera_id.in_(cam_ids))
-            d_subq = d_subq.subquery()
-            
-            # Count distinct persons per day
             dq = (
                 select(
-                    d_subq.c.bucket.label("b"),
-                    func.count(d_subq.c.person_identity_id).label("c")
+                    d_bexpr.label("b"),
+                    func.count(PersonIdentity.id).label("c")
                 )
-                .group_by(d_subq.c.bucket)
-                .order_by(d_subq.c.bucket)
+                .where(
+                    PersonIdentity.last_seen_at >= start,
+                    PersonIdentity.last_seen_at <= end,
+                )
+                .group_by("b")
+                .order_by("b")
             )
+            if cam_ids:
+                dq = dq.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
             d_rows = (await db.execute(dq)).all()
             # Convert timezone-naive buckets to IST timezone-aware
             daily_cnt = {}
@@ -1388,34 +1382,28 @@ class AnalyticsService:
             busiest_day_dt = max(daily_cnt, key=lambda k: daily_cnt[k]) if daily_cnt else None
             avg_daily = (total_visitors // max(len(daily_cnt), 1)) if daily_cnt else 0
 
-            # footfall_over_time (resolved granularity) - unique persons per slot
-            # Need to use distinct person_identity_id per slot
-            slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
-            
-            ff_subq = (
-                select(
-                    slot_bexpr.label("bucket"),
-                    TrackSession.person_identity_id
-                )
-                .where(
-                    TrackSession.started_at >= start,
-                    TrackSession.started_at <= end,
-                    TrackSession.person_identity_id.isnot(None),
-                )
-                .distinct()
-            )
-            if cam_ids:
-                ff_subq = ff_subq.where(TrackSession.camera_id.in_(cam_ids))
-            ff_subq = ff_subq.subquery()
+            # footfall_over_time (resolved granularity) - use PersonIdentity.last_seen_at
+            slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
             ffq = (
                 select(
-                    ff_subq.c.bucket.label("b"),
-                    func.count(ff_subq.c.person_identity_id).label("c")
+                    slot_bexpr.label("b"),
+                    func.count(PersonIdentity.id).label("c")
                 )
-                .group_by(ff_subq.c.bucket)
-                .order_by(ff_subq.c.bucket)
+                .where(
+                    PersonIdentity.last_seen_at >= start,
+                    PersonIdentity.last_seen_at <= end,
+                )
+                .group_by("b")
+                .order_by("b")
             )
+            if cam_ids:
+                ffq = ffq.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
             ff_rows = (await db.execute(ffq)).all()
             # Convert timezone-naive buckets to IST timezone-aware
             ff_map = {}
