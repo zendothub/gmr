@@ -11,7 +11,13 @@ from sqlalchemy.orm import joinedload
 from app.core.db.models.debug import PersonDebug
 from app.core.db.models.camera import Camera
 from app.core.db.models.store import Store
-from app.modules.debug.schemas import PersonDebugResponse, DebugSummary, DebugListResponse
+from app.core.db.models.person import PersonIdentity, PersonEmbedding
+from app.core.db.models.tracking import TrackSession
+from app.modules.debug.schemas import (
+    PersonDebugResponse, DebugSummary, DebugListResponse,
+    PersonIdentityDebugResponse, PersonsListResponse,
+    PersonTrackDebugResponse, PersonTracksListResponse
+)
 from app.utils.time_utils import utc_now
 
 # IST timezone (UTC+5:30)
@@ -143,6 +149,193 @@ class DebugService:
         return DebugListResponse(
             summary=summary,
             records=response_records,
+            total=total,
+            page=page,
+            limit=limit,
+        )
+    
+    @staticmethod
+    async def get_debug_persons(
+        db: AsyncSession,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        page: int = 1,
+        limit: int = 25,
+    ) -> PersonsListResponse:
+        """Get paginated list of unique persons."""
+        
+        # Default to last 24 hours if no times provided
+        if not start_time or not end_time:
+            end_time = utc_now()
+            start_time = end_time - timedelta(hours=24)
+        
+        # Subquery to count tracks per person
+        track_count_subquery = (
+            select(
+                TrackSession.person_identity_id,
+                func.count(TrackSession.id).label('track_count')
+            )
+            .group_by(TrackSession.person_identity_id)
+            .subquery()
+        )
+        
+        # Subquery to get best quality body crop per person
+        best_crop_subquery = (
+            select(
+                PersonEmbedding.person_identity_id,
+                PersonEmbedding.crop_path,
+                func.row_number().over(
+                    partition_by=PersonEmbedding.person_identity_id,
+                    order_by=PersonEmbedding.crop_quality.desc()
+                ).label('rn')
+            )
+            .subquery()
+        )
+        
+        # Main query
+        conditions = [
+            PersonIdentity.first_seen_at >= start_time,
+            PersonIdentity.first_seen_at <= end_time,
+        ]
+        
+        # Count total
+        count_query = select(func.count(PersonIdentity.id)).where(and_(*conditions))
+        total = (await db.execute(count_query)).scalar() or 0
+        
+        # Get persons with all computed fields
+        query = (
+            select(
+                PersonIdentity.id,
+                PersonIdentity.first_seen_at,
+                PersonIdentity.last_seen_at,
+                func.coalesce(track_count_subquery.c.track_count, 0).label('total_tracks'),
+                PersonIdentity.estimated_age.label('age'),
+                PersonIdentity.gender,
+                PersonIdentity.best_face_score,
+                PersonIdentity.face_crop_path,
+                best_crop_subquery.c.crop_path.label('body_crop_path'),
+            )
+            .outerjoin(
+                track_count_subquery,
+                PersonIdentity.id == track_count_subquery.c.person_identity_id
+            )
+            .outerjoin(
+                best_crop_subquery,
+                and_(
+                    PersonIdentity.id == best_crop_subquery.c.person_identity_id,
+                    best_crop_subquery.c.rn == 1
+                )
+            )
+            .where(and_(*conditions))
+            .order_by(PersonIdentity.first_seen_at.desc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+        
+        result = await db.execute(query)
+        rows = result.all()
+        
+        # Build response
+        persons = []
+        for row in rows:
+            persons.append(PersonIdentityDebugResponse(
+                id=row.id,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                total_tracks=row.total_tracks,
+                age=row.age,
+                gender=row.gender,
+                avg_reid_score=None,  # Would need to compute from embeddings if needed
+                has_face=row.best_face_score is not None and row.best_face_score > 0,
+                face_age=row.age,  # Use same as estimated_age
+                face_gender=row.gender,
+                body_crop_path=row.body_crop_path,
+                face_crop_path=row.face_crop_path,
+            ))
+        
+        return PersonsListResponse(
+            persons=persons,
+            total=total,
+            page=page,
+            limit=limit,
+        )
+    
+    @staticmethod
+    async def get_person_tracks(
+        db: AsyncSession,
+        person_id: UUID,
+        page: int = 1,
+        limit: int = 10,
+    ) -> PersonTracksListResponse:
+        """Get paginated tracks for a specific person."""
+        
+        # Count total tracks for this person
+        count_query = select(func.count(TrackSession.id)).where(
+            TrackSession.person_identity_id == person_id
+        )
+        total = (await db.execute(count_query)).scalar() or 0
+        
+        if total == 0:
+            # Person not found or has no tracks
+            return PersonTracksListResponse(
+                tracks=[],
+                total=0,
+                page=page,
+                limit=limit,
+            )
+        
+        # Get tracks with camera info
+        query = (
+            select(TrackSession)
+            .options(joinedload(TrackSession.camera))
+            .where(TrackSession.person_identity_id == person_id)
+            .order_by(TrackSession.started_at.desc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+        
+        result = await db.execute(query)
+        track_sessions = result.unique().scalars().all()
+        
+        # Build response
+        tracks = []
+        for track in track_sessions:
+            # Calculate duration in seconds
+            duration_seconds = None
+            if track.ended_at:
+                duration_seconds = (track.ended_at - track.started_at).total_seconds()
+            
+            # Parse age from age_group if needed (e.g., "young_adult" -> estimate)
+            age = None
+            if track.age_group:
+                age_map = {
+                    "child": 10,
+                    "teenager": 16,
+                    "young_adult": 25,
+                    "middle_adult": 45,
+                    "senior": 65,
+                }
+                age = age_map.get(track.age_group)
+            
+            tracks.append(PersonTrackDebugResponse(
+                id=track.id,
+                person_identity_id=track.person_identity_id,
+                camera_id=track.camera_id,
+                camera_name=track.camera.name if track.camera else None,
+                started_at=track.started_at,
+                ended_at=track.ended_at,
+                duration_seconds=duration_seconds,
+                total_frames=track.total_frames,
+                avg_quality_score=track.stability_score,  # Use stability as proxy for quality
+                avg_detection_confidence=track.avg_confidence,
+                age=age,
+                gender=track.gender,
+                body_crop_path=track.best_crop_path,
+                face_crop_path=None,  # Not stored on TrackSession
+            ))
+        
+        return PersonTracksListResponse(
+            tracks=tracks,
             total=total,
             page=page,
             limit=limit,

@@ -72,3 +72,75 @@ class DebugListResponse(BaseModel):
     total: int
     page: int
     limit: int
+
+
+# --- Person Identity Debug Schemas ---
+
+class PersonIdentityDebugResponse(BaseModel):
+    """Person identity aggregated from all detections."""
+    id: UUID
+    first_seen_at: datetime
+    last_seen_at: datetime
+    total_tracks: int
+    
+    # Demographics (most common values)
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    
+    # ReID embedding quality
+    avg_reid_score: Optional[float] = None
+    
+    # Face data (if available)
+    has_face: bool = False
+    face_age: Optional[int] = None
+    face_gender: Optional[str] = None
+    
+    # Crop paths (best quality)
+    body_crop_path: Optional[str] = None
+    face_crop_path: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class PersonsListResponse(BaseModel):
+    """Paginated unique persons list."""
+    persons: List[PersonIdentityDebugResponse]
+    total: int
+    page: int
+    limit: int
+
+
+class PersonTrackDebugResponse(BaseModel):
+    """Single track session for a person."""
+    id: UUID
+    person_identity_id: UUID
+    camera_id: UUID
+    camera_name: Optional[str] = None
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    total_frames: int
+    
+    # Quality metrics
+    avg_quality_score: Optional[float] = None
+    avg_detection_confidence: Optional[float] = None
+    
+    # Demographics
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    
+    # Crop paths
+    body_crop_path: Optional[str] = None
+    face_crop_path: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class PersonTracksListResponse(BaseModel):
+    """Paginated tracks for a person."""
+    tracks: List[PersonTrackDebugResponse]
+    total: int
+    page: int
+    limit: int

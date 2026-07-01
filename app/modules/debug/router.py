@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
-from app.modules.debug.schemas import DebugListResponse
+from app.modules.debug.schemas import DebugListResponse, PersonsListResponse, PersonTracksListResponse
 from app.modules.debug.service import DebugService
 
 
@@ -51,6 +51,62 @@ async def get_debug_detections(
         start_time=start_time,
         end_time=end_time,
         status=status,
+        page=page,
+        limit=limit,
+    )
+
+
+@router.get("/persons", response_model=PersonsListResponse)
+async def get_debug_persons(
+    start_time: Optional[datetime] = Query(None, description="Filter by first seen start time"),
+    end_time: Optional[datetime] = Query(None, description="Filter by first seen end time"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get paginated list of unique persons from person_identities table.
+    
+    **Filters:**
+    - `start_time`, `end_time`: Filter by first_seen_at (default: last 24h)
+    - `page`, `limit`: Pagination
+    
+    **Returns:**
+    - List of persons with minimal fields initially
+    - Each person includes: id, first/last seen, total tracks, demographics, crops
+    """
+    return await DebugService.get_debug_persons(
+        db=db,
+        start_time=start_time,
+        end_time=end_time,
+        page=page,
+        limit=limit,
+    )
+
+
+@router.get("/persons/{person_id}/tracks", response_model=PersonTracksListResponse)
+async def get_person_tracks(
+    person_id: UUID,
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get paginated tracks for a specific person.
+    
+    **Parameters:**
+    - `person_id`: UUID of the person identity
+    - `page`, `limit`: Pagination
+    
+    **Returns:**
+    - List of track sessions for this person
+    - Each track includes: camera, time range, duration, frames, demographics, crops
+    """
+    return await DebugService.get_person_tracks(
+        db=db,
+        person_id=person_id,
         page=page,
         limit=limit,
     )
