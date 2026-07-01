@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     OSNET_MODEL_PATH: str = "models/osnet_x1_0.pth"
     REID_EMBEDDING_DIM: int = 512
     REID_MATCH_THRESHOLD: float = 0.60
-    REID_CROP_QUALITY_THRESHOLD: float = 0.70
+    REID_CROP_QUALITY_THRESHOLD: float = 0.30
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
     REID_MIN_QUALITY_FOR_SWITCH: float = 0.80
