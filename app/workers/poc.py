@@ -207,7 +207,12 @@ def main():
     print(f"Next global ID starts at: {next_global_id}")
 
     # Detect hardware acceleration device
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Inference device: {device.upper()}")
     
     # Load YOLO11 model

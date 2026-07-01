@@ -1,7 +1,7 @@
 """fix_events_zone_id_foreign_key_constraint
 
 Revision ID: bf7bcd7c1293
-Revises: 0001_initial
+Revises: 0004
 Create Date: 2026-07-01 15:06:14.081885
 
 """
@@ -14,7 +14,7 @@ from pgvector.sqlalchemy import Vector
 
 # revision identifiers, used by Alembic.
 revision: str = 'bf7bcd7c1293'
-down_revision: Union[str, None] = '0001_initial'
+down_revision: Union[str, None] = '0004'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
