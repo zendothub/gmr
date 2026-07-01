@@ -49,6 +49,7 @@ class StreamBroadcaster:
         width: int,
         height: int,
         fps: int = 15,
+        max_restart_attempts: int = 10,
     ):
         self.settings = get_settings()
         self.frame_buffer = frame_buffer
@@ -56,6 +57,7 @@ class StreamBroadcaster:
         self.width = width
         self.height = height
         self.fps = fps
+        self.max_restart_attempts = max_restart_attempts
 
         # Shared mutable state — populated by CameraWorker._process_frame()
         # each time YOLO tracking runs (mutated IN-PLACE via .clear() + .append()).
@@ -71,6 +73,9 @@ class StreamBroadcaster:
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[str] = None
         self._first_frame_sent = threading.Event()
+        self._consecutive_failures = 0
+        self._fatal_error = False
+        self._successful_writes = 0  # Track consecutive successful writes
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -100,6 +105,14 @@ class StreamBroadcaster:
     def is_alive(self) -> bool:
         proc = self._proc
         return bool(proc and proc.poll() is None)
+
+    def has_fatal_error(self) -> bool:
+        """Check if the broadcaster has encountered a fatal error and stopped trying."""
+        return self._fatal_error
+
+    def get_error(self) -> Optional[str]:
+        """Get the last error message, if any."""
+        return self._error
 
     def wait_until_ready(self, timeout: float = 15.0) -> bool:
         """Wait for at least one annotated frame to be pushed to FFmpeg.
@@ -221,28 +234,69 @@ class StreamBroadcaster:
                 last_frame_ts = 0.0
                 continue
 
-            # Check if FFmpeg died; respawn with backoff
+            # Check if FFmpeg died; respawn with backoff and retry limit
             if self._proc is None or self._proc.poll() is not None:
+                self._consecutive_failures += 1
+                self._successful_writes = 0  # Reset on failure
+                
                 if self._proc is not None:
+                    exit_code = self._proc.returncode
                     logger.warning(
-                        f"StreamBroadcaster ffmpeg died (code={self._proc.returncode}) "
-                        f"for camera {self.camera_id}; restarting in {backoff:.0f}s"
+                        f"StreamBroadcaster ffmpeg died (code={exit_code}) "
+                        f"for camera {self.camera_id} (attempt {self._consecutive_failures}/{self.max_restart_attempts})"
                     )
-                self._stop_event.wait(backoff)
+                    
+                    # Exit code 224 typically means connection refused to MediaMTX
+                    if exit_code == 224:
+                        logger.error(
+                            f"StreamBroadcaster cannot connect to MediaMTX at {self._ingest_url()} "
+                            f"for camera {self.camera_id}. Check MediaMTX service and network connectivity."
+                        )
+                
+                # Check if we've exceeded max restart attempts
+                if self._consecutive_failures >= self.max_restart_attempts:
+                    self._fatal_error = True
+                    self._error = f"FFmpeg failed {self._consecutive_failures} times. Giving up."
+                    logger.error(
+                        f"StreamBroadcaster for camera {self.camera_id} exceeded max restart attempts "
+                        f"({self.max_restart_attempts}). Stopping broadcast. Error: {self._error}"
+                    )
+                    break
+                
+                # Wait with exponential backoff before retrying
+                wait_time = min(backoff * (2 ** (self._consecutive_failures - 1)), 30.0)
+                logger.info(f"StreamBroadcaster waiting {wait_time:.1f}s before retry...")
+                self._stop_event.wait(wait_time)
+                
                 if self._stop_event.is_set():
                     break
+                
                 self._spawn_ffmpeg()
-                backoff = min(backoff * 2, 30.0)
                 # Reset frame ts to force a fresh frame after respawn
                 last_frame_ts = 0.0
                 continue
 
-            backoff = 0.5  # reset on success
+            # FFmpeg is alive - try to write frame
             last_frame_ts = frame_ts
 
             try:
                 annotated = self._draw_overlays(frame)
                 self._proc.stdin.write(annotated.tobytes())
+                self._proc.stdin.flush()  # Ensure data is sent
+                
+                # Increment successful writes counter
+                self._successful_writes += 1
+                
+                # Only reset failure counter after 3+ consecutive successful writes
+                # This prevents premature "recovered" messages when FFmpeg dies immediately
+                if self._consecutive_failures > 0 and self._successful_writes >= 3:
+                    logger.info(
+                        f"StreamBroadcaster for camera {self.camera_id} recovered after "
+                        f"{self._consecutive_failures} failures ({self._successful_writes} successful writes)"
+                    )
+                    self._consecutive_failures = 0
+                    backoff = 0.5
+                
                 if not self._first_frame_sent.is_set():
                     self._first_frame_sent.set()
                     logger.info(
@@ -250,10 +304,13 @@ class StreamBroadcaster:
                         f"({actual_w}x{actual_h})"
                     )
             except (BrokenPipeError, OSError) as e:
-                logger.warning(
-                    f"StreamBroadcaster write error for camera {self.camera_id}: {e}"
-                )
+                # Reset successful writes counter on pipe error
+                self._successful_writes = 0
+                # Don't log as warning - this is expected when FFmpeg dies
+                # The next loop iteration will detect the dead process and handle it
+                pass
             except Exception as e:
+                self._successful_writes = 0
                 logger.error(f"StreamBroadcaster error for camera {self.camera_id}: {e}")
 
             # Maintain target FPS
