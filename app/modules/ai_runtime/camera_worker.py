@@ -517,26 +517,9 @@ class CameraWorker:
             metadata_json={"total_frames": track.total_frames, "duration_seconds": track.last_seen_at.timestamp() - track.started_at.timestamp()}
         )
         db.add(exit_event)
+        # Note: PersonIdentity demographics (face_crop, age, gender) are now written
+        # eagerly in _run_reid on every accumulation window. No deferred write needed here.
 
-        # 2. Update PersonIdentity demographics with the highest quality face crop
-        if track.person_identity_id and track.best_demographics:
-            result = await db.execute(
-                select(PersonIdentity).where(PersonIdentity.id == track.person_identity_id)
-            )
-            person = result.scalar_one_or_none()
-            if person:
-                current_score = person.best_face_score or 0.0
-                new_score = track.best_demographics["face_score"]
-                if new_score > current_score:
-                    person.gender = track.best_demographics["gender"]
-                    person.age_group = track.best_demographics["age_group"]
-                    person.estimated_age = track.best_demographics["age"]
-                    person.best_face_score = new_score
-                    person.face_crop_path = track.best_demographics["face_crop_path"]
-                    logger.info(
-                        f"Updated PersonIdentity {track.person_identity_id} demographics: "
-                        f"gender={person.gender}, age_group={person.age_group}, age={person.estimated_age} (score={new_score:.3f})"
-                    )
 
     async def _close_all_track_sessions(self):
         """Close all open track sessions on shutdown."""
@@ -794,6 +777,30 @@ class CameraWorker:
                             .where(Event.event_type == "person_entered_view")
                             .values(person_identity_id=person_id, description=f"Person {str(person_id)[:8]} entered view.")
                         )
+
+                # Eagerly sync demographics + face crop to PersonIdentity on every
+                # accumulation window so they are always written together atomically.
+                # This prevents the desync where face_crop_path is written per-window
+                # but age/gender were only written at track close.
+                if person_id and track.best_demographics:
+                    demo_result = await db.execute(
+                        select(PersonIdentity).where(PersonIdentity.id == person_id)
+                    )
+                    person_record = demo_result.scalar_one_or_none()
+                    if person_record:
+                        new_score = track.best_demographics.get("face_score", 0.0)
+                        current_score = person_record.best_face_score or 0.0
+                        if new_score > current_score:
+                            person_record.gender = track.best_demographics["gender"]
+                            person_record.age_group = track.best_demographics["age_group"]
+                            person_record.estimated_age = track.best_demographics["age"]
+                            person_record.best_face_score = new_score
+                            person_record.face_crop_path = track.best_demographics["face_crop_path"]
+                            logger.info(
+                                f"Updated PersonIdentity {person_id} demographics (eager): "
+                                f"gender={person_record.gender}, age={person_record.estimated_age} "
+                                f"(score={new_score:.3f})"
+                            )
 
                 logger.info(
                     f"ReID resolved (count={track.reid_frame_count}): track={track.local_track_id} "
