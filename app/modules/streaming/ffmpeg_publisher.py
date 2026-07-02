@@ -63,15 +63,10 @@ class FFmpegPublisher(StreamPublisher):
         ]
 
         if self.mode == "lowlatency":
-            # Re-encode video to low-latency H.264, drop audio.
-            cmd += [
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-tune", "zerolatency",
-                "-pix_fmt", "yuv420p",
-                "-g", "30",
-            ]
+            # Re-encode video to H.264, drop audio.
+            # Encoder is selected at startup: h264_nvenc (CUDA) > h264_videotoolbox (MPS) > libx264 (CPU)
+            from app.utils.device import get_ffmpeg_video_codec_args
+            cmd += ["-an"] + get_ffmpeg_video_codec_args(s.FFMPEG_BINARY) + ["-g", "30"]
         else:
             # Remux only - no re-encode.  Drop audio — surveillance cameras
             # don't need it, and an audio-only track would break WebRTC.

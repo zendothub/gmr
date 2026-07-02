@@ -1,0 +1,144 @@
+INFO:     Will watch for changes in these directories: ['/Users/zendot/Desktop/zendot/GMR/retail-ai-platform']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [86444] using WatchFiles
+INFO:     Started server process [86446]
+INFO:     Waiting for application startup.
+2026-07-02 14:57:40 | INFO     | app.lifecycle:lifespan - Starting RetailAIPlatform v1.0.0
+2026-07-02 14:57:41 | INFO     | app.utils.device:_log_device_info - 🍎 Device detected: MPS (Apple Silicon)  (torch 2.12.0)
+2026-07-02 14:57:41 | INFO     | app.lifecycle:lifespan - FFmpeg video encoder selected: h264_videotoolbox
+2026-07-02 14:57:41 | INFO     | app.lifecycle:lifespan - MinIO bucket 'retail' ready
+2026-07-02 14:57:41 | INFO     | app.modules.jobs.scheduler:start_scheduler - Background job scheduler started (4 jobs registered)
+2026-07-02 14:57:42 | INFO     | app.lifecycle:lifespan - Restoring 1 active camera(s) after server restart...
+2026-07-02 14:57:42 | INFO     | app.modules.rule_engine.config_loader:load_runtime_config - Runtime config loaded for camera 61fabd00-acd6-4591-9074-8fd40e87c1f0: 0 zones, 0 rules
+2026-07-02 14:57:42 | INFO     | app.modules.detection.yolo_detector:__init__ - YOLO detector using device: mps
+2026-07-02 14:57:42 | INFO     | app.modules.detection.yolo_detector:_load_model - YOLO model loaded on mps: models/yolov8n.pt
+2026-07-02 14:57:42 | INFO     | app.modules.detection.yolo_detector:get_shared_detector - Shared YOLO detector created for models/yolov8n.pt
+2026-07-02 14:57:42 | INFO     | app.modules.reid.osnet_extractor:__init__ - OSNet extractor using device: mps
+/Users/zendot/Desktop/zendot/GMR/retail-ai-platform/.venv/lib/python3.12/site-packages/torchreid/reid/metrics/rank.py:11: UserWarning: Cython evaluation (very fast so highly recommended) is unavailable, now use python evaluation.
+  warnings.warn(
+Model: osnet_x1_0
+- params: 2,193,616
+- flops: 978,878,352
+Successfully loaded pretrained weights from "models/osnet_x1_0.pth"
+** The following layers are discarded due to unmatched keys or layer size: ['classifier.weight', 'classifier.bias']
+2026-07-02 14:57:44 | INFO     | app.modules.reid.osnet_extractor:_load_model - OSNet FeatureExtractor loaded: models/osnet_x1_0.pth
+2026-07-02 14:57:44 | INFO     | app.modules.reid.osnet_extractor:get_shared_extractor - Shared OSNet extractor created for models/osnet_x1_0.pth
+2026-07-02 14:57:44 | INFO     | app.modules.reid.insightface_analyzer:_load_model - InsightFace using ctx_id=-1 (device=mps)
+/Users/zendot/Desktop/zendot/GMR/retail-ai-platform/.venv/lib/python3.12/site-packages/onnxruntime/capi/onnxruntime_inference_collection.py:147: UserWarning: Specified provider 'CUDAExecutionProvider' is not in available provider names.Available providers: 'CoreMLExecutionProvider, AzureExecutionProvider, CPUExecutionProvider'
+  warnings.warn(
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+model ignore: /Users/zendot/.insightface/models/buffalo_l/1k3d68.onnx landmark_3d_68
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+model ignore: /Users/zendot/.insightface/models/buffalo_l/2d106det.onnx landmark_2d_106
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/det_10g.onnx detection [1, 3, '?', '?'] 127.5 128.0
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/genderage.onnx genderage ['None', 3, 96, 96] 0.0 1.0
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/w600k_r50.onnx recognition ['None', 3, 112, 112] 127.5 127.5
+set det-size: (640, 640)
+2026-07-02 14:57:45 | INFO     | app.modules.reid.insightface_analyzer:_load_model - InsightFace FaceAnalysis prepared successfully (model=buffalo_l)
+2026-07-02 14:57:45 | INFO     | app.modules.reid.insightface_analyzer:get_shared_analyzer - Shared InsightFace analyzer created for buffalo_l
+2026-07-02 14:57:45 | INFO     | app.modules.rule_engine.rule_evaluator:load - Rule cache loaded: 0 rules, 0 zones
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.camera_worker:apply_runtime_config - Camera worker 61fabd00-acd6-4591-9074-8fd40e87c1f0 config applied: 0 zones, 0 rules
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.frame_buffer:start - Frame buffer capture thread started for rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.stream_broadcaster:start - StreamBroadcaster started: camera=61fabd00-acd6-4591-9074-8fd40e87c1f0 1920x1080 @ 15fps
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.camera_worker:start - Stream burn-in enabled for camera 61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.camera_worker:start - Camera worker started: 61fabd00-acd6-4591-9074-8fd40e87c1f0 (fps_target=5, rotation=None)
+2026-07-02 14:57:45 | INFO     | app.modules.ai_runtime.worker_supervisor:start_camera - Worker supervisor: camera 61fabd00-acd6-4591-9074-8fd40e87c1f0 started
+2026-07-02 14:57:45 | INFO     | app.lifecycle:lifespan - Restored camera worker: cam2 (61fabd00-acd6-4591-9074-8fd40e87c1f0)
+2026-07-02 14:57:45 | INFO     | app.lifecycle:lifespan - Stream publishing handled by CameraWorker (burn-in mode) for cam2
+2026-07-02 14:57:45 | INFO     | app.lifecycle:lifespan - Application startup complete
+INFO:     Application startup complete.
+[tcp @ 0xc4f09a260] Connection to tcp://192.168.1.177:1936?timeout=0 failed: Connection refused
+[ WARN:0@5.985] global cap.cpp:217 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-07-02 14:57:46 | WARNING  | app.modules.ai_runtime.frame_buffer:_capture_loop - RTSP capture error (rtsp://admin:admin@192.168.1.177:1936): Cannot open RTSP stream: rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:57:46 | INFO     | app.modules.ai_runtime.frame_buffer:_capture_loop - Reconnecting to RTSP stream in 5s...
+[tcp @ 0xc4f0bf200] Connection to tcp://192.168.1.177:1936?timeout=0 failed: Connection refused
+[ WARN:0@12.475] global cap.cpp:217 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-07-02 14:57:52 | WARNING  | app.modules.ai_runtime.frame_buffer:_capture_loop - RTSP capture error (rtsp://admin:admin@192.168.1.177:1936): Cannot open RTSP stream: rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:57:52 | INFO     | app.modules.ai_runtime.frame_buffer:_capture_loop - Reconnecting to RTSP stream in 10s...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-07-02 14:57:55 | INFO     | app.lifecycle:lifespan - Shutting down application...
+2026-07-02 14:57:55 | INFO     | app.modules.jobs.scheduler:stop_scheduler - Background job scheduler stopped
+2026-07-02 14:58:00 | INFO     | app.modules.ai_runtime.stream_broadcaster:stop - StreamBroadcaster stopped: camera=61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:58:00 | INFO     | app.modules.ai_runtime.frame_buffer:stop - Frame buffer capture thread stopped for rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:58:00 | INFO     | app.modules.ai_runtime.camera_worker:stop - Camera worker stopped: 61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:58:00 | INFO     | app.modules.ai_runtime.worker_supervisor:stop_all - Worker supervisor: stopped 1 workers
+2026-07-02 14:58:00 | INFO     | app.lifecycle:lifespan - All camera workers stopped
+2026-07-02 14:58:00 | INFO     | app.modules.streaming.manager:shutdown - StreamManager shut down; all publishers stopped
+2026-07-02 14:58:00 | INFO     | app.lifecycle:lifespan - Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [86446]
+INFO:     Stopping reloader process [86444]
+INFO:     Will watch for changes in these directories: ['/Users/zendot/Desktop/zendot/GMR/retail-ai-platform']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [86506] using WatchFiles
+INFO:     Started server process [86508]
+INFO:     Waiting for application startup.
+2026-07-02 14:58:16 | INFO     | app.lifecycle:lifespan - Starting RetailAIPlatform v1.0.0
+2026-07-02 14:58:17 | INFO     | app.utils.device:_log_device_info - 🍎 Device detected: MPS (Apple Silicon)  (torch 2.12.0)
+2026-07-02 14:58:17 | INFO     | app.lifecycle:lifespan - FFmpeg video encoder selected: h264_videotoolbox
+2026-07-02 14:58:17 | INFO     | app.lifecycle:lifespan - MinIO bucket 'retail' ready
+2026-07-02 14:58:17 | INFO     | app.modules.jobs.scheduler:start_scheduler - Background job scheduler started (4 jobs registered)
+2026-07-02 14:58:17 | INFO     | app.lifecycle:lifespan - Restoring 1 active camera(s) after server restart...
+2026-07-02 14:58:17 | INFO     | app.modules.rule_engine.config_loader:load_runtime_config - Runtime config loaded for camera 61fabd00-acd6-4591-9074-8fd40e87c1f0: 0 zones, 0 rules
+2026-07-02 14:58:17 | INFO     | app.modules.detection.yolo_detector:__init__ - YOLO detector using device: mps
+2026-07-02 14:58:18 | INFO     | app.modules.detection.yolo_detector:_load_model - YOLO model loaded on mps: models/yolov8n.pt
+2026-07-02 14:58:18 | INFO     | app.modules.detection.yolo_detector:get_shared_detector - Shared YOLO detector created for models/yolov8n.pt
+2026-07-02 14:58:18 | INFO     | app.modules.reid.osnet_extractor:__init__ - OSNet extractor using device: mps
+/Users/zendot/Desktop/zendot/GMR/retail-ai-platform/.venv/lib/python3.12/site-packages/torchreid/reid/metrics/rank.py:11: UserWarning: Cython evaluation (very fast so highly recommended) is unavailable, now use python evaluation.
+  warnings.warn(
+Model: osnet_x1_0
+- params: 2,193,616
+- flops: 978,878,352
+Successfully loaded pretrained weights from "models/osnet_x1_0.pth"
+** The following layers are discarded due to unmatched keys or layer size: ['classifier.weight', 'classifier.bias']
+2026-07-02 14:58:19 | INFO     | app.modules.reid.osnet_extractor:_load_model - OSNet FeatureExtractor loaded: models/osnet_x1_0.pth
+2026-07-02 14:58:19 | INFO     | app.modules.reid.osnet_extractor:get_shared_extractor - Shared OSNet extractor created for models/osnet_x1_0.pth
+2026-07-02 14:58:19 | INFO     | app.modules.reid.insightface_analyzer:_load_model - InsightFace using ctx_id=-1 (device=mps)
+/Users/zendot/Desktop/zendot/GMR/retail-ai-platform/.venv/lib/python3.12/site-packages/onnxruntime/capi/onnxruntime_inference_collection.py:147: UserWarning: Specified provider 'CUDAExecutionProvider' is not in available provider names.Available providers: 'CoreMLExecutionProvider, AzureExecutionProvider, CPUExecutionProvider'
+  warnings.warn(
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+model ignore: /Users/zendot/.insightface/models/buffalo_l/1k3d68.onnx landmark_3d_68
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+model ignore: /Users/zendot/.insightface/models/buffalo_l/2d106det.onnx landmark_2d_106
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/det_10g.onnx detection [1, 3, '?', '?'] 127.5 128.0
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/genderage.onnx genderage ['None', 3, 96, 96] 0.0 1.0
+Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
+find model: /Users/zendot/.insightface/models/buffalo_l/w600k_r50.onnx recognition ['None', 3, 112, 112] 127.5 127.5
+set det-size: (640, 640)
+2026-07-02 14:58:20 | INFO     | app.modules.reid.insightface_analyzer:_load_model - InsightFace FaceAnalysis prepared successfully (model=buffalo_l)
+2026-07-02 14:58:20 | INFO     | app.modules.reid.insightface_analyzer:get_shared_analyzer - Shared InsightFace analyzer created for buffalo_l
+2026-07-02 14:58:20 | INFO     | app.modules.rule_engine.rule_evaluator:load - Rule cache loaded: 0 rules, 0 zones
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.camera_worker:apply_runtime_config - Camera worker 61fabd00-acd6-4591-9074-8fd40e87c1f0 config applied: 0 zones, 0 rules
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.frame_buffer:start - Frame buffer capture thread started for rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.stream_broadcaster:start - StreamBroadcaster started: camera=61fabd00-acd6-4591-9074-8fd40e87c1f0 1920x1080 @ 15fps
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.camera_worker:start - Stream burn-in enabled for camera 61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.camera_worker:start - Camera worker started: 61fabd00-acd6-4591-9074-8fd40e87c1f0 (fps_target=5, rotation=None)
+2026-07-02 14:58:20 | INFO     | app.modules.ai_runtime.worker_supervisor:start_camera - Worker supervisor: camera 61fabd00-acd6-4591-9074-8fd40e87c1f0 started
+2026-07-02 14:58:20 | INFO     | app.lifecycle:lifespan - Restored camera worker: cam2 (61fabd00-acd6-4591-9074-8fd40e87c1f0)
+2026-07-02 14:58:20 | INFO     | app.lifecycle:lifespan - Stream publishing handled by CameraWorker (burn-in mode) for cam2
+2026-07-02 14:58:20 | INFO     | app.lifecycle:lifespan - Application startup complete
+INFO:     Application startup complete.
+[tcp @ 0x76e52cd20] Connection to tcp://192.168.1.177:1936?timeout=0 failed: Connection refused
+[ WARN:0@6.281] global cap.cpp:217 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-07-02 14:58:21 | WARNING  | app.modules.ai_runtime.frame_buffer:_capture_loop - RTSP capture error (rtsp://admin:admin@192.168.1.177:1936): Cannot open RTSP stream: rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:58:21 | INFO     | app.modules.ai_runtime.frame_buffer:_capture_loop - Reconnecting to RTSP stream in 5s...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-07-02 14:58:22 | INFO     | app.lifecycle:lifespan - Shutting down application...
+2026-07-02 14:58:22 | INFO     | app.modules.jobs.scheduler:stop_scheduler - Background job scheduler stopped
+2026-07-02 14:58:24 | INFO     | app.modules.ai_runtime.stream_broadcaster:stop - StreamBroadcaster stopped: camera=61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:58:24 | INFO     | app.modules.ai_runtime.frame_buffer:stop - Frame buffer capture thread stopped for rtsp://admin:admin@192.168.1.177:1936
+2026-07-02 14:58:24 | INFO     | app.modules.ai_runtime.camera_worker:stop - Camera worker stopped: 61fabd00-acd6-4591-9074-8fd40e87c1f0
+2026-07-02 14:58:24 | INFO     | app.modules.ai_runtime.worker_supervisor:stop_all - Worker supervisor: stopped 1 workers
+2026-07-02 14:58:24 | INFO     | app.lifecycle:lifespan - All camera workers stopped
+2026-07-02 14:58:24 | INFO     | app.modules.streaming.manager:shutdown - StreamManager shut down; all publishers stopped
+2026-07-02 14:58:24 | INFO     | app.lifecycle:lifespan - Application shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [86508]
+INFO:     Stopping reloader process [86506]

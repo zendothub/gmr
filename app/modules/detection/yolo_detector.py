@@ -65,17 +65,11 @@ class YOLODetector:
         self.confidence_threshold = confidence_threshold or settings.YOLO_CONFIDENCE_THRESHOLD
         self.allowed_classes = allowed_classes or settings.yolo_allowed_classes_list
         self.model = None
-        
-        # Detect device: cuda -> mps -> cpu
-        import torch
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-            
-        logger.info(f"YOLO detector device set to: {self.device}")
+
+        # Read the process-wide device decision made at startup (cuda / mps / cpu).
+        from app.utils.device import get_device
+        self.device = get_device()
+        logger.info(f"YOLO detector using device: {self.device}")
         self._load_model()
 
     def _load_model(self):

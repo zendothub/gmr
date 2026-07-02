@@ -142,6 +142,8 @@ class StreamBroadcaster:
 
     def _build_command(self) -> List[str]:
         s = self.settings
+        from app.utils.device import get_ffmpeg_video_codec_args
+        video_codec_args = get_ffmpeg_video_codec_args(s.FFMPEG_BINARY)
         return [
             s.FFMPEG_BINARY,
             "-nostdin",
@@ -152,12 +154,10 @@ class StreamBroadcaster:
             "-s", f"{self.width}x{self.height}",
             "-r", str(self.fps),
             "-i", "-",
-            # Encode to low-latency H.264 (no audio)
+            # Encode to H.264 using the best available hardware (no audio).
+            # Encoder is resolved once at startup: h264_nvenc > h264_videotoolbox > libx264
             "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p",
+            *video_codec_args,
             "-g", str(self.fps * 2),  # keyframe interval ~2 seconds
             # Push to MediaMTX
             "-f", "rtsp",
