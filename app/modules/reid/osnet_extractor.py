@@ -34,17 +34,11 @@ class OSNetExtractor:
         self.model_path = model_path or settings.OSNET_MODEL_PATH
         self.embedding_dim = settings.REID_EMBEDDING_DIM
         self.model = None
-        
-        # Detect device: cuda -> mps -> cpu
-        import torch
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-            
-        logger.info(f"OSNet extractor device set to: {self.device}")
+
+        # Read the process-wide device decision made at startup (cuda / mps / cpu).
+        from app.utils.device import get_device
+        self.device = get_device()
+        logger.info(f"OSNet extractor using device: {self.device}")
         self._load_model()
 
     def _load_model(self):

@@ -6,7 +6,6 @@ from typing import Optional, Dict
 import cv2
 import numpy as np
 from loguru import logger
-import torch
 
 from app.config import get_settings
 
@@ -57,13 +56,26 @@ class InsightFaceAnalyzer:
         """Lazy load InsightFace app."""
         try:
             from insightface.app import FaceAnalysis
+            from app.utils.device import insightface_ctx_id, get_device, get_insightface_providers
 
-            # Determine execution device: use GPU if CUDA is available, otherwise CPU.
-            ctx_id = 0 if torch.cuda.is_available() else -1
-            logger.info(f"InsightFace using ctx_id={ctx_id} (CUDA={torch.cuda.is_available()})")
+            device = get_device()
+            ctx_id = insightface_ctx_id()
+            providers = get_insightface_providers()
+            logger.info(
+                f"InsightFace using ctx_id={ctx_id} device={device} "
+                f"providers={providers}"
+            )
 
-            # buffalo_l is the default high-accuracy model pack
-            self.app = FaceAnalysis(name=self.model_name, allowed_modules=['detection', 'genderage', 'recognition'])
+            # Pass providers= to the constructor so ONNX Runtime uses the correct
+            # execution backend from the start:
+            #   CUDA  → CUDAExecutionProvider
+            #   MPS   → CoreMLExecutionProvider  (Apple Neural Engine)
+            #   CPU   → CPUExecutionProvider
+            self.app = FaceAnalysis(
+                name=self.model_name,
+                allowed_modules=['detection', 'genderage', 'recognition'],
+                providers=providers,
+            )
             self.app.prepare(ctx_id=ctx_id, det_size=self.det_size)
             logger.info(f"InsightFace FaceAnalysis prepared successfully (model={self.model_name})")
         except Exception as e:
