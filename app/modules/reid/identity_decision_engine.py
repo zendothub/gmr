@@ -48,6 +48,10 @@ class IdentityDecisionEngine:
         4. Refinement Disassociation: If assigned ID face contradicts -> disassociate -> re-search.
         """
         try:
+            # === RACE CONDITION PREVENTION ===
+            # Acquire transaction-level exclusive lock to serialize ReID decisions across all camera workers
+            await db.execute(text("SELECT pg_advisory_xact_lock(1001)"))
+
             best_candidate = None
             best_similarity = -1.0
             used_face = False
@@ -134,6 +138,10 @@ class IdentityDecisionEngine:
                     person_id = await self._create_new_person(
                         db, mean_embedding, camera_id, crop_quality_score, crop_path, face_embedding, face_score, face_crop_path
                     )
+                    if person_id is None:
+                        logger.info("[Initial ReID] Identity creation blocked (REQUIRE_FACE_FOR_IDENTITY is True, but no face detected).")
+                        return None, 0.0, False, False, None
+                        
                     logger.info(f"[Initial ReID] Created new anonymous person ID {person_id} (best score: {best_similarity:.3f} < {required_threshold})")
                     return person_id, 0.0, False, True, None
 
@@ -162,7 +170,11 @@ class IdentityDecisionEngine:
                         new_pid = await self._create_new_person(
                             db, mean_embedding, camera_id, crop_quality_score, crop_path, face_embedding, face_score, face_crop_path
                         )
-                        
+                        if new_pid is None:
+                            logger.info("[ReID Refined] Contradiction occurred but couldn't create new ID (no face). Returning None.")
+                            prune_old_id = current_person_id if is_temporary else None
+                            return None, 0.0, False, False, prune_old_id
+                            
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
                             await self._delete_person(db, prune_old_id, new_pid)
@@ -243,6 +255,8 @@ class IdentityDecisionEngine:
             person_id = await self._create_new_person(
                 db, mean_embedding, camera_id, crop_quality_score, crop_path, face_embedding, face_score, face_crop_path
             )
+            if person_id is None:
+                return None, 0.0, False, False, None
             return person_id, 0.0, False, True, None
 
     async def _search_similar(
@@ -536,8 +550,12 @@ class IdentityDecisionEngine:
         face_embedding: Optional[np.ndarray] = None,
         face_score: float = 0.0,
         face_crop_path: Optional[str] = None,
-    ) -> uuid.UUID:
+    ) -> Optional[uuid.UUID]:
         """Create a new anonymous person identity and fire registration event."""
+        if self.settings.REQUIRE_FACE_FOR_IDENTITY and face_embedding is None:
+            logger.debug(f"[_create_new_person] Blocked: REQUIRE_FACE_FOR_IDENTITY is True, but no face detected on camera {camera_id}.")
+            return None
+            
         now = utc_now()
         person = PersonIdentity(
             label=None,

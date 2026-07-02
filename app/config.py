@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
     REID_MIN_QUALITY_FOR_SWITCH: float = 0.80
+    REQUIRE_FACE_FOR_IDENTITY: bool = True
 
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
