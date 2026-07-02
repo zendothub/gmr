@@ -790,7 +790,7 @@ class CameraWorker:
                     if person_record:
                         new_score = track.best_demographics.get("face_score", 0.0)
                         current_score = person_record.best_face_score or 0.0
-                        if new_score > current_score:
+                        if person_record.gender is None or new_score >= current_score:
                             person_record.gender = track.best_demographics["gender"]
                             person_record.age_group = track.best_demographics["age_group"]
                             person_record.estimated_age = track.best_demographics["age"]
