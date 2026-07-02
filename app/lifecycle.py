@@ -16,6 +16,20 @@ async def lifespan(app: FastAPI):
     # --- STARTUP ---
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
 
+    # Detect compute device once (CUDA → MPS → CPU).
+    # Also probes the FFmpeg build for h264_nvenc / h264_videotoolbox support.
+    # Result is cached in memory AND written to runtime/device_info.json.
+    # All AI components (YOLO, OSNet, InsightFace, FFmpeg) read from this single source.
+    try:
+        from app.utils.device import detect_and_save_device, get_ffmpeg_video_codec_args
+        detect_and_save_device()
+        # Pre-warm the FFmpeg encoder probe so the result is cached before
+        # any camera worker starts.
+        codec_args = get_ffmpeg_video_codec_args(settings.FFMPEG_BINARY)
+        logger.info(f"FFmpeg video encoder selected: {codec_args[1]}")
+    except Exception as e:
+        logger.warning(f"Device detection failed: {e} — models will fall back to CPU")
+
     # Initialize MinIO bucket
     try:
         from app.modules.storage.minio_client import get_client
