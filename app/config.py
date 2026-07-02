@@ -115,7 +115,15 @@ class Settings(BaseSettings):
         "http://10.69.154.89:80,"
         "http://10.69.154.89:3000,"
         "http://10.69.154.89:5173,"
-        "http://10.69.154.89:8080"
+        "http://10.69.154.89:8080,"
+        "http://10.8.0.2,"
+        "https://10.8.0.2,"
+        "http://10.8.0.2:80,"
+        "http://10.8.0.2:3000,"
+        "http://10.8.0.2:5173,"
+        "http://10.8.0.2:8080,"
+        "http://retaileye.bluecloudsoftech.com,"
+        "https://retaileye.bluecloudsoftech.com"
     )
 
     @property
