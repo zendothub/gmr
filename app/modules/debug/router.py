@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
-from app.modules.debug.schemas import ActiveTracksRealtimeResponse
+from app.modules.debug.schemas import (
+    ActiveTracksRealtimeResponse, PaginatedUniquePersonsResponse, PaginatedTracksResponse
+)
 from app.modules.debug.service import DebugService
 
 
@@ -29,3 +31,31 @@ async def get_active_tracks(
     - List of active tracks with current quality, face status, and ReID scores
     """
     return await DebugService.get_active_tracks(db)
+
+
+@router.get("/unique-persons", response_model=PaginatedUniquePersonsResponse)
+async def get_unique_persons(
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get all unique person identities with basic statistics (paginated).
+    """
+    return await DebugService.get_unique_persons(db, page=page, size=size, search=search)
+
+
+@router.get("/unique-persons/{person_id}/tracks", response_model=PaginatedTracksResponse)
+async def get_unique_person_tracks(
+    person_id: UUID,
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get all track sessions where a person was detected (paginated).
+    """
+    return await DebugService.get_unique_person_tracks(db, person_id=person_id, page=page, size=size)

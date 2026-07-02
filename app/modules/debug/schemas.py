@@ -47,3 +47,43 @@ class ActiveTracksRealtimeResponse(BaseModel):
     total_identified_tracks: int
     total_inactive_tracks: int
     active_tracks: List[ActiveTrackResponse]
+
+
+# --- Paginated Unique Persons & Tracks Debug Schemas ---
+
+class PersonTrackDetail(BaseModel):
+    track_session_id: UUID
+    camera_name: str
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    duration_seconds: float
+    body_crop_path: Optional[str] = None
+    face_crop_path: Optional[str] = None
+
+
+class PaginatedTracksResponse(BaseModel):
+    total_count: int
+    page: int
+    size: int
+    tracks: List[PersonTrackDetail]
+
+
+class UniquePersonItem(BaseModel):
+    id: UUID
+    gender: Optional[str] = None
+    age_group: Optional[str] = None
+    estimated_age: Optional[int] = None
+    best_face_score: Optional[float] = None
+    face_crop_path: Optional[str] = None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    visit_count: int
+    total_tracks: int
+    total_days: int
+
+
+class PaginatedUniquePersonsResponse(BaseModel):
+    total_count: int
+    page: int
+    size: int
+    persons: List[UniquePersonItem]

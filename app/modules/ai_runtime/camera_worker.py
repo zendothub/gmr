@@ -18,6 +18,7 @@ import numpy as np
 
 from app.config import get_settings
 from app.core.db.session import AsyncSessionLocal
+from app.core.db.models.person import PersonIdentity
 from app.modules.ai_runtime.frame_buffer import LatestFrameBuffer
 from app.modules.ai_runtime.inference_pool import run_inference
 from app.modules.ai_runtime.stream_broadcaster import StreamBroadcaster
@@ -778,24 +779,26 @@ class CameraWorker:
                             .values(person_identity_id=person_id, description=f"Person {str(person_id)[:8]} entered view.")
                         )
 
-                # Eagerly sync demographics + face crop to PersonIdentity on every
-                # accumulation window so they are always written together atomically.
-                # This prevents the desync where face_crop_path is written per-window
-                # but age/gender were only written at track close.
                 if person_id and track.best_demographics:
-                    demo_result = await db.execute(
-                        select(PersonIdentity).where(PersonIdentity.id == person_id)
-                    )
-                    person_record = demo_result.scalar_one_or_none()
+                    # Ensure person_id is a UUID object (in case it is returned as a string from raw SQL)
+                    if isinstance(person_id, str):
+                        person_id_uuid = uuid.UUID(person_id)
+                    else:
+                        person_id_uuid = person_id
+                    
+                    person_record = await db.get(PersonIdentity, person_id_uuid)
+
                     if person_record:
                         new_score = track.best_demographics.get("face_score", 0.0)
                         current_score = person_record.best_face_score or 0.0
+
                         if person_record.gender is None or new_score >= current_score:
                             person_record.gender = track.best_demographics["gender"]
                             person_record.age_group = track.best_demographics["age_group"]
                             person_record.estimated_age = track.best_demographics["age"]
                             person_record.best_face_score = new_score
                             person_record.face_crop_path = track.best_demographics["face_crop_path"]
+                            
                             logger.info(
                                 f"Updated PersonIdentity {person_id} demographics (eager): "
                                 f"gender={person_record.gender}, age={person_record.estimated_age} "
