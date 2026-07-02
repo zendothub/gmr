@@ -36,6 +36,7 @@ class InsightFaceResult:
     face_bbox: dict  # {"x1", "y1", "x2", "y2"}
     embedding: Optional[np.ndarray] = None
     face_crop: Optional[np.ndarray] = None
+    kps: Optional[np.ndarray] = None
 
 
 class InsightFaceAnalyzer:
@@ -120,7 +121,8 @@ class InsightFaceAnalyzer:
                 face_score=float(best_face.det_score),
                 face_bbox=face_bbox,
                 embedding=getattr(best_face, "embedding", None),
-                face_crop=face_crop
+                face_crop=face_crop,
+                kps=getattr(best_face, "kps", None)
             )
 
         except Exception as e:

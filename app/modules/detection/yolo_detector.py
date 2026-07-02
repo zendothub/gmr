@@ -14,6 +14,9 @@ from app.config import get_settings
 _shared_detectors: Dict[str, "YOLODetector"] = {}
 _shared_lock = threading.Lock()
 
+_shared_pose_models: Dict[str, "YOLO"] = {}
+_shared_pose_lock = threading.Lock()
+
 
 def get_shared_detector(
     model_path: Optional[str] = None,
@@ -32,6 +35,27 @@ def get_shared_detector(
             )
             logger.info(f"Shared YOLO detector created for {key}")
         return _shared_detectors[key]
+
+
+def get_shared_pose_model(model_path: Optional[str] = None):
+    """Get (or lazily create) a process-wide shared YOLO-Pose model."""
+    from ultralytics import YOLO
+    import torch
+    settings = get_settings()
+    key = model_path or settings.YOLO_POSE_MODEL_PATH
+    with _shared_pose_lock:
+        if key not in _shared_pose_models:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+            model = YOLO(key)
+            model.to(device)
+            _shared_pose_models[key] = model
+            logger.info(f"Shared YOLO-Pose model created for {key} on {device}")
+        return _shared_pose_models[key]
 
 
 @dataclass

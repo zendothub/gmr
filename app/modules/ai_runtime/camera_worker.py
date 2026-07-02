@@ -21,7 +21,7 @@ from app.core.db.session import AsyncSessionLocal
 from app.modules.ai_runtime.frame_buffer import LatestFrameBuffer
 from app.modules.ai_runtime.inference_pool import run_inference
 from app.modules.ai_runtime.stream_broadcaster import StreamBroadcaster
-from app.modules.detection.yolo_detector import get_shared_detector
+from app.modules.detection.yolo_detector import get_shared_detector, get_shared_pose_model
 from app.modules.tracking.track_manager import TrackManager, ActiveTrack
 from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
@@ -63,6 +63,7 @@ class CameraWorker:
         self.zone_event_detector = ZoneEventDetector(self.camera_id)
         
         self.reid_extractor = get_shared_extractor(self.settings.OSNET_MODEL_PATH) if self.reid_enabled else None
+        self.yolo_pose = get_shared_pose_model() if self.reid_enabled else None
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
         self.insightface_analyzer = get_shared_analyzer(self.settings.INSIGHTFACE_MODEL) if self.demographic_enabled else None
 
@@ -665,12 +666,34 @@ class CameraWorker:
                 )
                 return
 
+            # Run YOLO-Pose keypoints check if pose model is available
+            keypoint_visibility_ratio = None
+            keypoint_gate_passed = False
+            if self.yolo_pose:
+                try:
+                    pose_results = await run_inference(
+                        self.yolo_pose.predict,
+                        crop,
+                        verbose=False,
+                        conf=self.settings.YOLO_POSE_CONFIDENCE
+                    )
+                    if pose_results and pose_results[0].keypoints is not None:
+                        kp_conf = pose_results[0].keypoints.conf
+                        if kp_conf is not None and kp_conf.shape[0] > 0:
+                            from app.modules.reid.crop_quality import check_torso_keypoints
+                            keypoint_visibility_ratio, keypoint_gate_passed = check_torso_keypoints(
+                                kp_conf[0].cpu().numpy(),
+                                confidence_threshold=self.settings.YOLO_POSE_CONFIDENCE
+                            )
+                except Exception as pose_err:
+                    logger.debug(f"Pose check failed: {pose_err}")
+
             # Assess quality (returns either a float score or a dict with detailed metrics)
-            quality_result = assess_crop_quality(crop)
+            quality_result = assess_crop_quality(crop, keypoint_visibility_ratio=keypoint_visibility_ratio)
             if isinstance(quality_result, dict):
                 quality = quality_result.get("quality_score", 0.0)
-                keypoint_visibility_ratio = quality_result.get("keypoint_visibility_ratio")
-                keypoint_gate_passed = quality_result.get("keypoint_gate_passed", False)
+                keypoint_visibility_ratio = quality_result.get("keypoint_visibility_ratio", keypoint_visibility_ratio)
+                keypoint_gate_passed = quality_result.get("keypoint_gate_passed", keypoint_gate_passed)
                 sharpness_score = quality_result.get("sharpness_score")
                 size_score = quality_result.get("size_score")
                 aspect_ratio = quality_result.get("aspect_ratio")
@@ -679,8 +702,6 @@ class CameraWorker:
             else:
                 quality = float(quality_result)
                 quality_passed = quality >= self.settings.REID_CROP_QUALITY_THRESHOLD
-                keypoint_visibility_ratio = None
-                keypoint_gate_passed = False
                 sharpness_score = None
                 size_score = None
                 aspect_ratio = None
@@ -691,11 +712,77 @@ class CameraWorker:
             # Save crop for audit / debugging (MUST be before any debug log that references crop_path)
             crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
 
-            if quality < self.settings.REID_CROP_QUALITY_THRESHOLD:
-                logger.debug(
-                    f"ReID crop rejected (quality={quality:.2f}) "
-                    f"track={track.local_track_id} camera={self.camera_id}"
-                )
+            # Run demographics / face detection on all crops first (regardless of body quality)
+            face_embedding = None
+            face_score = 0.0
+            face_crop_path = None
+            face_result = None
+            face_frontal = False
+            
+            if self.demographic_enabled and self.insightface_analyzer:
+                face_result = await run_inference(self.insightface_analyzer.analyze, crop)
+                if face_result:
+                    track.face_analysis_count += 1
+                    
+                    # Validate frontality criteria using settings
+                    face_bbox = face_result.face_bbox
+                    face_width = face_bbox["x2"] - face_bbox["x1"]
+                    
+                    face_frontal = True
+                    rejection_reason = ""
+                    if face_result.face_score < self.settings.FACE_MIN_DET_SCORE:
+                        face_frontal = False
+                        rejection_reason = f"score {face_result.face_score:.2f} < {self.settings.FACE_MIN_DET_SCORE}"
+                    elif face_width < self.settings.FACE_MIN_SIZE_PX:
+                        face_frontal = False
+                        rejection_reason = f"width {face_width}px < {self.settings.FACE_MIN_SIZE_PX}px"
+                    elif face_result.kps is not None and len(face_result.kps) == 5:
+                        eye_dx = float(face_result.kps[1][0]) - float(face_result.kps[0][0])
+                        eye_spread = eye_dx / face_width if face_width > 0 else 0.0
+                        if eye_spread < self.settings.FACE_MIN_EYE_SPREAD:
+                            face_frontal = False
+                            rejection_reason = f"eye {eye_spread:.2f} < {self.settings.FACE_MIN_EYE_SPREAD}"
+                    
+                    if face_frontal:
+                        face_embedding = face_result.embedding
+                        face_score = face_result.face_score
+                        if face_result.face_crop is not None:
+                            face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
+                        
+                        # Keep the best face score demographics for display and TrackSession updating
+                        if (track.best_demographics is None or 
+                            face_score > track.best_demographics.get("face_score", 0.0)):
+                            track.best_demographics = {
+                                "age": face_result.age,
+                                "gender": face_result.gender,
+                                "age_group": face_result.age_group,
+                                "face_score": face_score,
+                                "face_crop_path": face_crop_path,
+                            }
+                            logger.debug(f"Demographics updated for track {track.local_track_id}: {track.best_demographics}")
+                    else:
+                        logger.debug(f"Track {track.local_track_id}: Face rejected due to {rejection_reason}")
+
+            # Check if we should extract body ReID or fall back to face-only
+            body_embedding = None
+            should_accumulate = False
+            
+            if quality_passed:
+                # Standard path: extract OSNet body embedding
+                body_embedding = await run_inference(self.reid_extractor.extract, crop)
+                if body_embedding is not None:
+                    should_accumulate = True
+                    if quality > track.best_crop_quality:
+                        track.best_crop_quality = quality
+                        track.best_crop_path = crop_path
+                else:
+                    logger.warning("OSNet embedding extraction returned None.")
+            elif face_frontal and face_embedding is not None:
+                # Fallback path: body quality is low, but high-quality face is present
+                logger.info(f"Track {track.local_track_id}: body quality rejected ({quality:.2f}), falling back to face-only identification.")
+                should_accumulate = True
+
+            if not should_accumulate:
                 await self._log_debug_record(
                     db, track,
                     reid_attempted=True,
@@ -708,76 +795,27 @@ class CameraWorker:
                     size_score=size_score,
                     aspect_ratio=aspect_ratio,
                     brightness_mean=brightness_mean,
-                    crop_height_px=h,
-                    crop_width_px=w,
                     body_crop_path=crop_path,
                     failure_stage="quality_too_low",
-                    failure_reason=f"Quality score {quality:.2f} < {self.settings.REID_CROP_QUALITY_THRESHOLD} threshold.",
+                    failure_reason=f"Quality score {quality:.2f} < {self.settings.REID_CROP_QUALITY_THRESHOLD} threshold and no valid frontal face.",
                 )
                 return
-
-            embedding = await run_inference(self.reid_extractor.extract, crop)
-            if embedding is None:
-                await self._log_debug_record(
-                    db, track,
-                    reid_attempted=True,
-                    reid_success=False,
-                    quality_score=quality,
-                    quality_passed=True,
-                    keypoint_visibility_ratio=keypoint_visibility_ratio,
-                    keypoint_gate_passed=keypoint_gate_passed,
-                    crop_height_px=h,
-                    crop_width_px=w,
-                    body_crop_path=crop_path,
-                    failure_stage="embedding_failed",
-                    failure_reason="OSNet embedding extraction returned None.",
-                )
-                return
-
-            if quality > track.best_crop_quality:
-                track.best_crop_quality = quality
-                track.best_crop_path = crop_path
-
-            # Run demographics extraction if enabled and budget allows
-            face_embedding = None
-            face_score = 0.0
-            face_crop_path = None
-            
-            if self.demographic_enabled and self.insightface_analyzer:
-                face_result = await run_inference(self.insightface_analyzer.analyze, crop)
-                if face_result:
-                    track.face_analysis_count += 1
-                    face_embedding = face_result.embedding
-                    face_score = face_result.face_score
-                    
-                    if face_result.face_crop is not None:
-                        # Save face crop
-                        face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
-
-                    # Keep the best face score demographics for display and TrackSession updating
-                    if (track.best_demographics is None or 
-                        face_score > track.best_demographics.get("face_score", 0.0)):
-                        track.best_demographics = {
-                            "age": face_result.age,
-                            "gender": face_result.gender,
-                            "age_group": face_result.age_group,
-                            "face_score": face_score,
-                            "face_crop_path": face_crop_path,
-                        }
-                        logger.debug(f"Demographics updated for track {track.local_track_id}: {track.best_demographics}")
 
             # Accumulate embedding
             accum_list = self.track_embeddings.setdefault(track.local_track_id, [])
-            accum_list.append((embedding, quality, crop_path, face_embedding, face_score, face_crop_path))
+            accum_list.append((body_embedding, quality, crop_path, face_embedding, face_score, face_crop_path))
             track.reid_frame_count += 1
 
             # Decision execution on reaching the window size (5 frames)
             if len(accum_list) == self.settings.REID_ACCUMULATION_FRAMES:
-                embeddings = [item[0] for item in accum_list]
-                mean_embedding = np.mean(embeddings, axis=0)
-                mean_norm = np.linalg.norm(mean_embedding)
-                if mean_norm > 0:
-                    mean_embedding = mean_embedding / mean_norm
+                body_embeddings = [item[0] for item in accum_list if item[0] is not None]
+                if body_embeddings:
+                    mean_embedding = np.mean(body_embeddings, axis=0)
+                    mean_norm = np.linalg.norm(mean_embedding)
+                    if mean_norm > 0:
+                        mean_embedding = mean_embedding / mean_norm
+                else:
+                    mean_embedding = None
 
                 best_crop_item = max(accum_list, key=lambda item: item[1])
                 best_quality = best_crop_item[1]
@@ -855,8 +893,8 @@ class CameraWorker:
                     face_detected=best_face_embedding is not None,
                     face_score=best_face_score,
                     face_crop_path=best_face_crop_path,
-                    face_age=face_result.age if face_result else None,
-                    face_gender=face_result.gender if face_result else None,
+                    face_age=track.best_demographics.get("age") if track.best_demographics else None,
+                    face_gender=track.best_demographics.get("gender") if track.best_demographics else None,
                     reid_score=score,
                     reid_confident=is_confident,
                     reid_frame_count=track.reid_frame_count,
