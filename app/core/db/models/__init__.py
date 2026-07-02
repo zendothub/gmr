@@ -22,7 +22,6 @@ from app.core.db.models.feature_request import FeatureRequest, FeatureStatus
 from app.core.db.models.storage import StorageObject, StorageType
 from app.core.db.models.store import Store, StoreStatus
 from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone, StoreTerminal
-from app.core.db.models.debug import PersonDebug
 
 __all__ = [
     "User",
@@ -56,5 +55,4 @@ __all__ = [
     "StoreLevel",
     "StoreZone",
     "StoreTerminal",
-    "PersonDebug",
 ]

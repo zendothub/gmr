@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
     FACE_MATCH_THRESHOLD: float = 0.55  # Face contradiction threshold (increased from 0.50)
+    FACE_MIN_DET_SCORE: float = 0.60  # Minimum face detection score for frontal verification
+    FACE_MIN_SIZE_PX: int = 45  # Minimum face width in pixels
+    FACE_MIN_EYE_SPREAD: float = 0.30  # Minimum eye-spread ratio for frontal verification
+    FACE_SEARCH_THRESHOLD: float = 0.65  # Threshold above which face is considered high quality to skip body search if not matched
     
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"

@@ -36,6 +36,7 @@ class InsightFaceResult:
     face_bbox: dict  # {"x1", "y1", "x2", "y2"}
     embedding: Optional[np.ndarray] = None
     face_crop: Optional[np.ndarray] = None
+    kps: Optional[np.ndarray] = None
 
 
 class InsightFaceAnalyzer:
@@ -91,8 +92,46 @@ class InsightFaceAnalyzer:
             if not faces:
                 return None
 
-            # Get the face with the highest detection score
-            best_face = max(faces, key=lambda f: f.det_score)
+            # Filter faces to avoid background face contamination
+            valid_faces = []
+            h, w = crop.shape[:2]
+            for f in faces:
+                bbox = f.bbox
+                f_x1, f_y1, f_x2, f_y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+                f_w = f_x2 - f_x1
+                f_h = f_y2 - f_y1
+                f_y_center = (f_y1 + f_y2) / 2
+
+                # Heuristic 1: Face center must be in the upper region of the body crop (top 45%)
+                if f_y_center > h * 0.45:
+                    logger.debug(f"InsightFace: face rejected (y_center {f_y_center:.1f} > {h * 0.45:.1f})")
+                    continue
+
+                # Heuristic 2: Face must not be too small (minimum 8% of body crop width/height)
+                if f_w < w * 0.08 and f_h < h * 0.08:
+                    logger.debug(f"InsightFace: face rejected (too small: {f_w:.1f}x{f_h:.1f} vs crop {w}x{h})")
+                    continue
+
+                valid_faces.append(f)
+
+            if not valid_faces:
+                logger.debug(f"InsightFace: no faces passed heuristics from {len(faces)} detected")
+                return None
+
+            # Select the face whose horizontal centre is closest to the crop's vertical centreline.
+            # This ensures the tracked person's face wins over an adjacent person's face in
+            # close-range scenarios, regardless of detection confidence scores.
+            crop_cx = w / 2
+            best_face = min(
+                valid_faces,
+                key=lambda f: abs((f.bbox[0] + f.bbox[2]) / 2 - crop_cx)
+            )
+            logger.debug(
+                f"InsightFace: selected face at x_center "
+                f"{(best_face.bbox[0] + best_face.bbox[2]) / 2:.1f} "
+                f"(crop_cx={crop_cx:.1f}, score={best_face.det_score:.2f}) "
+                f"from {len(valid_faces)} valid face(s)"
+            )
             
             bbox = best_face.bbox
             face_bbox = {
@@ -120,7 +159,8 @@ class InsightFaceAnalyzer:
                 face_score=float(best_face.det_score),
                 face_bbox=face_bbox,
                 embedding=getattr(best_face, "embedding", None),
-                face_crop=face_crop
+                face_crop=face_crop,
+                kps=getattr(best_face, "kps", None)
             )
 
         except Exception as e:

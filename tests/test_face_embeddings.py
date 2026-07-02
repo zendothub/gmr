@@ -94,7 +94,7 @@ async def test_decide_identity_fallback_to_body(engine, mock_db):
         camera_id=camera_id,
         crop_quality_score=0.8,
         face_embedding=face_embedding,
-        face_score=0.8
+        face_score=0.60
     )
     
     assert pid == person_id
