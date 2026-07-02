@@ -153,7 +153,7 @@ class RuleEvaluator:
 
     def _eval_zone_dwell(self, rule: dict, track: ActiveTrack, camera_id: uuid.UUID) -> Optional[RuleEvent]:
         zone_id = rule.get("zone_id")
-        threshold = rule.get("dwell_threshold_seconds", 60)
+        threshold = rule.get("dwell_threshold_seconds") or 60
         if not zone_id:
             return None
         dwell = track.dwell_seconds.get(str(zone_id), 0)
@@ -174,7 +174,7 @@ class RuleEvaluator:
             return None
         if str(zone_id) in track.current_zones:
             dwell = track.dwell_seconds.get(str(zone_id), 0)
-            if dwell >= rule.get("dwell_threshold_seconds", 10):
+            if dwell >= (rule.get("dwell_threshold_seconds") or 10):
                 return RuleEvent(
                     rule_id=uuid.UUID(rule["id"]), rule_type="billing_interaction", camera_id=camera_id,
                     zone_id=uuid.UUID(zone_id), track_session_id=track.track_session_id,
@@ -196,7 +196,7 @@ class RuleEvaluator:
             return None
         if str(zone_id) in track.current_zones:
             dwell = track.dwell_seconds.get(str(zone_id), 0)
-            if dwell >= rule.get("dwell_threshold_seconds", 15):
+            if dwell >= (rule.get("dwell_threshold_seconds") or 15):
                 return RuleEvent(
                     rule_id=uuid.UUID(rule["id"]), rule_type="possible_purchase", camera_id=camera_id,
                     zone_id=uuid.UUID(zone_id), track_session_id=track.track_session_id,
