@@ -173,3 +173,39 @@ pytest tests/ -v
 - Set a strong `SECRET_KEY`, restrict CORS origins in `app/main.py`.
 - Bare-metal deployment: see `deployment/retail-ai.service` (systemd) and `deployment/nginx.conf`.
 - GPU: install CUDA-enabled torch and ultralytics will use it automatically.
+
+## Danger Zone 🔴
+
+Scripts in `danger/` perform **irreversible destructive operations**. Always stop all camera workers before running them.
+
+### `danger/reset_tracking_data.py` — Full data wipe
+
+Deletes all tracking, person identity, embedding, event, analytics and billing data from PostgreSQL **and** purges all crop/snapshot files from MinIO. Configuration tables are preserved.
+
+**Tables cleared (in FK-safe order):**
+
+| Table | What's in it |
+| --- | --- |
+| `track_observations` | Per-frame bounding box history |
+| `billing_interactions` | Dwell / purchase events |
+| `events` | All person entry / exit / rule events |
+| `track_sessions` | All track session records |
+| `person_embeddings` | Body ReID vectors (512-dim) |
+| `person_face_embeddings` | Face embedding vectors |
+| `person_identities` | All registered person records |
+| `daily_analytics_summary` | Aggregated analytics |
+| `storage_objects` | File reference records |
+
+**MinIO prefixes wiped:**
+- `retail/crops/` — all body and face crop JPEGs
+- `retail/snapshots/` — all event snapshot frames
+
+**Preserved (not touched):** `users`, `roles`, `cameras`, `zones`, `stores`, `rules`, `areas`, `store_categories`, `store_levels`, `store_zones`, `store_terminals`.
+
+```bash
+# With confirmation prompt
+PYTHONPATH=. .venv/bin/python danger/reset_tracking_data.py
+
+# Skip prompt (scripted / CI use)
+PYTHONPATH=. .venv/bin/python danger/reset_tracking_data.py --yes
+```
