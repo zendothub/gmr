@@ -27,7 +27,7 @@ class IdentityDecisionEngine:
     async def decide_identity(
         self,
         db: AsyncSession,
-        mean_embedding: np.ndarray,
+        mean_embedding: Optional[np.ndarray],
         camera_id: uuid.UUID,
         crop_quality_score: float,
         crop_path: Optional[str] = None,
@@ -41,19 +41,11 @@ class IdentityDecisionEngine:
         """
         Decide identity with face contradiction gate and disassociation logic.
         
-        Enhanced logic from reid_logic_explanation.md:
-        1. Face Contradiction Check: If track has face, check against all DB faces
-        2. Face Matching Priority: Face similarity checked first (higher confidence)
-        3. Body ReID Matching: With face contradiction gate (exclude contradicting candidates)
-        4. Refinement Disassociation: If assigned ID face contradicts → disassociate → re-search
-
-        Returns:
-            Tuple of:
-            - person_id (uuid.UUID): Resolved or refined person identity ID
-            - score (float): The cosine similarity score
-            - is_confident (bool): True if score >= REID_CONFIDENCE_LIMIT
-            - is_new (bool): True if a new identity was created
-            - prune_old_id (uuid.UUID or None): Old temporary ID to delete from database if identity switched
+        Enhanced logic:
+        1. Face Contradiction Check: If track has face, check against all DB faces.
+        2. Face Matching Priority: Face similarity checked first (higher confidence).
+        3. Body ReID Matching: With face contradiction gate (exclude contradicting candidates).
+        4. Refinement Disassociation: If assigned ID face contradicts -> disassociate -> re-search.
         """
         try:
             best_candidate = None
@@ -87,7 +79,13 @@ class IdentityDecisionEngine:
                         logger.info(f"[Face Match] Score: {face_sim:.3f}, Person: {str(face_candidate['person_identity_id'])[:8]}")
 
             # Step 2: Fallback to Body ReID matching (with face contradiction gate)
-            if not used_face and mean_embedding is not None:
+            skip_body_reid = False
+            if face_embedding is not None and not used_face:
+                if face_score >= self.settings.FACE_SEARCH_THRESHOLD:
+                    skip_body_reid = True
+                    logger.info(f"High-quality face (score: {face_score:.2f}) did not match in database. Skipping body ReID to avoid false merges.")
+
+            if not used_face and not skip_body_reid and mean_embedding is not None:
                 # Search for similar embeddings using pgvector cosine distance (limit 5 candidates)
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
                 for candidate in candidates:
@@ -112,10 +110,11 @@ class IdentityDecisionEngine:
                         best_candidate = candidate
 
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
+            required_threshold = self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
 
             # CASE 1: Initial resolution (no current_person_id assigned yet)
             if current_person_id is None:
-                if best_candidate and best_similarity >= self.match_threshold:
+                if best_candidate and best_similarity >= required_threshold:
                     person_id = best_candidate["person_identity_id"]
                     is_confident = (best_similarity >= confidence_limit)
                     
@@ -135,23 +134,61 @@ class IdentityDecisionEngine:
                     person_id = await self._create_new_person(
                         db, mean_embedding, camera_id, crop_quality_score, crop_path, face_embedding, face_score, face_crop_path
                     )
-                    logger.info(f"[Initial ReID] Created new anonymous person ID {person_id} (best score: {best_similarity:.3f} < {self.match_threshold})")
+                    logger.info(f"[Initial ReID] Created new anonymous person ID {person_id} (best score: {best_similarity:.3f} < {required_threshold})")
                     return person_id, 0.0, False, True, None
 
             # CASE 2: Refinement of an existing identity
             else:
-                # If we find a better match to an existing database ID with higher similarity
-                if best_candidate and best_similarity > previous_score and best_similarity >= self.match_threshold:
+                # If current ID contradicts track face, it MUST be disassociated
+                if current_id_contradicted:
+                    if best_candidate and best_similarity >= required_threshold:
+                        matched_id = best_candidate["person_identity_id"]
+                        
+                        prune_old_id = current_person_id if is_temporary else None
+                        if prune_old_id:
+                            await self._delete_person(db, prune_old_id, matched_id)
+                        
+                        is_confident = (best_similarity >= confidence_limit)
+                        await self._update_person(db, matched_id)
+                        await self._store_embedding(
+                            db, matched_id, mean_embedding, camera_id, crop_quality_score, crop_path
+                        )
+                        if face_embedding is not None and face_score > 0:
+                            await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
+                        logger.info(f"[ReID Refined] Identity switched due to contradiction: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, used_face={used_face})")
+                        return matched_id, best_similarity, is_confident, False, prune_old_id
+                    else:
+                        # No other match found; create a new person ID entirely
+                        new_pid = await self._create_new_person(
+                            db, mean_embedding, camera_id, crop_quality_score, crop_path, face_embedding, face_score, face_crop_path
+                        )
+                        
+                        prune_old_id = current_person_id if is_temporary else None
+                        if prune_old_id:
+                            await self._delete_person(db, prune_old_id, new_pid)
+                        logger.info(f"[ReID Refined] Contradiction forced new ID: {current_person_id} -> {new_pid}")
+                        return new_pid, 0.0, False, True, prune_old_id
+
+                is_valid_match = False
+                if best_candidate and best_similarity >= required_threshold:
+                    # If we used face and it's a different ID, allow switch regardless of previous body score
+                    if used_face and best_candidate["person_identity_id"] != current_person_id:
+                        is_valid_match = True
+                    # Otherwise, only switch/update if the new similarity is better than the previous one
+                    elif best_similarity > previous_score:
+                        is_valid_match = True
+                    # Or if it's the same ID, just allow updating the profile
+                    elif best_candidate["person_identity_id"] == current_person_id:
+                        is_valid_match = True
+
+                if is_valid_match:
                     matched_id = best_candidate["person_identity_id"]
                     
                     if matched_id != current_person_id:
-                        # Quality gate: only switch identities when the crop is clear enough
-                        # to trust the match.  Low-quality crops produce noisy embeddings
-                        # that can cause false switches.
-                        min_quality = self.settings.REID_MIN_QUALITY_FOR_SWITCH
-                        if crop_quality_score < min_quality:
+                        # Gating on crop quality should only apply for body ReID, not face matches
+                        if not used_face and crop_quality_score < self.settings.REID_MIN_QUALITY_FOR_SWITCH:
                             logger.debug(
-                                f"[ReID Refined] Skipping identity switch for track (quality={crop_quality_score:.2f} < {min_quality})"
+                                f"[ReID Refined] Skipping identity switch for track (quality={crop_quality_score:.2f} < {self.settings.REID_MIN_QUALITY_FOR_SWITCH})"
                             )
                             # Still store the embedding to refine the current identity's signature
                             await self._store_embedding(
@@ -173,23 +210,23 @@ class IdentityDecisionEngine:
                         )
                         if face_embedding is not None and face_score > 0:
                             await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
-                        logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, quality={crop_quality_score:.2f})")
+                        logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, quality={crop_quality_score:.2f}, used_face={used_face})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
                     else:
                         # Same ID, but score upgraded
                         is_confident = (best_similarity >= confidence_limit)
-                        # Store/refine embedding in pgvector
                         await self._store_embedding(
                             db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
                         )
                         if face_embedding is not None and face_score > 0:
                             await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
-                        logger.info(f"[ReID Refined] Score upgraded for ID {current_person_id}: {previous_score:.3f} -> {best_similarity:.3f}")
-                        return current_person_id, best_similarity, is_confident, False, None
+                        new_score = max(previous_score, best_similarity)
+                        if new_score > previous_score:
+                            logger.info(f"[ReID Refined] Score upgraded for ID {current_person_id}: {previous_score:.3f} -> {new_score:.3f}")
+                        return current_person_id, new_score, is_confident, False, None
                 else:
                     # No better match found. If this is a temporary/unconfident ID, refine its signature
                     if is_temporary:
-                        # Store this embedding to refine signature
                         await self._store_embedding(
                             db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
                         )
@@ -329,12 +366,14 @@ class IdentityDecisionEngine:
         self,
         db: AsyncSession,
         person_id: uuid.UUID,
-        embedding: np.ndarray,
+        embedding: Optional[np.ndarray],
         camera_id: uuid.UUID,
         crop_quality_score: float,
         crop_path: Optional[str],
     ):
         """Store a new embedding for an existing person (capped per identity)."""
+        if embedding is None:
+            return
         emb = PersonEmbedding(
             person_identity_id=person_id,
             embedding=embedding.tolist(),
@@ -490,7 +529,7 @@ class IdentityDecisionEngine:
     async def _create_new_person(
         self,
         db: AsyncSession,
-        embedding: np.ndarray,
+        embedding: Optional[np.ndarray],
         camera_id: uuid.UUID,
         crop_quality_score: float,
         crop_path: Optional[str],
@@ -512,15 +551,16 @@ class IdentityDecisionEngine:
         db.add(person)
         await db.flush()
 
-        emb = PersonEmbedding(
-            person_identity_id=person.id,
-            embedding=embedding.tolist(),
-            camera_id=camera_id,
-            crop_quality=crop_quality_score,
-            crop_path=crop_path,
-            captured_at=now,
-        )
-        db.add(emb)
+        if embedding is not None:
+            emb = PersonEmbedding(
+                person_identity_id=person.id,
+                embedding=embedding.tolist(),
+                camera_id=camera_id,
+                crop_quality=crop_quality_score,
+                crop_path=crop_path,
+                captured_at=now,
+            )
+            db.add(emb)
         
         if face_embedding is not None and face_score > 0:
             from app.core.db.models.person import PersonFaceEmbedding
@@ -540,7 +580,7 @@ class IdentityDecisionEngine:
             camera_id=camera_id,
             person_identity_id=person.id,
             event_type="new_person_registered",
-            severity=EventSeverity.INFO,
+            severity=EventSeverity.LOW,
             description=f"New person {person.id} registered.",
             occurred_at=now,
             metadata_json={"face_score": face_score, "crop_quality_score": crop_quality_score}

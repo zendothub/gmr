@@ -41,10 +41,16 @@ class ActiveTrack:
     # Demographics and Face crop tracking
     face_analysis_count: int = 0
     best_demographics: Optional[dict] = None
+    current_face_crop_path: Optional[str] = None
+    current_face_score: float = 0.0
 
     # Track's best crop (body)
     best_crop_quality: float = 0.0
     best_crop_path: Optional[str] = None
+
+    # Track's current frame crop (for real-time quality debug)
+    current_crop_quality: float = 0.0
+    current_crop_path: Optional[str] = None
 
     @property
     def track_age_seconds(self) -> float:

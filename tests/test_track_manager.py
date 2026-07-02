@@ -52,7 +52,7 @@ class TestTrackManager:
         zones = [
             {
                 "id": str(uuid.uuid4()),
-                "polygon": {"points": [[0, 0], [100, 0], [100, 100], [0, 100]]},
+                "polygon": {"points": [[0, 0], [10, 0], [10, 10], [0, 10]]},
                 "zone_type": "billing_zone",
             }
         ]
@@ -77,6 +77,7 @@ class TestShouldRunReid:
     def test_reid_confident(self):
         track = self._eligible_track()
         track.reid_confident = True
+        track.reid_frame_count = 1  # not divisible by 5
         assert track.should_run_reid() is False
 
     def test_bbox_too_small(self):
@@ -86,5 +87,6 @@ class TestShouldRunReid:
 
     def test_too_many_frames(self):
         track = self._eligible_track()
-        track.reid_frame_count = 20
+        track.reid_confident = True
+        track.reid_frame_count = 21  # not divisible by 5
         assert track.should_run_reid() is False
