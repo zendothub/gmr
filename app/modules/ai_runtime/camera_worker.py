@@ -548,105 +548,7 @@ class CameraWorker:
         except Exception as e:
             logger.warning(f"Could not close track sessions for camera {self.camera_id}: {e}")
 
-    async def _log_debug_record(
-        self, db, track: ActiveTrack, *,
-        reid_attempted: bool = False,
-        reid_success: bool = False,
-        quality_score: Optional[float] = None,
-        quality_passed: bool = False,
-        keypoint_visibility_ratio: Optional[float] = None,
-        keypoint_gate_passed: bool = False,
-        sharpness_score: Optional[float] = None,
-        size_score: Optional[float] = None,
-        aspect_ratio: Optional[float] = None,
-        brightness_mean: Optional[float] = None,
-        face_detected: bool = False,
-        face_score: Optional[float] = None,
-        face_crop_path: Optional[str] = None,
-        face_age: Optional[int] = None,
-        face_gender: Optional[str] = None,
-        reid_score: Optional[float] = None,
-        reid_confident: bool = False,
-        reid_frame_count: int = 0,
-        body_crop_path: Optional[str] = None,
-        crop_height_px: Optional[int] = None,
-        crop_width_px: Optional[int] = None,
-        detection_confidence: Optional[float] = None,
-        failure_stage: Optional[str] = None,
-        failure_reason: Optional[str] = None,
-    ):
-        """Log a debug record for this ReID attempt.
 
-        Safeguard: any exception inside this method is caught and logged but
-        never raised — debug instrumentation must not break the pipeline.
-        """
-        try:
-            from app.core.db.models.debug import PersonDebug
-            from app.core.db.models.camera import Camera
-            from sqlalchemy import select
-
-            # Defensive: skip if camera_id is somehow None (worker teardown race)
-            if not self.camera_id:
-                logger.warning("_log_debug_record: self.camera_id is None, skipping debug record")
-                return
-
-            # Look up store_id from camera (returns None if camera was deleted)
-            store_id = None
-            try:
-                camera_result = await db.execute(
-                    select(Camera.store_id).where(Camera.id == self.camera_id)
-                )
-                store_id = camera_result.scalar_one_or_none()
-            except Exception:
-                # Camera table may not exist or DB may be in inconsistent state
-                pass
-
-            # Bounding box dimensions
-            bbox_height_px = None
-            bbox_width_px = None
-            if track.bbox:
-                bbox_height_px = float(track.bbox.get("y2", 0) - track.bbox.get("y1", 0))
-                bbox_width_px = float(track.bbox.get("x2", 0) - track.bbox.get("x1", 0))
-
-            debug_record = PersonDebug(
-                camera_id=self.camera_id,
-                store_id=store_id,
-                track_session_id=track.track_session_id,
-                person_identity_id=track.person_identity_id,
-                occurred_at=utc_now(),
-                reid_attempted=reid_attempted,
-                reid_success=reid_success,
-                bbox_height_px=bbox_height_px,
-                bbox_width_px=bbox_width_px,
-                detection_confidence=detection_confidence or track.avg_confidence,
-                track_total_frames=track.total_frames,
-                track_age_seconds=track.track_age_seconds,
-                crop_path=body_crop_path,
-                body_crop_path=body_crop_path,
-                crop_height_px=crop_height_px,
-                crop_width_px=crop_width_px,
-                quality_score=quality_score,
-                quality_passed=quality_passed,
-                keypoint_visibility_ratio=keypoint_visibility_ratio,
-                keypoint_gate_passed=keypoint_gate_passed,
-                sharpness_score=sharpness_score,
-                size_score=size_score,
-                aspect_ratio=aspect_ratio,
-                brightness_mean=brightness_mean,
-                face_detected=face_detected,
-                face_score=face_score,
-                face_crop_path=face_crop_path,
-                face_age=face_age,
-                face_gender=face_gender,
-                reid_score=reid_score,
-                reid_confident=reid_confident,
-                reid_frame_count=reid_frame_count,
-                failure_stage=failure_stage,
-                failure_reason=failure_reason,
-            )
-            db.add(debug_record)
-        except Exception as e:
-            logger.warning(f"Failed to log debug record for track {track.local_track_id}: {e}")
 
     async def _run_reid(self, db, frame, track: ActiveTrack):
         """Run ReID pipeline: crop -> quality -> embedding -> accumulation -> decision."""
@@ -656,14 +558,7 @@ class CameraWorker:
         try:
             crop = extract_crop(frame, track.bbox)
             if crop is None or crop.size == 0:
-                await self._log_debug_record(
-                    db, track,
-                    reid_attempted=True,
-                    reid_success=False,
-                    body_crop_path=None,
-                    failure_stage="crop_extraction_failed",
-                    failure_reason="Failed to extract crop from bounding box.",
-                )
+                logger.warning(f"Track {track.local_track_id}: Failed to extract crop from bounding box.")
                 return
 
             # Run YOLO-Pose keypoints check if pose model is available
@@ -719,9 +614,18 @@ class CameraWorker:
             face_result = None
             face_frontal = False
             
+            track.current_face_crop_path = None
+            track.current_face_score = 0.0
             if self.demographic_enabled and self.insightface_analyzer:
                 face_result = await run_inference(self.insightface_analyzer.analyze, crop)
                 if face_result:
+                    # Save current frame's detected face crop for real-time debug
+                    current_face_path = None
+                    if face_result.face_crop is not None:
+                        current_face_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
+                    track.current_face_crop_path = current_face_path
+                    track.current_face_score = face_result.face_score
+                    
                     track.face_analysis_count += 1
                     
                     # Validate frontality criteria using settings
@@ -763,6 +667,15 @@ class CameraWorker:
                     else:
                         logger.debug(f"Track {track.local_track_id}: Face rejected due to {rejection_reason}")
 
+            # Update current frame crop quality and path (updated every frame for real-time debug)
+            track.current_crop_quality = quality
+            track.current_crop_path = crop_path
+
+            # Update best crop quality and path seen so far
+            if quality > track.best_crop_quality:
+                track.best_crop_quality = quality
+                track.best_crop_path = crop_path
+
             # Check if we should extract body ReID or fall back to face-only
             body_embedding = None
             should_accumulate = False
@@ -772,9 +685,6 @@ class CameraWorker:
                 body_embedding = await run_inference(self.reid_extractor.extract, crop)
                 if body_embedding is not None:
                     should_accumulate = True
-                    if quality > track.best_crop_quality:
-                        track.best_crop_quality = quality
-                        track.best_crop_path = crop_path
                 else:
                     logger.warning("OSNet embedding extraction returned None.")
             elif face_frontal and face_embedding is not None:
@@ -783,22 +693,7 @@ class CameraWorker:
                 should_accumulate = True
 
             if not should_accumulate:
-                await self._log_debug_record(
-                    db, track,
-                    reid_attempted=True,
-                    reid_success=False,
-                    quality_score=quality,
-                    quality_passed=False,
-                    keypoint_visibility_ratio=keypoint_visibility_ratio,
-                    keypoint_gate_passed=keypoint_gate_passed,
-                    sharpness_score=sharpness_score,
-                    size_score=size_score,
-                    aspect_ratio=aspect_ratio,
-                    brightness_mean=brightness_mean,
-                    body_crop_path=crop_path,
-                    failure_stage="quality_too_low",
-                    failure_reason=f"Quality score {quality:.2f} < {self.settings.REID_CROP_QUALITY_THRESHOLD} threshold and no valid frontal face.",
-                )
+                logger.debug(f"Track {track.local_track_id}: quality too low ({quality:.2f}) and no valid frontal face. Skipping ReID accumulation.")
                 return
 
             # Accumulate embedding
@@ -877,31 +772,7 @@ class CameraWorker:
                 track.reid_resolved = True
                 track.reid_attempted = True
 
-                # Log success debug record
-                await self._log_debug_record(
-                    db, track,
-                    reid_attempted=True,
-                    reid_success=True,
-                    quality_score=best_quality,
-                    quality_passed=True,
-                    keypoint_visibility_ratio=keypoint_visibility_ratio,
-                    keypoint_gate_passed=keypoint_gate_passed,
-                    sharpness_score=sharpness_score,
-                    size_score=size_score,
-                    aspect_ratio=aspect_ratio,
-                    brightness_mean=brightness_mean,
-                    face_detected=best_face_embedding is not None,
-                    face_score=best_face_score,
-                    face_crop_path=best_face_crop_path,
-                    face_age=track.best_demographics.get("age") if track.best_demographics else None,
-                    face_gender=track.best_demographics.get("gender") if track.best_demographics else None,
-                    reid_score=score,
-                    reid_confident=is_confident,
-                    reid_frame_count=track.reid_frame_count,
-                    body_crop_path=best_crop_path,
-                    crop_height_px=h,
-                    crop_width_px=w,
-                )
+
 
                 # Update current track session in PostgreSQL
                 if track.track_session_id:
@@ -931,13 +802,7 @@ class CameraWorker:
 
         except Exception as e:
             logger.error(f"ReID failed for track {track.local_track_id}: {e}")
-            await self._log_debug_record(
-                db, track,
-                reid_attempted=True,
-                reid_success=False,
-                failure_stage="reid_exception",
-                failure_reason=f"Unexpected error in ReID pipeline: {str(e)}",
-            )
+
 
     async def _persist_events(self, db, frame, rule_events: List[RuleEvent], zone_events: List[ZoneEvent]):
         """Persist rule engine events and automatic zone events to PostgreSQL."""
