@@ -158,11 +158,9 @@ class InsightFaceAnalyzer:
             gender_val = getattr(best_face, "gender", -1)
             gender = "M" if gender_val == 1 else "F"
             
-            # Extract face crop for saving
-            h, w = crop.shape[:2]
-            x1_crop, y1_crop = max(0, int(bbox[0])), max(0, int(bbox[1]))
-            x2_crop, y2_crop = min(w, int(bbox[2])), min(h, int(bbox[3]))
-            face_crop = crop[y1_crop:y2_crop, x1_crop:x2_crop] if y2_crop > y1_crop and x2_crop > x1_crop else None
+            # Extract face crop with 30% padding for better face recognition
+            from app.utils.image_utils import extract_crop
+            face_crop = extract_crop(crop, face_bbox, padding_pct=0.30)
 
             return InsightFaceResult(
                 age=age,

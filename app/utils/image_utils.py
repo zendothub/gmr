@@ -12,24 +12,30 @@ from loguru import logger
 from app.config import get_settings
 
 
-def extract_crop(frame: np.ndarray, bbox: dict, padding: int = 10) -> Optional[np.ndarray]:
+def extract_crop(frame: np.ndarray, bbox: dict, padding_pct: float = 0.10) -> Optional[np.ndarray]:
     """
     Extract a crop from a frame using bounding box coordinates.
 
     Args:
         frame: The full video frame (numpy array)
         bbox: dict with x1, y1, x2, y2
-        padding: Extra pixels around the bbox
+        padding_pct: Padding as a fraction of bbox dimensions (e.g. 0.10 = 10% on all sides)
+                     Applied as a percentage of width (for horizontal) and height (for vertical).
 
     Returns:
         Cropped image as numpy array, or None if invalid
     """
     try:
         h, w = frame.shape[:2]
-        x1 = max(0, int(bbox["x1"]) - padding)
-        y1 = max(0, int(bbox["y1"]) - padding)
-        x2 = min(w, int(bbox["x2"]) + padding)
-        y2 = min(h, int(bbox["y2"]) + padding)
+        bbox_h = int(bbox["y2"]) - int(bbox["y1"])
+        bbox_w = int(bbox["x2"]) - int(bbox["x1"])
+        pad_y = int(bbox_h * padding_pct)
+        pad_x = int(bbox_w * padding_pct)
+
+        x1 = max(0, int(bbox["x1"]) - pad_x)
+        y1 = max(0, int(bbox["y1"]) - pad_y)
+        x2 = min(w, int(bbox["x2"]) + pad_x)
+        y2 = min(h, int(bbox["y2"]) + pad_y)
 
         if x2 <= x1 or y2 <= y1:
             return None

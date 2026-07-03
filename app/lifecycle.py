@@ -1,5 +1,7 @@
 """Application lifecycle management - startup and shutdown events."""
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from loguru import logger
 
@@ -45,6 +47,32 @@ async def lifespan(app: FastAPI):
         start_scheduler()
     except Exception as e:
         logger.warning(f"Could not start background job scheduler: {e}")
+
+    # Wait for MediaMTX to be ready before restoring camera workers.
+    # On boot, the docker-compose service may have started but MediaMTX
+    # may need a few more seconds to initialize and listen on port 9997.
+    # Poll the API until it responds (max 30 seconds).
+    try:
+        import httpx
+        mediamtx_api_url = f"http://{settings.MEDIAMTX_HOST}:{settings.MEDIAMTX_API_PORT}/v1/paths"
+        logger.info(f"Waiting for MediaMTX to be ready at {mediamtx_api_url}...")
+        start_wait = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            while time.monotonic() - start_wait < 30.0:
+                try:
+                    resp = await client.get(mediamtx_api_url, timeout=2.0)
+                    if resp.status_code == 200:
+                        logger.info(f"MediaMTX is ready (took {time.monotonic() - start_wait:.1f}s)")
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            else:
+                logger.warning("MediaMTX did not become ready within 30s — proceeding anyway")
+    except ImportError:
+        logger.warning("httpx not installed — skipping MediaMTX readiness check")
+    except Exception as e:
+        logger.warning(f"MediaMTX readiness check failed: {e} — proceeding anyway")
 
     # Auto-restart camera workers + stream publishers for all cameras
     # that were active before the server was restarted.  Without this step

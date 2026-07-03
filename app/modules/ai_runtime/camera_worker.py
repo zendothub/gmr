@@ -624,12 +624,13 @@ class CameraWorker:
                     elif face_width < self.settings.FACE_MIN_SIZE_PX:
                         face_frontal = False
                         rejection_reason = f"width {face_width}px < {self.settings.FACE_MIN_SIZE_PX}px"
-                    elif face_result.kps is not None and len(face_result.kps) == 5:
-                        eye_dx = float(face_result.kps[1][0]) - float(face_result.kps[0][0])
-                        eye_spread = eye_dx / face_width if face_width > 0 else 0.0
-                        if eye_spread < self.settings.FACE_MIN_EYE_SPREAD:
-                            face_frontal = False
-                            rejection_reason = f"eye {eye_spread:.2f} < {self.settings.FACE_MIN_EYE_SPREAD}"
+                    # FACE_MIN_EYE_SPREAD check disabled — too aggressive for non-frontal shots
+                    # elif face_result.kps is not None and len(face_result.kps) == 5:
+                    #     eye_dx = float(face_result.kps[1][0]) - float(face_result.kps[0][0])
+                    #     eye_spread = eye_dx / face_width if face_width > 0 else 0.0
+                    #     if eye_spread < self.settings.FACE_MIN_EYE_SPREAD:
+                    #         face_frontal = False
+                    #         rejection_reason = f"eye {eye_spread:.2f} < {self.settings.FACE_MIN_EYE_SPREAD}"
                     
                     if face_frontal:
                         face_embedding = face_result.embedding
@@ -687,14 +688,16 @@ class CameraWorker:
 
             # Decision execution on reaching the window size (5 frames)
             if len(accum_list) == self.settings.REID_ACCUMULATION_FRAMES:
-                body_embeddings = [item[0] for item in accum_list if item[0] is not None]
-                if body_embeddings:
-                    mean_embedding = np.mean(body_embeddings, axis=0)
-                    mean_norm = np.linalg.norm(mean_embedding)
-                    if mean_norm > 0:
-                        mean_embedding = mean_embedding / mean_norm
+                body_items = [item for item in accum_list if item[0] is not None]
+                if body_items:
+                    # Use the best-quality embedding instead of averaging all 5
+                    best_body = max(body_items, key=lambda item: item[1])  # item[1] = quality
+                    selected_embedding = best_body[0]
+                    norm = np.linalg.norm(selected_embedding)
+                    if norm > 0:
+                        selected_embedding = selected_embedding / norm
                 else:
-                    mean_embedding = None
+                    selected_embedding = None
 
                 best_crop_item = max(accum_list, key=lambda item: item[1])
                 best_quality = best_crop_item[1]
@@ -733,7 +736,7 @@ class CameraWorker:
 
                 person_id, score, is_confident, is_new, prune_old_id = await self.identity_engine.decide_identity(
                     db=db,
-                    mean_embedding=mean_embedding,
+                    mean_embedding=selected_embedding,
                     camera_id=self.camera_id,
                     crop_quality_score=best_quality,
                     crop_path=best_crop_path,
