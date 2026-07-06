@@ -49,11 +49,15 @@ class Settings(BaseSettings):
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
-    FACE_MATCH_THRESHOLD: float = 0.55  # Face contradiction threshold (increased from 0.50)
+    FACE_MATCH_THRESHOLD: float = 0.48  # Face match/contradiction threshold (lowered from 0.55 for cross-angle robustness)
     FACE_MIN_DET_SCORE: float = 0.50  # Minimum face detection score for frontal verification
     FACE_MIN_SIZE_PX: int = 30  # Minimum face width in pixels
     FACE_MIN_EYE_SPREAD: float = 0.30  # Minimum eye-spread ratio for frontal verification (currently disabled — see camera_worker.py)
     FACE_SEARCH_THRESHOLD: float = 0.65  # Threshold above which face is considered high quality to skip body search if not matched
+    FACE_IDENTITY_MIN_SCORE: float = 0.60  # Minimum face quality score required to create a new PersonIdentity
+    FACE_IDENTITY_MIN_DETECTIONS: int = 2  # Minimum good face detections across track lifestyle required for identity creation
+    MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5  # Maximum face embeddings stored per person identity (multi-angle)
+    BODY_ONLY_CONFIDENCE_LIMIT: float = 0.95  # Body-only (no face) matches require higher confidence for re-identification
     
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
@@ -61,7 +65,7 @@ class Settings(BaseSettings):
 
     # Runtime
     DEFAULT_FPS_TARGET: int = 10
-    MAX_WORKERS: int = 8
+    MAX_WORKERS: int = 10
     FRAME_BUFFER_SIZE: int = 2
     RUNTIME_SHOW_GUI: bool = False
 

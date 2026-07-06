@@ -2,10 +2,22 @@
 """
 reset_tracking_data.py
 ----------------------
-Wipes all tracking, person identity, embedding, event, analytics and
-billing data from the database AND deletes all crop/snapshot files
-from MinIO, while preserving configuration tables (users, roles,
-cameras, zones, stores, rules, areas, feature_requests).
+Wipes all tracking, person identity, body/face embedding vectors, face crops,
+event, analytics and billing data from the database AND deletes all
+crop/snapshot/clip files from MinIO, while preserving configuration tables
+(users, roles, cameras, zones, stores, rules, areas, feature_requests).
+
+Cleans:
+  DB tables (in FK-safe order):
+    - track_observations, billing_interactions, events, track_sessions
+    - person_embeddings         (body ReID vectors, OSNet 512-dim)
+    - person_face_embeddings   (face recognition vectors, ArcFace 512-dim)
+    - person_identities        (identity rows with face_crop_path references)
+    - daily_analytics_summary, storage_objects
+  MinIO objects:
+    - crops/      (body crops + face crops)
+    - snapshots/  (event/frame snapshots)
+    - clips/      (video clips)
 
 Usage:
     .venv/bin/python reset_tracking_data.py [--yes]
@@ -27,15 +39,15 @@ TABLES_IN_ORDER = [
     "billing_interactions",         # → track_sessions, person_identities
     "events",                       # → track_sessions, person_identities
     "track_sessions",               # → person_identities
-    "person_embeddings",            # → person_identities
-    "person_face_embeddings",       # → person_identities
-    "person_identities",            # root person table
+    "person_embeddings",            # → person_identities (body ReID vectors)
+    "person_face_embeddings",       # → person_identities (face recognition vectors)
+    "person_identities",            # root person table (includes face_crop_path refs)
     "daily_analytics_summary",      # standalone analytics
     "storage_objects",              # file references
 ]
 
-# MinIO object name prefixes to wipe
-MINIO_PREFIXES = ["crops/", "snapshots/"]
+# MinIO object name prefixes to wipe (covers body crops, face crops, snapshots, clips)
+MINIO_PREFIXES = ["crops/", "snapshots/", "clips/"]
 
 
 def wipe_minio():

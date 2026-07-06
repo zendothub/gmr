@@ -54,6 +54,16 @@ class ActiveTrack:
     current_crop_path: Optional[str] = None
     current_confidence: float = 0.0
 
+    # Face-first identity gating: count of good faces (meeting FACE_IDENTITY_MIN_SCORE)
+    good_face_count: int = 0
+    best_face_embedding: Optional["np.ndarray"] = None
+    best_face_score_for_id: float = 0.0
+    best_face_crop_path_for_id: Optional[str] = None
+    face_embedding_list: list = field(default_factory=list)
+
+    # Best body embedding accumulated across ReID windows (used for deferred resolution)
+    best_body_embedding: Optional["np.ndarray"] = None
+
     @property
     def track_age_seconds(self) -> float:
         return seconds_since(self.started_at)

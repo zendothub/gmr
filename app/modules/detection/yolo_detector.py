@@ -9,13 +9,36 @@ from loguru import logger
 
 from app.config import get_settings
 
-# Shared detector instances (one per model path) so multiple camera workers
-# don't each load their own copy of the weights into RAM/VRAM.
-_shared_detectors: Dict[str, "YOLODetector"] = {}
-_shared_lock = threading.Lock()
+# Per-camera detector instances so ByteTrack's persist=True state is isolated.
+# Sharing one model across cameras corrupts ByteTrack's internal tracking state.
+_camera_detectors: Dict[str, "YOLODetector"] = {}
+_camera_detectors_lock = threading.Lock()
 
 _shared_pose_models: Dict[str, "YOLO"] = {}
 _shared_pose_lock = threading.Lock()
+
+
+def get_camera_detector(
+    camera_id: str,
+    model_path: Optional[str] = None,
+    confidence_threshold: Optional[float] = None,
+    allowed_classes: Optional[List[int]] = None,
+) -> "YOLODetector":
+    """Get (or lazily create) a per-camera detector instance.
+
+    Each camera gets its own YOLO model so ByteTrack's persist=True state
+    (Kalman filters, track ID assignments) is isolated per camera. Sharing a
+    single model across cameras causes track ID corruption and churn.
+    """
+    with _camera_detectors_lock:
+        if camera_id not in _camera_detectors:
+            _camera_detectors[camera_id] = YOLODetector(
+                model_path=model_path,
+                confidence_threshold=confidence_threshold,
+                allowed_classes=allowed_classes,
+            )
+            logger.info(f"Per-camera YOLO detector created for camera {camera_id}")
+        return _camera_detectors[camera_id]
 
 
 def get_shared_detector(
@@ -23,18 +46,22 @@ def get_shared_detector(
     confidence_threshold: Optional[float] = None,
     allowed_classes: Optional[List[int]] = None,
 ) -> "YOLODetector":
-    """Get (or lazily create) a process-wide shared detector for a model path."""
+    """Get a shared detector instance (legacy, NOT recommended for tracking).
+
+    WARNING: Using a shared detector with persist=True across multiple cameras
+    corrupts ByteTrack state. Use get_camera_detector() instead.
+    """
     settings = get_settings()
     key = model_path or settings.YOLO_MODEL_PATH
-    with _shared_lock:
-        if key not in _shared_detectors:
-            _shared_detectors[key] = YOLODetector(
+    with _camera_detectors_lock:
+        if key not in _camera_detectors:
+            _camera_detectors[key] = YOLODetector(
                 model_path=key,
                 confidence_threshold=confidence_threshold,
                 allowed_classes=allowed_classes,
             )
             logger.info(f"Shared YOLO detector created for {key}")
-        return _shared_detectors[key]
+        return _camera_detectors[key]
 
 
 def get_shared_pose_model(model_path: Optional[str] = None):

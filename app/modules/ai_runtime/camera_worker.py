@@ -22,7 +22,7 @@ from app.core.db.models.person import PersonIdentity
 from app.modules.ai_runtime.frame_buffer import LatestFrameBuffer
 from app.modules.ai_runtime.inference_pool import run_inference
 from app.modules.ai_runtime.stream_broadcaster import StreamBroadcaster
-from app.modules.detection.yolo_detector import get_shared_detector, get_shared_pose_model
+from app.modules.detection.yolo_detector import get_camera_detector, get_shared_pose_model
 from app.modules.tracking.track_manager import TrackManager, ActiveTrack
 from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
@@ -50,11 +50,12 @@ class CameraWorker:
         self.reid_enabled: bool = bool(camera_config.get("reid_enabled", True))
         self.demographic_enabled: bool = bool(camera_config.get("demographic_enabled", True))
 
-        # Components (models are shared across all workers)
+        # Components — YOLO detector is per-camera (not shared) to isolate ByteTrack state
         rotation = camera_config.get("frame_rotation")
         self.frame_buffer = LatestFrameBuffer(camera_config["rtsp_url"], frame_rotation=rotation)
         
-        self.detector = get_shared_detector(
+        self.detector = get_camera_detector(
+            camera_id=str(self.camera_id),
             model_path=self.settings.YOLO_MODEL_PATH,
             confidence_threshold=self.settings.YOLO_CONFIDENCE_THRESHOLD,
             allowed_classes=self.settings.yolo_allowed_classes_list,
@@ -509,12 +510,103 @@ class CameraWorker:
             )
 
     async def _close_track_session(self, db, track: ActiveTrack):
-        """Mark a track session as ended in PostgreSQL."""
+        """Mark a track session as ended in PostgreSQL.
+
+        If the track has no resolved identity but has accumulated enough good
+        face data, perform a final identity resolution before closing.
+        """
         if not track.track_session_id:
             return
         from sqlalchemy import update, select
         from app.core.db.models.tracking import TrackSession
         from app.core.db.models.person import PersonIdentity
+        from app.core.db.models.event import Event
+
+        # Final identity resolution attempt for tracks that accumulated
+        # enough good faces but hadn't yet met the window threshold
+        close_resolved = False
+        if (track.person_identity_id is None
+                and track.best_face_embedding is not None
+                and track.good_face_count >= self.settings.FACE_IDENTITY_MIN_DETECTIONS
+                and self.identity_engine):
+            try:
+                person_id, score, is_confident, is_new, _ = await self.identity_engine.decide_identity(
+                    db=db,
+                    mean_embedding=track.best_body_embedding,
+                    camera_id=self.camera_id,
+                    crop_quality_score=track.best_crop_quality,
+                    crop_path=track.best_crop_path,
+                    current_person_id=None,
+                    previous_score=0.0,
+                    is_temporary=False,
+                    face_embedding=track.best_face_embedding,
+                    face_score=track.best_face_score_for_id,
+                    face_crop_path=track.best_face_crop_path_for_id,
+                    good_face_count=track.good_face_count,
+                    face_embedding_list=track.face_embedding_list,
+                )
+                if person_id is not None:
+                    track.person_identity_id = person_id
+                    track.reid_score = score
+                    track.reid_confident = is_confident
+                    track.reid_resolved = True
+                    close_resolved = True
+                    if is_new:
+                        self.temporary_person_ids.add(person_id)
+
+                    # Store ALL accumulated good faces (skip the best, already stored by decide_identity)
+                    person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
+                    best_emb = track.best_face_embedding
+                    for face_emb, face_scr, face_crp in track.face_embedding_list:
+                        if face_emb is None:
+                            continue
+                        if best_emb is not None:
+                            sim_to_best = float(np.dot(best_emb, face_emb))
+                            if sim_to_best > 0.95:
+                                continue
+                        try:
+                            await self.identity_engine._store_face_embedding(
+                                db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to store face embedding on close: {e}")
+
+                    logger.info(
+                        f"Track {track.local_track_id}: identity resolved on close "
+                        f"person={str(person_id)[:8]} score={score:.2f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Final identity resolution failed for track {track.local_track_id}: {e}")
+
+            # Post-resolution: update person_entered_view event and demographics
+            if close_resolved:
+                try:
+                    # Update the person_entered_view event with the resolved identity
+                    await db.execute(
+                        update(Event)
+                        .where(Event.track_session_id == track.track_session_id)
+                        .where(Event.event_type == "person_entered_view")
+                        .values(
+                            person_identity_id=track.person_identity_id,
+                            description=f"Person {str(track.person_identity_id)[:8]} entered view."
+                        )
+                    )
+
+                    # Persist demographics to PersonIdentity if available
+                    if track.best_demographics:
+                        person_id_uuid = track.person_identity_id if isinstance(track.person_identity_id, uuid.UUID) else uuid.UUID(str(track.person_identity_id))
+                        person_record = await db.get(PersonIdentity, person_id_uuid)
+                        if person_record:
+                            new_score = track.best_demographics.get("face_score", 0.0)
+                            current_score = person_record.best_face_score or 0.0
+                            if person_record.gender is None or new_score >= current_score:
+                                person_record.gender = track.best_demographics["gender"]
+                                person_record.age_group = track.best_demographics["age_group"]
+                                person_record.estimated_age = track.best_demographics["age"]
+                                person_record.best_face_score = new_score
+                                person_record.face_crop_path = track.best_demographics["face_crop_path"]
+                except Exception as e:
+                    logger.warning(f"Post-resolution update failed for track {track.local_track_id}: {e}")
 
         # 1. Update TrackSession
         session_values = {
@@ -526,6 +618,7 @@ class CameraWorker:
             "stability_score": track.stability_score,
             "bbox_history": track.bbox_history[-30:],
             "best_crop_path": track.best_crop_path,
+            "person_identity_id": track.person_identity_id,
         }
         
         # If demographics were captured, store them in the TrackSession
@@ -726,12 +819,32 @@ class CameraWorker:
             accum_list.append((body_embedding, quality, crop_path, face_embedding, face_score, face_crop_path))
             track.reid_frame_count += 1
 
+            # Track good faces across all windows for identity creation gating
+            if face_frontal and face_score >= self.settings.FACE_IDENTITY_MIN_SCORE:
+                track.good_face_count += 1
+                # Accumulate all good faces (different angles) for later storage.
+                # Deduplicate: skip if nearly identical (>0.95 cosine sim) to an
+                # existing face already in the list — same crop/angle from
+                # consecutive windows should not be stored multiple times.
+                if face_embedding is not None:
+                    is_duplicate = False
+                    for existing_emb, _, _ in track.face_embedding_list:
+                        if float(np.dot(existing_emb, face_embedding)) > 0.95:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        track.face_embedding_list.append((face_embedding, face_score, face_crop_path))
+                    # Keep the best face embedding for the identity matching step
+                    if face_score > track.best_face_score_for_id:
+                        track.best_face_embedding = face_embedding
+                        track.best_face_score_for_id = face_score
+                        track.best_face_crop_path_for_id = face_crop_path
+
             # Decision execution on reaching the window size (5 frames)
             if len(accum_list) == self.settings.REID_ACCUMULATION_FRAMES:
                 body_items = [item for item in accum_list if item[0] is not None]
                 if body_items:
-                    # Use the best-quality embedding instead of averaging all 5
-                    best_body = max(body_items, key=lambda item: item[1])  # item[1] = quality
+                    best_body = max(body_items, key=lambda item: item[1])
                     selected_embedding = best_body[0]
                     norm = np.linalg.norm(selected_embedding)
                     if norm > 0:
@@ -739,15 +852,19 @@ class CameraWorker:
                 else:
                     selected_embedding = None
 
+                # Update track-level best body embedding
+                if selected_embedding is not None:
+                    track.best_body_embedding = selected_embedding
+
                 best_crop_item = max(accum_list, key=lambda item: item[1])
                 best_quality = best_crop_item[1]
                 best_crop_path = best_crop_item[2]
                 
                 # Find the best face in this accumulation window
-                best_face_item = max(accum_list, key=lambda item: item[4])  # Max by face_score
-                best_face_embedding = best_face_item[3]
-                best_face_score = best_face_item[4]
-                best_face_crop_path = best_face_item[5]
+                best_face_item = max(accum_list, key=lambda item: item[4])
+                window_face_embedding = best_face_item[3]
+                window_face_score = best_face_item[4]
+                window_face_crop_path = best_face_item[5]
 
                 # Delete the other unused crops in this window from MinIO
                 from app.modules.storage.minio_client import delete_object as minio_delete
@@ -755,7 +872,6 @@ class CameraWorker:
                     other_path = item[2]
                     other_face_path = item[5]
 
-                    # Extract object_name from the full MinIO path (bucket/object_name)
                     def _extract_object_name(full_path: str) -> str:
                         parts = full_path.split("/", 1)
                         return parts[1] if len(parts) > 1 else full_path
@@ -764,13 +880,25 @@ class CameraWorker:
                         if other_path and other_path != best_crop_path:
                             obj_name = _extract_object_name(other_path)
                             minio_delete(obj_name)
-                        if other_face_path and other_face_path != best_face_crop_path:
+                        if other_face_path and other_face_path != window_face_crop_path:
                             obj_name = _extract_object_name(other_face_path)
                             minio_delete(obj_name)
                     except Exception as e:
                         logger.warning(f"Failed to remove unused crop from MinIO: {e}")
 
                 accum_list.clear()
+
+                # --- FACE-FIRST DEFERRED RESOLUTION ---
+                # If the track has no identity yet and hasn't accumulated enough
+                # good faces, defer the identity decision. Keep accumulating faces
+                # across subsequent windows until the threshold is met or track closes.
+                if (track.person_identity_id is None
+                        and track.good_face_count < self.settings.FACE_IDENTITY_MIN_DETECTIONS):
+                    logger.debug(
+                        f"Track {track.local_track_id}: deferring identity resolution "
+                        f"(good_face_count={track.good_face_count}/{self.settings.FACE_IDENTITY_MIN_DETECTIONS})"
+                    )
+                    return
 
                 is_temp = track.person_identity_id in self.temporary_person_ids
 
@@ -783,9 +911,11 @@ class CameraWorker:
                     current_person_id=track.person_identity_id,
                     previous_score=track.reid_score,
                     is_temporary=is_temp,
-                    face_embedding=best_face_embedding,
-                    face_score=best_face_score,
-                    face_crop_path=best_face_crop_path,
+                    face_embedding=track.best_face_embedding,
+                    face_score=track.best_face_score_for_id,
+                    face_crop_path=track.best_face_crop_path_for_id,
+                    good_face_count=track.good_face_count,
+                    face_embedding_list=track.face_embedding_list,
                 )
 
                 if is_new:
@@ -798,6 +928,28 @@ class CameraWorker:
                 track.reid_confident = is_confident
                 track.reid_resolved = True
                 track.reid_attempted = True
+
+                # Store ALL accumulated good faces (different angles) once identity is resolved.
+                # decide_identity already stored the best face, so skip the one that matches it
+                # (same embedding already in DB) to avoid duplicates.
+                if person_id and track.face_embedding_list:
+                    from app.core.db.models.person import PersonIdentity
+                    person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
+                    best_emb = track.best_face_embedding
+                    for face_emb, face_scr, face_crp in track.face_embedding_list:
+                        if face_emb is None:
+                            continue
+                        # Skip the face that decide_identity already stored (the best one)
+                        if best_emb is not None:
+                            sim_to_best = float(np.dot(best_emb, face_emb))
+                            if sim_to_best > 0.95:
+                                continue
+                        try:
+                            await self.identity_engine._store_face_embedding(
+                                db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to store additional face embedding: {e}")
 
 
 

@@ -204,8 +204,8 @@ Deletes all tracking, person identity, embedding, event, analytics and billing d
 
 ```bash
 # With confirmation prompt
-PYTHONPATH=. .venv/bin/python danger/reset_tracking_data.py
+PYTHONPATH=. venv/bin/python danger/reset_tracking_data.py
 
 # Skip prompt (scripted / CI use)
-PYTHONPATH=. .venv/bin/python danger/reset_tracking_data.py --yes
+PYTHONPATH=. venv/bin/python danger/reset_tracking_data.py --yes
 ```

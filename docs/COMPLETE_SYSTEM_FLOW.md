@@ -1,8 +1,10 @@
 # Complete System Flow: Camera Processing, ReID & Multi-Camera Synchronization
 
-**Document Version:** 1.0  
-**Last Updated:** June 30, 2026  
+**Document Version:** 2.0  
+**Last Updated:** July 6, 2026  
 **Author:** RetailAIPlatform Team
+
+> **IMPORTANT:** As of July 2026, each camera gets its own YOLO model instance (not shared) to isolate ByteTrack's `persist=True` tracking state. See `CRITICAL_FINDINGS.md` for details. The inference pool now uses `MAX_WORKERS` from config (default 10, set to 12 in `.env` for 2 cameras).
 
 ---
 

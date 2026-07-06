@@ -12,19 +12,26 @@ from typing import Optional
 
 from loguru import logger
 
+from app.config import get_settings
+
 _executor: Optional[ThreadPoolExecutor] = None
-_MAX_INFERENCE_THREADS = 2
+
+
+def _get_max_threads() -> int:
+    """Get max inference threads from settings (default 10)."""
+    return get_settings().MAX_WORKERS
 
 
 def get_inference_executor() -> ThreadPoolExecutor:
     """Get (or lazily create) the shared inference executor."""
     global _executor
     if _executor is None:
+        max_threads = _get_max_threads()
         _executor = ThreadPoolExecutor(
-            max_workers=_MAX_INFERENCE_THREADS,
+            max_workers=max_threads,
             thread_name_prefix="inference",
         )
-        logger.info(f"Inference executor started (max_workers={_MAX_INFERENCE_THREADS})")
+        logger.info(f"Inference executor started (max_workers={max_threads})")
     return _executor
 
 
