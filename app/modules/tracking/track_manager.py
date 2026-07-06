@@ -43,6 +43,7 @@ class ActiveTrack:
     best_demographics: Optional[dict] = None
     current_face_crop_path: Optional[str] = None
     current_face_score: float = 0.0
+    current_face_bbox: Optional[dict] = None
 
     # Track's best crop (body)
     best_crop_quality: float = 0.0
@@ -51,6 +52,7 @@ class ActiveTrack:
     # Track's current frame crop (for real-time quality debug)
     current_crop_quality: float = 0.0
     current_crop_path: Optional[str] = None
+    current_confidence: float = 0.0
 
     @property
     def track_age_seconds(self) -> float:
@@ -99,6 +101,7 @@ class TrackManager:
             track.last_seen_at = now
             track.total_frames += 1
             track.confidence_sum += confidence
+            track.current_confidence = confidence
 
             # Keep limited bbox history
             track.bbox_history.append(bbox)
@@ -116,6 +119,7 @@ class TrackManager:
                 bbox=bbox,
                 total_frames=1,
                 confidence_sum=confidence,
+                current_confidence=confidence,
             )
             track.bbox_history.append(bbox)
             self.tracks[local_track_id] = track

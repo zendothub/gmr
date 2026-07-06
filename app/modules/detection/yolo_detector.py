@@ -70,7 +70,7 @@ class DetectionResult:
 @dataclass
 class TrackedDetection:
     """Detection with active tracker ID."""
-    track_id: int
+    track_id: Optional[int]
     confidence: float
     bbox: dict  # {x1, y1, x2, y2}
 
@@ -192,10 +192,10 @@ class YOLODetector:
             tracked_detections = []
             for result in results:
                 boxes = result.boxes
-                if boxes is None or boxes.id is None:
+                if boxes is None:
                     continue
 
-                track_ids = boxes.id.int().cpu().tolist()
+                track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(boxes)
                 for i in range(len(boxes)):
                     track_id = track_ids[i]
                     conf = float(boxes.conf[i].item())

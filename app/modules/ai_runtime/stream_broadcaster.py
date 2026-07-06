@@ -384,7 +384,7 @@ class StreamBroadcaster:
                     continue
 
         # ----------------------------------------------------------------
-        # 2. Draw bounding boxes for each tracked person
+        # 2. Draw bounding boxes for each tracked person (+ Optional Face Box)
         # ----------------------------------------------------------------
         tracks = self.latest_tracks  # snapshot reference
         for track in tracks:
@@ -393,8 +393,89 @@ class StreamBroadcaster:
                 y1 = int(track["y1"])
                 x2 = int(track["x2"])
                 y2 = int(track["y2"])
+                confidence = float(track.get("confidence", 0.0))
+
                 # Green bounding box, 2px thick
                 cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                # Draw confidence and bbox size at top-left corner of box
+                bw = x2 - x1
+                bh = y2 - y1
+                track_id = track.get("track_id")
+                if track_id is not None:
+                    label = f"T:{track_id} C:{confidence:.2f} {bw}x{bh}"
+                else:
+                    label = f"Anon C:{confidence:.2f} {bw}x{bh}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.40
+                thickness = 1
+                (lbl_w, lbl_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+                # Semi-transparent black background behind label
+                label_y_offset = max(1, y1 - lbl_h - 4)
+                bg_overlay = display.copy()
+                cv2.rectangle(
+                    bg_overlay,
+                    (x1, label_y_offset),
+                    (x1 + lbl_w + 4, y1),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.addWeighted(bg_overlay, 0.5, display, 0.5, 0, display)
+
+                # White text on the label
+                cv2.putText(
+                    display,
+                    label,
+                    (x1 + 2, y1 - 3),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
+                # Draw Yellow/Orange Face bounding box if available
+                face_bbox = track.get("face_bbox")
+                face_score = track.get("face_score", 0.0)
+                if face_bbox is not None and face_score > 0.0:
+                    fx1 = int(face_bbox["x1"])
+                    fy1 = int(face_bbox["y1"])
+                    fx2 = int(face_bbox["x2"])
+                    fy2 = int(face_bbox["y2"])
+                    
+                    # Draw fine border for face
+                    cv2.rectangle(display, (fx1, fy1), (fx2, fy2), (0, 165, 255), 1)
+                    
+                    # Mini label under face bbox viz, e.g. "F:0.89"
+                    flabel = f"F:{face_score:.2f}"
+                    ffont = cv2.FONT_HERSHEY_SIMPLEX
+                    ffont_scale = 0.32
+                    fthickness = 1
+                    (flbl_w, flbl_h), fbaseline = cv2.getTextSize(flabel, ffont, ffont_scale, fthickness)
+                    
+                    # Highlight background behind face tag
+                    f_overlay = display.copy()
+                    cv2.rectangle(
+                        f_overlay,
+                        (fx1, fy2),
+                        (fx1 + flbl_w + 2, fy2 + flbl_h + 4),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    cv2.addWeighted(f_overlay, 0.5, display, 0.5, 0, display)
+                    
+                    # White text for face score
+                    cv2.putText(
+                        display,
+                        flabel,
+                        (fx1 + 1, fy2 + flbl_h + 2),
+                        ffont,
+                        ffont_scale,
+                        (255, 255, 255),
+                        fthickness,
+                        cv2.LINE_AA,
+                    )
             except (KeyError, ValueError, TypeError):
                 continue
 

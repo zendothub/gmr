@@ -36,6 +36,7 @@ class InsightFaceResult:
     embedding: Optional[np.ndarray] = None
     face_crop: Optional[np.ndarray] = None
     kps: Optional[np.ndarray] = None
+    face_quality: float = 0.0
 
 
 class InsightFaceAnalyzer:
@@ -162,7 +163,9 @@ class InsightFaceAnalyzer:
             from app.utils.image_utils import extract_crop
             face_crop = extract_crop(crop, face_bbox, padding_pct=0.30)
 
-            return InsightFaceResult(
+            from app.modules.reid.crop_quality import assess_face_quality
+            
+            result_obj = InsightFaceResult(
                 age=age,
                 gender=gender,
                 age_group=self._age_to_group(age),
@@ -172,6 +175,8 @@ class InsightFaceAnalyzer:
                 face_crop=face_crop,
                 kps=getattr(best_face, "kps", None)
             )
+            result_obj.face_quality = assess_face_quality(result_obj)
+            return result_obj
 
         except Exception as e:
             logger.error(f"InsightFace demographic analysis failed: {e}")

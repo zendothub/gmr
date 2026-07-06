@@ -306,33 +306,34 @@ class CameraWorker:
         observations: List[dict] = []
 
         for td in tracked_detections:
-            track = self.track_manager.update_track(td.track_id, td.bbox, td.confidence)
-            self.track_manager.update_zones(track, self.zones, width, height)
-            active_tracks.append(track)
+            if td.track_id is not None:
+                track = self.track_manager.update_track(td.track_id, td.bbox, td.confidence)
+                self.track_manager.update_zones(track, self.zones, width, height)
+                active_tracks.append(track)
 
-            if track.track_session_id is None:
-                new_tracks.append(track)
+                if track.track_session_id is None:
+                    new_tracks.append(track)
 
-            if (
-                self.reid_enabled
-                and self.reid_extractor
-                and self.identity_engine
-                and track.should_run_reid()
-            ):
-                reid_tracks.append(track)
+                if (
+                    self.reid_enabled
+                    and self.reid_extractor
+                    and self.identity_engine
+                    and track.should_run_reid()
+                ):
+                    reid_tracks.append(track)
 
-            # Sampled observation (1 per track every OBS_SAMPLE_SECONDS)
-            last_obs = self._last_obs_time.get(track.local_track_id, 0.0)
-            if now_mono - last_obs >= OBS_SAMPLE_SECONDS:
-                self._last_obs_time[track.local_track_id] = now_mono
-                observations.append(
-                    {
-                        "track": track,
-                        "bbox": dict(td.bbox),
-                        "confidence": td.confidence,
-                        "zone_ids": sorted(track.current_zones),
-                    }
-                )
+                # Sampled observation (1 per track every OBS_SAMPLE_SECONDS)
+                last_obs = self._last_obs_time.get(track.local_track_id, 0.0)
+                if now_mono - last_obs >= OBS_SAMPLE_SECONDS:
+                    self._last_obs_time[track.local_track_id] = now_mono
+                    observations.append(
+                        {
+                            "track": track,
+                            "bbox": dict(td.bbox),
+                            "confidence": td.confidence,
+                            "zone_ids": sorted(track.current_zones),
+                        }
+                    )
 
         # 4) Automatic zone event detection
         zone_events = self.zone_event_detector.detect(active_tracks)
@@ -361,7 +362,40 @@ class CameraWorker:
         self.latest_tracks.clear()
         for t in active_tracks:
             if t.bbox:
-                self.latest_tracks.append(dict(t.bbox))
+                # Use crop quality when available, fall back to YOLO confidence
+                quality = t.current_crop_quality if t.current_crop_quality > 0 else t.avg_confidence
+                
+                # Check for face bbox in body crop coordinate space, and translate it to full-frame coordinates!
+                face_bbox_full = None
+                if getattr(t, "current_face_bbox", None) is not None:
+                    # Face bbox coordinates are relative to the body crop!
+                    bx = t.bbox["x1"]
+                    by = t.bbox["y1"]
+                    face_bbox_full = {
+                        "x1": bx + t.current_face_bbox["x1"],
+                        "y1": by + t.current_face_bbox["y1"],
+                        "x2": bx + t.current_face_bbox["x2"],
+                        "y2": by + t.current_face_bbox["y2"],
+                    }
+                
+                self.latest_tracks.append({
+                    **t.bbox,
+                    "track_id": t.local_track_id,  # ByteTrack native ID
+                    "quality": quality,
+                    "confidence": getattr(t, "current_confidence", t.avg_confidence),
+                    "face_bbox": face_bbox_full,
+                    "face_score": getattr(t, "current_face_score", 0.0),
+                })
+        for td in tracked_detections:
+            if td.track_id is None:
+                self.latest_tracks.append({
+                    **td.bbox,
+                    "track_id": None,
+                    "quality": 0.0,
+                    "confidence": td.confidence,
+                    "face_bbox": None,
+                    "face_score": 0.0,
+                })
 
         # 9) Optional GUI display
         self._display_gui_frame(frame, active_tracks)
@@ -568,7 +602,11 @@ class CameraWorker:
                     logger.debug(f"Pose check failed: {pose_err}")
 
             # Assess quality (returns either a float score or a dict with detailed metrics)
-            quality_result = assess_crop_quality(crop, keypoint_visibility_ratio=keypoint_visibility_ratio)
+            quality_result = assess_crop_quality(
+                crop,
+                keypoint_visibility_ratio=keypoint_visibility_ratio,
+                yolo_confidence=track.current_confidence
+            )
             if isinstance(quality_result, dict):
                 quality = quality_result.get("quality_score", 0.0)
                 keypoint_visibility_ratio = quality_result.get("keypoint_visibility_ratio", keypoint_visibility_ratio)
@@ -577,7 +615,7 @@ class CameraWorker:
                 size_score = quality_result.get("size_score")
                 aspect_ratio = quality_result.get("aspect_ratio")
                 brightness_mean = quality_result.get("brightness_mean")
-                quality_passed = quality_result.get("quality_passed", quality >= self.settings.REID_CROP_QUALITY_THRESHOLD)
+                quality_passed = quality >= self.settings.REID_CROP_QUALITY_THRESHOLD
             else:
                 quality = float(quality_result)
                 quality_passed = quality >= self.settings.REID_CROP_QUALITY_THRESHOLD
@@ -600,6 +638,7 @@ class CameraWorker:
             
             track.current_face_crop_path = None
             track.current_face_score = 0.0
+            track.current_face_bbox = None
             if self.demographic_enabled and self.insightface_analyzer:
                 face_result = await run_inference(self.insightface_analyzer.analyze, crop)
                 if face_result:
@@ -608,7 +647,8 @@ class CameraWorker:
                     if face_result.face_crop is not None:
                         current_face_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
                     track.current_face_crop_path = current_face_path
-                    track.current_face_score = face_result.face_score
+                    track.current_face_score = face_result.face_quality
+                    track.current_face_bbox = face_result.face_bbox
                     
                     track.face_analysis_count += 1
                     
@@ -971,6 +1011,13 @@ class CameraWorker:
                     age_group = track.best_demographics.get("age_group")
                     if gender and age_group:
                         label_parts.append(f"{gender}, {age_group}")
+
+                # Confidence and bbox size
+                conf = getattr(track, "current_confidence", track.avg_confidence)
+                bw = x2 - x1
+                bh = y2 - y1
+                label_parts.append(f"C:{conf:.2f}")
+                label_parts.append(f"{bw}x{bh}")
                 
                 label = " | ".join(label_parts)
                 
@@ -989,6 +1036,32 @@ class CameraWorker:
                     1,
                     cv2.LINE_AA,
                 )
+
+            # 3. Draw untracked detections in local GUI
+            for td in tracked_detections:
+                if td.track_id is None:
+                    try:
+                        x1 = int(td.bbox["x1"])
+                        y1 = int(td.bbox["y1"])
+                        x2 = int(td.bbox["x2"])
+                        y2 = int(td.bbox["y2"])
+                        color = (128, 128, 128)  # Grey for untracked/anonymous detections
+                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                        label = f"Anonymous C:{td.confidence:.2f}"
+                        (lbl_w, lbl_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                        cv2.rectangle(display_frame, (x1, y1 - lbl_h - 6), (x1 + lbl_w + 4, y1), color, -1)
+                        cv2.putText(
+                            display_frame,
+                            label,
+                            (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                    except Exception:
+                        continue
 
             # Show frame
             window_title = f"Camera Stream - {self.camera_id}"

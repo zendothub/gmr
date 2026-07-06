@@ -1,9 +1,9 @@
 {
-  "device": "cpu",
-  "cuda_available": false,
+  "device": "cuda",
+  "cuda_available": true,
   "mps_available": false,
-  "cuda_device_name": null,
-  "cuda_device_count": 0,
+  "cuda_device_name": "NVIDIA GeForce RTX 4070 Ti",
+  "cuda_device_count": 1,
   "torch_version": "2.6.0+cu124",
-  "detected_at": "2026-07-03T11:19:49.193728+00:00"
+  "detected_at": "2026-07-06T09:21:00.836821+00:00"
 }
