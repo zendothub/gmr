@@ -1,5 +1,6 @@
 """Image utility functions for crop extraction and frame processing."""
 
+import asyncio
 import io
 import uuid
 from datetime import datetime
@@ -82,6 +83,17 @@ def save_image(image: np.ndarray, directory: str, prefix: str = "img") -> Option
     except Exception as e:
         logger.error(f"Failed to upload image: {e}")
         return None
+
+
+async def save_image_async(image: np.ndarray, directory: str, prefix: str = "img") -> Optional[str]:
+    """Async wrapper: run JPEG encode + MinIO upload in a background thread.
+
+    Offloads the synchronous ``cv2.imencode`` and MinIO HTTP PUT from the
+    FastAPI event-loop thread so that high-throughput frame processing does
+    not starve HTTP request handlers (login, debug, analytics).
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, save_image, image, directory, prefix)
 
 
 def frame_to_jpeg_bytes(frame: np.ndarray, quality: int = 80) -> Optional[bytes]:

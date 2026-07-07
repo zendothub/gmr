@@ -30,7 +30,7 @@ from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
-from app.utils.image_utils import extract_crop, save_image
+from app.utils.image_utils import extract_crop, save_image, save_image_async
 
 from app.utils.time_utils import utc_now
 from app.utils.geometry import polygon_from_json
@@ -309,7 +309,7 @@ class CameraWorker:
         for td in tracked_detections:
             if td.track_id is not None:
                 track = self.track_manager.update_track(td.track_id, td.bbox, td.confidence)
-                self.track_manager.update_zones(track, self.zones, width, height)
+                await asyncio.to_thread(self.track_manager.update_zones, track, self.zones, width, height)
                 active_tracks.append(track)
 
                 if track.track_session_id is None:
@@ -476,9 +476,9 @@ class CameraWorker:
 
         # Extract initial crop
         crop_path = None
-        crop = extract_crop(frame, track.bbox)
+        crop = await asyncio.to_thread(extract_crop, frame, track.bbox)
         if crop is not None and crop.size > 0:
-            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
+            crop_path = await save_image_async(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
             track.best_crop_path = crop_path
             # Initial quality is 0, will be overwritten if ReID runs
 
@@ -721,7 +721,7 @@ class CameraWorker:
                 if _prev_body_crop not in _accum_body_paths and _prev_body_crop != track.best_crop_path:
                     self._minio_cleanup(_prev_body_crop)
 
-            crop = extract_crop(frame, track.bbox)
+            crop = await asyncio.to_thread(extract_crop, frame, track.bbox)
             if crop is None or crop.size == 0:
                 logger.warning(f"Track {track.local_track_id}: Failed to extract crop from bounding box.")
                 return
@@ -749,10 +749,11 @@ class CameraWorker:
                     logger.debug(f"Pose check failed: {pose_err}")
 
             # Assess quality (returns either a float score or a dict with detailed metrics)
-            quality_result = assess_crop_quality(
+            quality_result = await asyncio.to_thread(
+                assess_crop_quality,
                 crop,
                 keypoint_visibility_ratio=keypoint_visibility_ratio,
-                yolo_confidence=track.current_confidence
+                yolo_confidence=track.current_confidence,
             )
             if isinstance(quality_result, dict):
                 quality = quality_result.get("quality_score", 0.0)
@@ -774,7 +775,7 @@ class CameraWorker:
             h, w = crop.shape[:2]
 
             # Save crop for audit / debugging (MUST be before any debug log that references crop_path)
-            crop_path = save_image(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
+            crop_path = await save_image_async(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
 
             # Run demographics / face detection on all crops first (regardless of body quality)
             face_embedding = None
@@ -795,7 +796,7 @@ class CameraWorker:
                     # Save current frame's detected face crop for real-time debug
                     current_face_path = None
                     if face_result.face_crop is not None:
-                        current_face_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
+                        current_face_path = await save_image_async(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
                     track.current_face_crop_path = current_face_path
                     # Delete the previous curr_face file — it has been replaced
                     if _prev_curr_face and _prev_curr_face != current_face_path:
@@ -905,7 +906,7 @@ class CameraWorker:
                             # a clean frontal detection always ranks higher than an angled one.
                             face_score = face_result.face_quality
                             if face_result.face_crop is not None:
-                                face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
+                                face_crop_path = await save_image_async(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
 
                             if (track.best_demographics is None or
                                     face_score > track.best_demographics.get("face_score", 0.0)):
@@ -1164,7 +1165,7 @@ class CameraWorker:
         from app.core.db.models.event import Event, EventSeverity
         from app.core.db.models.billing import BillingInteraction
 
-        snapshot_path = save_image(frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}")
+        snapshot_path = await save_image_async(frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}")
 
         for ev in rule_events:
             try:
