@@ -159,28 +159,80 @@ def assess_crop_quality(
 
 def assess_face_quality(face_result) -> float:
     """
-    Assess face quality based on face detection score and keypoint visibility.
-    In InsightFace, kps array of shape (5, 2) lists:
-    0: left_eye, 1: right_eye, 2: nose, 3: left_mouth_corner, 4: right_mouth_corner
+    Assess face quality combining detection score AND geometric frontality.
+
+    Frontality is derived from InsightFace's 5-point keypoints:
+      0: left_eye   1: right_eye   2: nose
+      3: left_mouth_corner         4: right_mouth_corner
+
+    Frontality signals:
+      1. Eye spread  = |right_eye_x - left_eye_x| / face_width
+         Frontal ≈ 0.35+, profile ≈ 0.0–0.10
+      2. Nose centering = 1 - 2*|nose_x - face_cx| / face_width
+         Frontal ≈ 1.0, profile ≈ 0.0–0.5
+      3. Eye symmetry = 1 - |left_eye_y - right_eye_y| / face_height
+         Frontal ≈ 1.0 (eyes level), tilted ≈ lower
+
+    Final formula:
+      quality = (1 - FRONTALITY_WEIGHT) * det_score
+              + FRONTALITY_WEIGHT       * frontality_score
+
+    Settings reference: FACE_FRONTALITY_WEIGHT (default 0.35)
     """
     try:
         if face_result is None:
             return 0.0
-        
-        score = face_result.face_score
-        
-        # Robust check: are both eyes detected and separated horizontally?
-        if face_result.kps is not None and len(face_result.kps) >= 2:
-            left_eye = face_result.kps[0]
-            right_eye = face_result.kps[1]
-            
-            # Distance between eyes should be a positive, healthy number in horizontal plane
-            eye_dist = abs(right_eye[0] - left_eye[0])
-            if eye_dist > 5:
-                # Up weight slightly if eyes are clearly visible and well-structured
-                return round(min(1.0, score * 1.1), 3)
-                
-        return round(score, 3)
+
+        det_score = float(face_result.face_score)
+
+        # ── Frontality from keypoints ────────────────────────────────────────
+        kps = face_result.kps
+        bbox = face_result.face_bbox
+        frontality_score = 0.5  # neutral default when kps unavailable
+
+        if kps is not None and len(kps) >= 5 and bbox:
+            import numpy as np
+
+            face_w = max(float(bbox["x2"]) - float(bbox["x1"]), 1.0)
+            face_h = max(float(bbox["y2"]) - float(bbox["y1"]), 1.0)
+            face_cx = (float(bbox["x1"]) + float(bbox["x2"])) / 2.0
+
+            lx, ly = float(kps[0][0]), float(kps[0][1])   # left eye
+            rx, ry = float(kps[1][0]), float(kps[1][1])   # right eye
+            nx     = float(kps[2][0])                       # nose x
+
+            # 1. Eye horizontal spread (normalised by face width)
+            #    Frontal → ~0.35–0.50+;  profile → ~0.0–0.10
+            eye_spread = abs(rx - lx) / face_w
+            spread_score = min(1.0, eye_spread / 0.35)   # saturates at 0.35+
+
+            # 2. Nose horizontal centering (1.0 = perfectly centred)
+            nose_offset = abs(nx - face_cx) / (face_w / 2.0)   # 0 = centred, 1 = edge
+            nose_score = max(0.0, 1.0 - nose_offset)
+
+            # 3. Eye vertical symmetry (both eyes at same height → frontal)
+            eye_vert_diff = abs(ry - ly) / face_h
+            sym_score = max(0.0, 1.0 - eye_vert_diff * 4.0)     # weight strongly
+
+            # Combine: spread is the strongest indicator of frontality
+            frontality_score = 0.55 * spread_score + 0.30 * nose_score + 0.15 * sym_score
+
+        elif kps is not None and len(kps) >= 2 and bbox:
+            # Fallback: only eyes available
+            import numpy as np
+            face_w = max(float(bbox["x2"]) - float(bbox["x1"]), 1.0)
+            lx = float(kps[0][0])
+            rx = float(kps[1][0])
+            eye_spread = abs(rx - lx) / face_w
+            frontality_score = min(1.0, eye_spread / 0.35)
+
+        # ── Weighted combination ─────────────────────────────────────────────
+        from app.config import get_settings
+        fw = get_settings().FACE_FRONTALITY_WEIGHT   # default 0.35
+        quality = (1.0 - fw) * det_score + fw * frontality_score
+
+        return round(min(1.0, max(0.0, quality)), 3)
+
     except Exception as e:
         logger.debug(f"Face quality assessment failed: {e}")
         return 0.0

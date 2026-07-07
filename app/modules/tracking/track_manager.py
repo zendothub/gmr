@@ -41,6 +41,7 @@ class ActiveTrack:
     # Demographics and Face crop tracking
     face_analysis_count: int = 0
     best_demographics: Optional[dict] = None
+    gender_votes: dict = field(default_factory=lambda: {"M": 0, "F": 0})  # majority voting across frontal faces
     current_face_crop_path: Optional[str] = None
     current_face_score: float = 0.0
     current_face_bbox: Optional[dict] = None

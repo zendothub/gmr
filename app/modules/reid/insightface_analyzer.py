@@ -29,14 +29,16 @@ def get_shared_analyzer(model_name: Optional[str] = None) -> "InsightFaceAnalyze
 class InsightFaceResult:
     """Demographics and recognition result for a face."""
     age: int
-    gender: str  # "M" or "F"
-    age_group: str  # "child", "young_adult", "adult", "senior"
-    face_score: float
-    face_bbox: dict  # {"x1", "y1", "x2", "y2"}
+    gender: str        # "M" or "F"
+    age_group: str     # "child", "young_adult", "adult", "senior"
+    face_score: float  # InsightFace raw detection confidence
+    face_bbox: dict    # {"x1", "y1", "x2", "y2"}
     embedding: Optional[np.ndarray] = None
     face_crop: Optional[np.ndarray] = None
     kps: Optional[np.ndarray] = None
-    face_quality: float = 0.0
+    face_quality: float = 0.0      # composite quality (det_score × frontality)
+    frontality_score: float = 0.0  # 0 = profile, 1 = perfectly frontal
+    eye_spread: float = 0.0        # normalised eye-to-eye horizontal distance
 
 
 class InsightFaceAnalyzer:
@@ -131,14 +133,37 @@ class InsightFaceAnalyzer:
                 logger.debug(f"InsightFace: no faces passed heuristics from {len(faces)} detected")
                 return None
 
-            # Select the face whose horizontal centre is closest to the crop's vertical centreline.
-            # This ensures the tracked person's face wins over an adjacent person's face in
-            # close-range scenarios, regardless of detection confidence scores.
-            crop_cx = w / 2
-            best_face = min(
-                valid_faces,
-                key=lambda f: abs((f.bbox[0] + f.bbox[2]) / 2 - crop_cx)
-            )
+            # Select the best face using a multi-signal heuristic that favours
+            # the TRACKED person's own face and penalises adjacent-person contamination.
+            # Signals: face size (large = own face), centreline proximity, upper-position,
+            # detection confidence.
+            #
+            # Old logic (removed): face closest to crop horizontal centre wins.
+            # This failed when two people stood shoulder-to-shoulder — the adjacent
+            # person's face could appear more centred in the tracked person's crop.
+            def _face_score(f) -> float:
+                f_x1, f_y1, f_x2, f_y2 = f.bbox
+                f_cx = (f_x1 + f_x2) / 2.0
+                f_w  = f_x2 - f_x1
+                f_h  = f_y2 - f_y1
+                face_area = f_w * f_h
+                crop_area  = w * h
+
+                # Larger face relative to crop → more likely tracked person's own face
+                size_score = min(1.0, face_area / (crop_area * 0.08))
+                # Closer to horizontal centre
+                centre_dev = abs(f_cx - w / 2.0) / (w / 2.0)
+                centre_score = max(0.0, 1.0 - centre_dev)
+                # Face should be in the upper region of the body crop
+                f_cy = (f_y1 + f_y2) / 2.0
+                upper_score = max(0.0, 1.0 - f_cy / (h * 0.40))
+
+                # Weighted geometric score × detection confidence
+                geo = 0.40 * size_score + 0.35 * centre_score + 0.25 * upper_score
+                return float(f.det_score) * geo
+
+            crop_cx = w / 2.0
+            best_face = max(valid_faces, key=_face_score)
             logger.debug(
                 f"InsightFace: selected face at x_center "
                 f"{(best_face.bbox[0] + best_face.bbox[2]) / 2:.1f} "
@@ -153,18 +178,20 @@ class InsightFaceAnalyzer:
                 "x2": float(bbox[2]),
                 "y2": float(bbox[3]),
             }
-            
+
             age = int(best_face.age)
             # InsightFace: gender=1 for Male, gender=0 for Female
             gender_val = getattr(best_face, "gender", -1)
             gender = "M" if gender_val == 1 else "F"
-            
+
             # Extract face crop with 30% padding for better face recognition
             from app.utils.image_utils import extract_crop
             face_crop = extract_crop(crop, face_bbox, padding_pct=0.30)
 
             from app.modules.reid.crop_quality import assess_face_quality
-            
+
+            kps = getattr(best_face, "kps", None)
+
             result_obj = InsightFaceResult(
                 age=age,
                 gender=gender,
@@ -173,9 +200,45 @@ class InsightFaceAnalyzer:
                 face_bbox=face_bbox,
                 embedding=getattr(best_face, "embedding", None),
                 face_crop=face_crop,
-                kps=getattr(best_face, "kps", None)
+                kps=kps,
             )
+
+            # Compute frontality metrics from keypoints before calling assess_face_quality
+            # so that the quality function can read them via result_obj.kps / result_obj.face_bbox
+            if kps is not None and len(kps) >= 2:
+                face_w = max(face_bbox["x2"] - face_bbox["x1"], 1.0)
+                lx = float(kps[0][0])
+                rx = float(kps[1][0])
+                result_obj.eye_spread = abs(rx - lx) / face_w
+            else:
+                result_obj.eye_spread = 0.0
+
             result_obj.face_quality = assess_face_quality(result_obj)
+
+            # Recompute frontality_score and expose it for camera_worker to use
+            # as the gating value (replaces the disabled FACE_MIN_EYE_SPREAD check)
+            face_w = max(face_bbox["x2"] - face_bbox["x1"], 1.0)
+            face_h = max(face_bbox["y2"] - face_bbox["y1"], 1.0)
+            face_cx = (face_bbox["x1"] + face_bbox["x2"]) / 2.0
+            if kps is not None and len(kps) >= 5:
+                spread_score = min(1.0, result_obj.eye_spread / 0.35)
+                nose_cx = float(kps[2][0])
+                nose_offset = abs(nose_cx - face_cx) / (face_w / 2.0)
+                nose_score = max(0.0, 1.0 - nose_offset)
+                eye_vert_diff = abs(float(kps[1][1]) - float(kps[0][1])) / face_h
+                sym_score = max(0.0, 1.0 - eye_vert_diff * 4.0)
+                result_obj.frontality_score = 0.55 * spread_score + 0.30 * nose_score + 0.15 * sym_score
+            elif kps is not None and len(kps) >= 2:
+                result_obj.frontality_score = min(1.0, result_obj.eye_spread / 0.35)
+            else:
+                result_obj.frontality_score = 0.5  # unknown
+
+            logger.debug(
+                f"InsightFace: det={result_obj.face_score:.2f}  "
+                f"eye_spread={result_obj.eye_spread:.2f}  "
+                f"frontality={result_obj.frontality_score:.2f}  "
+                f"quality={result_obj.face_quality:.2f}"
+            )
             return result_obj
 
         except Exception as e:

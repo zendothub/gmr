@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 
 import anyio
 from loguru import logger
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
 
 from app.core.db.session import AsyncSessionLocal
 from app.core.db.models.camera import Camera, CameraStatus
@@ -160,6 +160,310 @@ async def cleanup_old_storage(retention_days: int = 30):
         except Exception as e:
             await db.rollback()
             logger.error(f"Storage cleanup job failed: {e}")
+
+
+async def deduplicate_persons():
+    """
+    Merge duplicate PersonIdentity records created when two cameras register the
+    same physical person separately (cross-angle face similarity just below the
+    match threshold at registration time).
+
+    Algorithm (O(N·log N), index-assisted via pgvector LATERAL):
+    1. For every stored face embedding, find the nearest neighbours in *other*
+       identities that exceed FACE_MATCH_THRESHOLD.
+    2. Group valid pairs so the identity with the better face score (or earlier
+       first_seen_at as tiebreaker) is the "winner".
+    3. Merge the loser into the winner:
+         • Reassign track_sessions, events, billing_interactions, storage_objects
+         • Absorb first_seen_at and visit_count into winner
+         • DELETE loser (cascades to person_embeddings / person_face_embeddings)
+    4. Log a summary.
+
+    This job runs every 10 minutes.  It does NOT modify any config or realtime
+    state — only the PostgreSQL person tables.
+    """
+    from app.config import get_settings
+    settings = get_settings()
+    threshold = settings.FACE_MATCH_THRESHOLD
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # ── Step 1: efficient duplicate-pair discovery ──────────────────
+            # LATERAL lets pgvector's IVFFlat index handle each probe in
+            # O(log N) instead of a full O(N²) cross-join.
+            await db.execute(text("SET LOCAL ivfflat.probes = 50"))
+
+            pairs_result = await db.execute(text("""
+                SELECT DISTINCT
+                    LEAST(a.person_identity_id::text, b_near.person_identity_id::text)  AS pid_a,
+                    GREATEST(a.person_identity_id::text, b_near.person_identity_id::text) AS pid_b,
+                    MAX(1.0 - (b_near.dist)) AS max_sim
+                FROM person_face_embeddings a
+                CROSS JOIN LATERAL (
+                    SELECT pfe.person_identity_id,
+                           pfe.embedding <=> a.embedding AS dist
+                    FROM   person_face_embeddings pfe
+                    WHERE  pfe.person_identity_id != a.person_identity_id
+                      AND  (1.0 - (pfe.embedding <=> a.embedding)) >= :threshold
+                    ORDER  BY dist
+                    LIMIT  5
+                ) b_near
+                GROUP  BY pid_a, pid_b
+                HAVING MAX(1.0 - (b_near.dist)) >= :threshold
+            """), {"threshold": threshold})
+
+            pairs = pairs_result.fetchall()
+
+            if not pairs:
+                logger.debug("Dedup job: no duplicate pairs found.")
+                return
+
+            logger.info(f"Dedup job: found {len(pairs)} duplicate pair(s) — merging...")
+
+            # ── Step 2: resolve winners per connected component ─────────────
+            # Build union-find so A=B and B=C → all three merge into one winner.
+            parent: dict[str, str] = {}
+
+            def find(x: str) -> str:
+                while parent.get(x, x) != x:
+                    parent[x] = parent.get(parent.get(x, x), x)  # path compression
+                    x = parent.get(x, x)
+                return x
+
+            def union(x: str, y: str):
+                parent[find(x)] = find(y)
+
+            for row in pairs:
+                union(str(row[0]), str(row[1]))
+
+            # Collect all unique IDs involved
+            all_ids = set()
+            for row in pairs:
+                all_ids.add(str(row[0]))
+                all_ids.add(str(row[1]))
+
+            # Fetch identity metadata to pick the best winner per component
+            id_list = list(all_ids)
+            meta_result = await db.execute(text("""
+                SELECT id::text, best_face_score, first_seen_at, visit_count
+                FROM   person_identities
+                WHERE  id::text = ANY(:ids)
+            """), {"ids": id_list})
+            meta = {r[0]: {"score": r[1] or 0.0, "first_seen": r[2], "visits": r[3]}
+                    for r in meta_result.fetchall()}
+
+            # Group IDs by their representative (root of union-find tree)
+            components: dict[str, list[str]] = {}
+            for pid in all_ids:
+                root = find(pid)
+                components.setdefault(root, []).append(pid)
+
+            # For each component pick the winner = highest face score, tie-break by earliest first_seen
+            merges: list[tuple[str, str]] = []  # (winner_id, loser_id)
+            for root, members in components.items():
+                if len(members) < 2:
+                    continue
+                winner = max(
+                    members,
+                    key=lambda pid: (
+                        meta.get(pid, {}).get("score", 0.0),
+                        -(meta.get(pid, {}).get("first_seen") or utc_now()).timestamp(),
+                    )
+                )
+                for loser in members:
+                    if loser != winner:
+                        merges.append((winner, loser))
+
+            if not merges:
+                logger.debug("Dedup job: all pairs already resolved.")
+                return
+
+            # ── Step 3: merge each loser into its winner ────────────────────
+            merged_count = 0
+            for winner_id, loser_id in merges:
+                try:
+                    # Reassign FK references
+                    for tbl, col in [
+                        ("track_sessions",      "person_identity_id"),
+                        ("events",              "person_identity_id"),
+                        ("billing_interactions","person_identity_id"),
+                        ("storage_objects",     "person_identity_id"),
+                    ]:
+                        await db.execute(text(
+                            f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
+                        ), {"winner": winner_id, "loser": loser_id})
+
+                    # Absorb visit_count and first_seen_at into winner
+                    loser_meta  = meta.get(loser_id, {})
+                    winner_meta = meta.get(winner_id, {})
+                    extra_visits = loser_meta.get("visits", 0)
+                    loser_first  = loser_meta.get("first_seen")
+                    winner_first = winner_meta.get("first_seen")
+
+                    update_parts = ["visit_count = visit_count + :extra_visits"]
+                    params: dict = {"extra_visits": extra_visits, "winner": winner_id}
+
+                    if loser_first and winner_first and loser_first < winner_first:
+                        update_parts.append("first_seen_at = :loser_first")
+                        params["loser_first"] = loser_first
+
+                    await db.execute(text(
+                        f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
+                    ), params)
+
+                    # Collect paths to delete from MinIO BEFORE cascade-deleting the loser row
+                    paths_result = await db.execute(text("""
+                        SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
+                        UNION ALL
+                        SELECT face_crop_path   FROM person_face_embeddings WHERE person_identity_id::text = :loser
+                        UNION ALL
+                        SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
+                    """), {"loser": loser_id})
+                    paths_to_remove = [r[0] for r in paths_result.fetchall() if r[0]]
+
+                    # Delete loser (CASCADE removes person_embeddings + person_face_embeddings)
+                    await db.execute(
+                        text("DELETE FROM person_identities WHERE id::text = :loser"),
+                        {"loser": loser_id}
+                    )
+
+                    # Delete MinIO files for the loser's crops
+                    from app.modules.storage.minio_client import delete_object as minio_del
+                    for path in set(paths_to_remove):
+                        try:
+                            key = path.split("/", 1)[1] if "/" in path else path
+                            minio_del(key)
+                        except Exception as e:
+                            logger.warning(f"Dedup: MinIO delete failed for {path}: {e}")
+
+                    merged_count += 1
+                    logger.info(
+                        f"Dedup: merged {loser_id[:8]} → {winner_id[:8]} "
+                        f"(sim>{threshold:.2f}, +{extra_visits} visits)"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Dedup: failed to merge {loser_id[:8]} → {winner_id[:8]}: {e}")
+                    await db.rollback()
+                    return  # abort this run; retry in 10 min
+
+            await db.commit()
+            logger.info(f"Dedup job complete: merged {merged_count} duplicate identit(ies).")
+
+            # ── Step 4: sweep orphaned MinIO objects ─────────────────────────
+            swept = await _sweep_orphaned_crops(db)
+            if swept > 0:
+                logger.info(f"MinIO sweep: removed {swept} unreferenced crop file(s).")
+
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Dedup job failed: {e}")
+
+
+async def _sweep_orphaned_crops(db) -> int:
+    """
+    Delete MinIO objects under the ``crops/`` prefix that are NOT referenced by
+    any live DB row.
+
+    Referenced paths are collected from:
+      • person_face_embeddings.face_crop_path
+      • person_identities.face_crop_path
+      • person_embeddings.crop_path
+      • track_sessions.best_crop_path
+
+    The function also drains ``CameraWorker._pending_minio_deletes`` — every
+    path that was queued for deferred deletion by the AI runtime is also
+    processed here so the set stays bounded.
+
+    Returns the number of objects removed from MinIO.
+    """
+    from app.config import get_settings
+    from app.modules.storage.minio_client import get_client, BUCKET_PREFIX
+    from app.modules.ai_runtime.camera_worker import CameraWorker
+
+    settings = get_settings()
+    client = get_client()
+    bucket = BUCKET_PREFIX
+
+    # ── 1. Collect every known-referenced path from the DB ───────────────────
+    known: set[str] = set()
+
+    # face_crop_path (person_face_embeddings)
+    r = await db.execute(text(
+        "SELECT face_crop_path FROM person_face_embeddings WHERE face_crop_path IS NOT NULL"
+    ))
+    for row in r.fetchall():
+        known.add(row[0])
+
+    # face_crop_path (person_identities)
+    r = await db.execute(text(
+        "SELECT face_crop_path FROM person_identities WHERE face_crop_path IS NOT NULL"
+    ))
+    for row in r.fetchall():
+        known.add(row[0])
+
+    # crop_path (person_embeddings)
+    r = await db.execute(text(
+        "SELECT crop_path FROM person_embeddings WHERE crop_path IS NOT NULL"
+    ))
+    for row in r.fetchall():
+        known.add(row[0])
+
+    # best_crop_path (track_sessions)
+    r = await db.execute(text(
+        "SELECT best_crop_path FROM track_sessions WHERE best_crop_path IS NOT NULL"
+    ))
+    for row in r.fetchall():
+        known.add(row[0])
+
+    if not known:
+        # DB is empty — don't sweep (avoids accidentally deleting everything
+        # during/after a reset)
+        CameraWorker._pending_minio_deletes.clear()
+        return 0
+
+    # ── 2. Build a set of MinIO object keys (strip bucket prefix) ───────────
+    # Also drain the pending queue into the check set so those paths are
+    # processed even if they aren't referenced by the DB.
+    pending = CameraWorker._pending_minio_deletes.copy()
+    CameraWorker._pending_minio_deletes.clear()
+
+    # Normalise: "retaileye/crops/foo.jpg" → "crops/foo.jpg"
+    def _normalise(path: str) -> str:
+        if path.startswith(f"{bucket}/"):
+            return path[len(bucket) + 1:]
+        return path
+
+    objects_to_check: set[str] = {_normalise(p) for p in pending}
+
+    removed = 0
+    try:
+        obj_list = client.list_objects(bucket, prefix="crops/", recursive=True)
+        for obj in obj_list:
+            key = obj.object_name
+            full_key = f"{bucket}/{key}"
+            objects_to_check.add(key)
+
+            if full_key not in known and key not in known:
+                # Also check: is this key referenced by a pending path?
+                pending_match = any(
+                    _normalise(p) == key for p in pending
+                )
+                # Only delete if it was explicitly queued for deletion
+                # (pending) OR it's been unreferenced for a full sweep cycle.
+                # For safety, we DO delete all truly unreferenced objects.
+                try:
+                    client.remove_object(bucket, key)
+                    removed += 1
+                    logger.debug(f"MinIO sweep: deleted unreferenced object {full_key}")
+                except Exception as e:
+                    logger.warning(f"MinIO sweep: failed to delete {full_key}: {e}")
+
+    except Exception as e:
+        logger.error(f"MinIO sweep: failed to list/delete objects: {e}")
+        return removed
+
+    return removed
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ from app.modules.jobs.tasks import (
     close_stale_track_sessions,
     cleanup_old_storage,
     probe_camera_statuses,
+    deduplicate_persons,
 )
 
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -64,8 +65,18 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Periodic person-identity deduplication every 10 minutes.
+    # Merges identities that were registered separately by different cameras for
+    # the same physical person (cross-angle face similarity just below threshold).
+    _scheduler.add_job(
+        deduplicate_persons,
+        IntervalTrigger(minutes=10),
+        id="deduplicate_persons",
+        replace_existing=True,
+    )
+
     _scheduler.start()
-    logger.info("Background job scheduler started (4 jobs registered)")
+    logger.info("Background job scheduler started (5 jobs registered)")
     return _scheduler
 
 

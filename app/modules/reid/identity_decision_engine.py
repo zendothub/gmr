@@ -61,17 +61,20 @@ class IdentityDecisionEngine:
             used_face = False
             
             # === FACE CONTRADICTION GATE ===
-            # Check if current_person_id face embeddings contradict track face
+            # Check if current_person_id face embeddings contradict track face.
+            # Uses FACE_CONTRADICTION_THRESHOLD (0.25) — much lower than the match
+            # threshold so that same-person cross-angle similarity (0.40-0.47) does NOT
+            # trigger disassociation.  Only truly different faces (< 0.25) disassociate.
             current_id_contradicted = False
             if current_person_id is not None and face_embedding is not None:
                 current_faces = await self._get_person_face_embeddings(db, current_person_id)
                 if current_faces:
                     best_face_sim = max(float(np.dot(f, face_embedding)) for f in current_faces)
-                    if best_face_sim < self.settings.FACE_MATCH_THRESHOLD:
+                    if best_face_sim < self.settings.FACE_CONTRADICTION_THRESHOLD:
                         current_id_contradicted = True
                         logger.warning(
                             f"[CONTRADICTION] Current ID {str(current_person_id)[:8]} face contradicts track face! "
-                            f"BestSim={best_face_sim:.3f} < {self.settings.FACE_MATCH_THRESHOLD}"
+                            f"BestSim={best_face_sim:.3f} < {self.settings.FACE_CONTRADICTION_THRESHOLD}"
                         )
             
             # Step 1: Face matching (highest priority)
@@ -98,29 +101,29 @@ class IdentityDecisionEngine:
                             used_face = True
                             logger.info(f"[Face Match] Score: {face_sim:.3f}, Person: {str(face_candidate['person_identity_id'])[:8]}")
 
-            # Step 2: Fallback to Body ReID matching (with face contradiction gate)
-            skip_body_reid = False
-            if face_embedding is not None and not used_face:
-                if face_score >= self.settings.FACE_SEARCH_THRESHOLD:
-                    skip_body_reid = True
-                    logger.info(f"High-quality face (score: {face_score:.2f}) did not match in database. Skipping body ReID to avoid false merges.")
-
-            if not used_face and not skip_body_reid and mean_embedding is not None:
+            # Step 2: Fallback to Body ReID matching (with face contradiction gate).
+            # skip_body_reid logic intentionally removed — high-quality face that misses
+            # in face search (cross-angle, same person) should still fall through to body
+            # ReID rather than creating a duplicate identity.
+            if not used_face and mean_embedding is not None:
                 # Search for similar embeddings using pgvector cosine distance (limit 5 candidates)
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
                     
-                    # === FACE CONTRADICTION GATE FOR BODY MATCHING ===
-                    # Skip candidates whose faces contradict the track's face
+                    # === FACE BODY-EXCLUSION GATE ===
+                    # Skip body candidates whose faces definitely contradict the track face.
+                    # Uses FACE_BODY_EXCLUSION_THRESHOLD (0.30) — more permissive than the
+                    # match threshold so that same-person cross-angle similarity (0.40-0.47)
+                    # does NOT exclude a valid body candidate.
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
                         if candidate_faces:
                             best_f_sim = max(float(np.dot(f, face_embedding)) for f in candidate_faces)
-                            if best_f_sim < self.settings.FACE_MATCH_THRESHOLD:
+                            if best_f_sim < self.settings.FACE_BODY_EXCLUSION_THRESHOLD:
                                 logger.debug(
                                     f"[Body Match] Candidate {str(candidate_id)[:8]} EXCLUDED due to face contradiction "
-                                    f"(BestFaceSim={best_f_sim:.3f} < {self.settings.FACE_MATCH_THRESHOLD})"
+                                    f"(BestFaceSim={best_f_sim:.3f} < {self.settings.FACE_BODY_EXCLUSION_THRESHOLD})"
                                 )
                                 continue  # Skip this candidate
                     
@@ -234,6 +237,16 @@ class IdentityDecisionEngine:
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
                             await self._delete_person(db, prune_old_id, matched_id)
+                        elif not is_temporary:
+                            # Even for confident (non-temporary) identities, if the old identity
+                            # has no other active track sessions it is effectively orphaned.
+                            # Mark it for cleanup by the periodic dedup job — don't hard-delete
+                            # here because another camera may still reference it.
+                            logger.info(
+                                f"[ReID Refined] Non-temporary ID {str(current_person_id)[:8]} superseded by "
+                                f"{str(matched_id)[:8]} (score={best_similarity:.3f}). "
+                                f"Old identity left for dedup job to clean up."
+                            )
                             
                         raw_confident = (best_similarity >= confidence_limit)
                         is_confident = raw_confident and used_face
@@ -458,9 +471,46 @@ class IdentityDecisionEngine:
 
         Multiple face embeddings per person capture different angles and lighting
         conditions. Low-quality embeddings are pruned when the cap is exceeded.
+
+        Duplication guard: if this face_crop_path is already stored for this person,
+        the existing row's score and embedding are updated (upgraded if the new score
+        is higher) instead of creating a redundant row.  This prevents the per-window
+        accumulation pipeline from inserting the same crop 5+ times.
         """
         try:
             from app.core.db.models.person import PersonFaceEmbedding
+
+            # ── Dedup by crop path ─────────────────────────────────────────
+            if face_crop_path:
+                existing_result = await db.execute(text(
+                    "SELECT id, face_score FROM person_face_embeddings"
+                    " WHERE person_identity_id = :pid AND face_crop_path = :path"
+                    " ORDER BY face_score DESC LIMIT 1"
+                ), {"pid": str(person_id), "path": face_crop_path})
+                existing_row = existing_result.fetchone()
+                if existing_row:
+                    existing_score = float(existing_row[1]) if existing_row[1] else 0.0
+                    if face_score > existing_score:
+                        # Upgrade the existing row's score + embedding
+                        await db.execute(text(
+                            "UPDATE person_face_embeddings"
+                            " SET face_score = :score, embedding = :emb, captured_at = NOW()"
+                            " WHERE id = :row_id"
+                        ), {
+                            "score": face_score,
+                            "emb": face_embedding.tolist(),
+                            "row_id": existing_row[0],
+                        })
+                        logger.debug(
+                            f"Upgraded existing face embedding {existing_row[0]} for person "
+                            f"{person_id}: score {existing_score:.3f} → {face_score:.3f}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Skipped duplicate face embedding for person {person_id} "
+                            f"(path already stored, score {existing_score:.3f} ≥ {face_score:.3f})"
+                        )
+                    return
 
             face_emb = PersonFaceEmbedding(
                 person_identity_id=person_id,
@@ -477,10 +527,13 @@ class IdentityDecisionEngine:
             logger.error(f"Failed to store face embedding: {e}")
 
     async def _prune_face_embeddings(self, db: AsyncSession, person_id: uuid.UUID):
-        """Keep only the best-quality K face embeddings per identity."""
-        try:
-            from app.modules.storage.minio_client import delete_object as minio_delete
+        """Keep only the best-quality K face embeddings per identity.
 
+        Excess rows are deleted from the DB.  MinIO file deletion is deferred to
+        the periodic sweep in ``deduplicate_persons()`` (every 10 min) which
+        cross-references files against all live DB paths before deleting.
+        """
+        try:
             query = text("""
                 SELECT id, face_crop_path FROM person_face_embeddings
                 WHERE person_identity_id = :pid
@@ -495,20 +548,16 @@ class IdentityDecisionEngine:
 
             if rows:
                 ids_to_delete = [row[0] for row in rows]
-                paths_to_delete = [row[1] for row in rows if row[1]]
-
+                paths_deferred = sum(1 for row in rows if row[1])
                 await db.execute(
                     text("DELETE FROM person_face_embeddings WHERE id = ANY(:ids)"),
                     {"ids": ids_to_delete},
                 )
-
-                for path in paths_to_delete:
-                    try:
-                        obj_name = path.split("/", 1)[1] if "/" in path else path
-                        minio_delete(obj_name)
-                        logger.debug(f"Pruned face crop file deleted: {path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete pruned face crop {path}: {e}")
+                if paths_deferred:
+                    logger.debug(
+                        f"Pruned {paths_deferred} face embedding(s) for person {person_id} "
+                        f"(MinIO cleanup deferred to dedup-job sweep)"
+                    )
 
         except Exception as e:
             logger.warning(f"Face embedding pruning failed for person {person_id}: {e}")
@@ -528,23 +577,18 @@ class IdentityDecisionEngine:
 
             if rows:
                 ids_to_delete = [row[0] for row in rows]
-                paths_to_delete = [row[1] for row in rows if row[1]]
+                paths_deferred = sum(1 for row in rows if row[1])
 
-                # Delete from database
                 await db.execute(
                     text("DELETE FROM person_embeddings WHERE id = ANY(:ids)"),
                     {"ids": ids_to_delete}
                 )
 
-                # Delete files from MinIO
-                from app.modules.storage.minio_client import delete_object as minio_delete
-                for path in paths_to_delete:
-                    try:
-                        obj_name = path.split("/", 1)[1] if "/" in path else path
-                        minio_delete(obj_name)
-                        logger.debug(f"Pruned crop file deleted: {path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete pruned crop file {path}: {e}")
+                if paths_deferred:
+                    logger.debug(
+                        f"Pruned {paths_deferred} body embedding(s) for person {person_id} "
+                        f"(MinIO cleanup deferred to dedup-job sweep)"
+                    )
         except Exception as e:
             logger.warning(f"Embedding pruning failed for person {person_id}: {e}")
 
@@ -569,41 +613,16 @@ class IdentityDecisionEngine:
                 {"pid": str(person_id), "matched_id": str(matched_id)}
             )
 
-            # Get all crop paths first
-            query = text("SELECT crop_path FROM person_embeddings WHERE person_identity_id = :pid")
-            res = await db.execute(query, {"pid": str(person_id)})
-            paths = [row[0] for row in res.fetchall() if row[0]]
-
-            # Also get face crop paths from person_face_embeddings
-            query_face_embs = text("SELECT face_crop_path FROM person_face_embeddings WHERE person_identity_id = :pid")
-            res_face_embs = await db.execute(query_face_embs, {"pid": str(person_id)})
-            for row in res_face_embs.fetchall():
-                if row[0]:
-                    paths.append(row[0])
-
-            # Also delete face crop from PersonIdentity
-            query_face = text("SELECT face_crop_path FROM person_identities WHERE id = :pid")
-            res_face = await db.execute(query_face, {"pid": str(person_id)})
-            face_row = res_face.fetchone()
-            if face_row and face_row[0]:
-                paths.append(face_row[0])
-
             # Delete the identity (cascades to person_embeddings)
             await db.execute(
                 text("DELETE FROM person_identities WHERE id = :pid"),
                 {"pid": str(person_id)}
             )
             logger.info(f"Deleted temporary person identity from database: {person_id} (merged into {matched_id})")
-
-            # Delete files from MinIO
-            from app.modules.storage.minio_client import delete_object as minio_delete
-            for path in set(paths):  # set to avoid duplicate removals
-                try:
-                    obj_name = path.split("/", 1)[1] if "/" in path else path
-                    minio_delete(obj_name)
-                    logger.debug(f"Temporary crop file deleted: {path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete temporary crop file {path}: {e}")
+            # MinIO files for the merged identity are NOT deleted immediately.
+            # The periodic dedup-job sweep (every 10 min) cross-references all MinIO
+            # ``crops/`` objects against live DB paths and removes only truly
+            # unreferenced files.
         except Exception as e:
             logger.warning(f"Failed to delete temporary person {person_id}: {e}")
 

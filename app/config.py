@@ -49,15 +49,25 @@ class Settings(BaseSettings):
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
-    FACE_MATCH_THRESHOLD: float = 0.48  # Face match/contradiction threshold (lowered from 0.55 for cross-angle robustness)
-    FACE_MIN_DET_SCORE: float = 0.50  # Minimum face detection score for frontal verification
-    FACE_MIN_SIZE_PX: int = 30  # Minimum face width in pixels
-    FACE_MIN_EYE_SPREAD: float = 0.30  # Minimum eye-spread ratio for frontal verification (currently disabled — see camera_worker.py)
-    FACE_SEARCH_THRESHOLD: float = 0.65  # Threshold above which face is considered high quality to skip body search if not matched
-    FACE_IDENTITY_MIN_SCORE: float = 0.60  # Minimum face quality score required to create a new PersonIdentity
-    FACE_IDENTITY_MIN_DETECTIONS: int = 2  # Minimum good face detections across track lifestyle required for identity creation
-    MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5  # Maximum face embeddings stored per person identity (multi-angle)
+    FACE_MATCH_THRESHOLD: float = 0.48        # Positive face match threshold (face search result must exceed this)
+    FACE_CONTRADICTION_THRESHOLD: float = 0.25 # Disassociation threshold — only trigger if face is DEFINITELY different
+                                                # (same person cross-angle ~0.40-0.47, so 0.25 avoids false disassociation)
+    FACE_BODY_EXCLUSION_THRESHOLD: float = 0.30 # Body candidate exclusion gate — more permissive than match threshold
+                                                 # allows body ReID to proceed when face is same-person but cross-angle
+    FACE_MIN_DET_SCORE: float = 0.50          # Minimum InsightFace detection score for a face to be considered valid
+    FACE_MIN_SIZE_PX: int = 30                # Minimum face width in pixels
+    FACE_MIN_EYE_SPREAD: float = 0.25         # Minimum normalised eye-spread (eye_distance / face_width) for frontality
+                                               # Frontal: ~0.35+, profile: ~0.0-0.15, 3/4: ~0.20-0.30
+    FACE_FRONTALITY_WEIGHT: float = 0.35      # How much frontality score contributes to face_quality (0–1)
+    FACE_CONTAMINATION_THRESHOLD: float = 0.35 # Running-consensus contamination gate: if a new face embedding has
+                                                # cosine similarity < 0.35 to ALL previously accumulated faces for this
+                                                # track, it is rejected as contamination (face from adjacent person).
+                                                # Same person cross-angle range: 0.40–0.70+.  Different person: 0.10–0.30.
+    FACE_IDENTITY_MIN_SCORE: float = 0.60     # Minimum face quality score required to create a new PersonIdentity
+    FACE_IDENTITY_MIN_DETECTIONS: int = 2     # Minimum good face detections across track lifetime required for identity creation
+    MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5   # Maximum face embeddings stored per person identity (multi-angle)
     BODY_ONLY_CONFIDENCE_LIMIT: float = 0.95  # Body-only (no face) matches require higher confidence for re-identification
+    # FACE_SEARCH_THRESHOLD intentionally removed — skip_body_reid logic has been eliminated (caused duplicate registrations)
     
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"

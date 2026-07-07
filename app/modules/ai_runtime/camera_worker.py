@@ -349,7 +349,30 @@ class CameraWorker:
         stale = self.track_manager.cleanup_stale_tracks()
         for t in stale:
             self._last_obs_time.pop(t.local_track_id, None)
-            self.track_embeddings.pop(t.local_track_id, None)
+            # --- Change 3 & 6: clean up MinIO files that belong to this track before
+            # discarding the in-memory state.
+            #
+            # 3) Delete the last current-face-crop (never stored in DB, never in accum_list).
+            if t.current_face_crop_path:
+                self._minio_cleanup(t.current_face_crop_path)
+            #
+            # 6) Delete any body/face crops from an incomplete ReID window (less than
+            #    REID_ACCUMULATION_FRAMES arrived before the track went stale, so the
+            #    normal window-cleanup never ran for them).  Protect paths still referenced
+            #    by persistent track state that _close_track_session is about to save to DB.
+            _partial_window = self.track_embeddings.pop(t.local_track_id, [])
+            if _partial_window:
+                _protected = {t.best_crop_path, t.best_face_crop_path_for_id}
+                if t.best_demographics:
+                    _protected.add(t.best_demographics.get("face_crop_path"))
+                for _fe, _fs, _fp in t.face_embedding_list:
+                    if _fp:
+                        _protected.add(_fp)
+                _protected.discard(None)
+                for _item in _partial_window:
+                    for _path in (_item[2], _item[5]):   # body crop, face crop
+                        if _path and _path not in _protected:
+                            self._minio_cleanup(_path)
 
         # 7) Persist - ONLY if there is actual work. Quiet frames skip the DB.
         if new_tracks or reid_tracks or rule_events or zone_events or observations or stale:
@@ -661,12 +684,43 @@ class CameraWorker:
 
 
 
+    # ── Deferred MinIO deletion ──────────────────────────────────────────────
+    # All calls to _minio_cleanup() from this class add paths to this set instead
+    # of deleting immediately.  The periodic ``deduplicate_persons()`` job
+    # (every 10 min) sweeps MinIO ``crops/`` against a live list of DB-referenced
+    # paths and deletes only truly unreferenced objects.  This eliminates the
+    # entire class of "deleted-too-early" 404 bugs.
+    _pending_minio_deletes: "set[str]" = set()
+
+    @staticmethod
+    def _minio_cleanup(full_path: str) -> None:
+        """Queue a MinIO object for *deferred* deletion by the next dedup-job sweep.
+
+        The object key is extracted from the full bucket/key path and added to the
+        class-level ``_pending_minio_deletes`` set.  Actual deletion happens in
+        ``deduplicate_persons()`` (every 10 min) after verifying no DB row still
+        references this path.
+        """
+        if full_path:
+            CameraWorker._pending_minio_deletes.add(full_path)
+
     async def _run_reid(self, db, frame, track: ActiveTrack):
         """Run ReID pipeline: crop -> quality -> embedding -> accumulation -> decision."""
         track.last_reid_time = utc_now()
         was_resolved = track.reid_resolved
         face_result = None  # ensure defined even when demographics are disabled
         try:
+            # --- Change 4: clean up previous current_crop_path if it was never accumulated
+            # and is not the overall best.  This prevents body-crop leaks from frames that
+            # failed the quality/face gate and were never added to accum_list.
+            _prev_body_crop = track.current_crop_path
+            if _prev_body_crop:
+                _accum_body_paths = {
+                    item[2] for item in self.track_embeddings.get(track.local_track_id, [])
+                }
+                if _prev_body_crop not in _accum_body_paths and _prev_body_crop != track.best_crop_path:
+                    self._minio_cleanup(_prev_body_crop)
+
             crop = extract_crop(frame, track.bbox)
             if crop is None or crop.size == 0:
                 logger.warning(f"Track {track.local_track_id}: Failed to extract crop from bounding box.")
@@ -729,6 +783,9 @@ class CameraWorker:
             face_result = None
             face_frontal = False
             
+            # --- Change 2: capture previous curr_face path before resetting, so we can
+            # delete it from MinIO after uploading the replacement (prevents permanent leak).
+            _prev_curr_face = track.current_face_crop_path
             track.current_face_crop_path = None
             track.current_face_score = 0.0
             track.current_face_bbox = None
@@ -740,50 +797,138 @@ class CameraWorker:
                     if face_result.face_crop is not None:
                         current_face_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
                     track.current_face_crop_path = current_face_path
+                    # Delete the previous curr_face file — it has been replaced
+                    if _prev_curr_face and _prev_curr_face != current_face_path:
+                        self._minio_cleanup(_prev_curr_face)
                     track.current_face_score = face_result.face_quality
                     track.current_face_bbox = face_result.face_bbox
                     
                     track.face_analysis_count += 1
                     
-                    # Validate frontality criteria using settings
-                    face_bbox = face_result.face_bbox
-                    face_width = face_bbox["x2"] - face_bbox["x1"]
-                    
-                    face_frontal = True
+                    # Validate frontality criteria using settings.
+                    # face_quality from assess_face_quality() now encodes both det_score
+                    # AND geometric frontality (eye-spread, nose centering, eye symmetry).
+                    # We still gate on raw det_score and pixel size as hard minimums,
+                    # then use frontality_score (from insightface_analyzer) to discriminate
+                    # frontal from angled faces for the ReID pipeline.
+                    face_bbox   = face_result.face_bbox
+                    face_width  = face_bbox["x2"] - face_bbox["x1"]
+                    face_height = face_bbox["y2"] - face_bbox["y1"]
+
+                    face_frontal     = True
                     rejection_reason = ""
-                    if face_result.face_score < self.settings.FACE_MIN_DET_SCORE:
+
+                    # ── KPS geometry validation ──────────────────────────────
+                    # InsightFace hallucinates face landmarks on hair / objects.
+                    # Real faces have consistent geometry: left eye left of right
+                    # eye, both eyes roughly horizontal, nose between them.
+                    # Hallucinated landmarks violate these invariants.
+                    kps = face_result.kps
+                    if kps is not None and len(kps) >= 5:
+                        lx, ly = float(kps[0][0]), float(kps[0][1])
+                        rx, ry = float(kps[1][0]), float(kps[1][1])
+                        nx     = float(kps[2][0])
+                        if lx >= rx or abs(ry - ly) / max(face_height, 1) > 0.20:
+                            face_frontal = False
+                            rejection_reason = "invalid kps geometry (hair/object hallucination)"
+                        else:
+                            eye_mid = (lx + rx) / 2.0
+                            eye_sep = max(rx - lx, 1.0)
+                            if abs(nx - eye_mid) / eye_sep > 0.40:
+                                face_frontal = False
+                                rejection_reason = "nose offset from eye-midpoint (hallucinated landmarks)"
+
+                    if face_frontal and face_result.face_score < self.settings.FACE_MIN_DET_SCORE:
                         face_frontal = False
-                        rejection_reason = f"score {face_result.face_score:.2f} < {self.settings.FACE_MIN_DET_SCORE}"
-                    elif face_width < self.settings.FACE_MIN_SIZE_PX:
+                        rejection_reason = f"det_score {face_result.face_score:.2f} < {self.settings.FACE_MIN_DET_SCORE}"
+                    elif face_frontal and face_width < self.settings.FACE_MIN_SIZE_PX:
                         face_frontal = False
-                        rejection_reason = f"width {face_width}px < {self.settings.FACE_MIN_SIZE_PX}px"
-                    # FACE_MIN_EYE_SPREAD check disabled — too aggressive for non-frontal shots
-                    # elif face_result.kps is not None and len(face_result.kps) == 5:
-                    #     eye_dx = float(face_result.kps[1][0]) - float(face_result.kps[0][0])
-                    #     eye_spread = eye_dx / face_width if face_width > 0 else 0.0
-                    #     if eye_spread < self.settings.FACE_MIN_EYE_SPREAD:
-                    #         face_frontal = False
-                    #         rejection_reason = f"eye {eye_spread:.2f} < {self.settings.FACE_MIN_EYE_SPREAD}"
-                    
+                        rejection_reason = f"width {face_width:.0f}px < {self.settings.FACE_MIN_SIZE_PX}px"
+                    elif face_frontal and face_result.eye_spread < self.settings.FACE_MIN_EYE_SPREAD:
+                        face_frontal = False
+                        rejection_reason = (
+                            f"eye_spread {face_result.eye_spread:.2f} < {self.settings.FACE_MIN_EYE_SPREAD} "
+                            f"(frontality={face_result.frontality_score:.2f})"
+                        )
+
+                    # ── Gender voting (runs for EVERY detected face, not just frontal) ──
+                    # InsightFace returns reliable gender even from non-frontal faces.
+                    # Counting votes across all frames gives a robust majority instead
+                    # of relying on the handful of perfectly frontal shots.
+                    if face_result.gender in ("M", "F"):
+                        track.gender_votes[face_result.gender] += 1
+                    _majority_gender = "M" if track.gender_votes.get("M", 0) >= track.gender_votes.get("F", 0) else "F"
+
+                    # Keep best_demographics gender in sync even for non-frontal frames
+                    if track.best_demographics is not None:
+                        _prev_gender = track.best_demographics.get("gender")
+                        if _prev_gender != _majority_gender:
+                            track.best_demographics["gender"] = _majority_gender
+                            logger.debug(
+                                f"Gender vote flipped for track {track.local_track_id}: "
+                                f"{_prev_gender} → {_majority_gender} "
+                                f"(votes: M={track.gender_votes.get('M',0)} F={track.gender_votes.get('F',0)})"
+                            )
+
                     if face_frontal:
                         face_embedding = face_result.embedding
-                        face_score = face_result.face_score
-                        if face_result.face_crop is not None:
-                            face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
-                        
-                        # Keep the best face score demographics for display and TrackSession updating
-                        if (track.best_demographics is None or 
-                            face_score > track.best_demographics.get("face_score", 0.0)):
-                            track.best_demographics = {
-                                "age": face_result.age,
-                                "gender": face_result.gender,
-                                "age_group": face_result.age_group,
-                                "face_score": face_score,
-                                "face_crop_path": face_crop_path,
-                            }
-                            logger.debug(f"Demographics updated for track {track.local_track_id}: {track.best_demographics}")
-                    else:
-                        logger.debug(f"Track {track.local_track_id}: Face rejected due to {rejection_reason}")
+
+                        # ── Contamination gate (Layer 2) ───────────────────
+                        # If this track has already accumulated ≥2 prior good faces,
+                        # validate the new face against the running consensus.
+                        # A face with cosine similarity < CONTAMINATION_THRESHOLD to
+                        # ALL prior faces is almost certainly from an adjacent person
+                        # whose body crop overlapped ours — reject this frame's face.
+                        if (face_embedding is not None
+                                and len(track.face_embedding_list) >= 2):
+                            _max_sim_to_prior = 0.0
+                            for _prior_emb, _prior_scr, _ in track.face_embedding_list:
+                                if _prior_emb is not None:
+                                    _sim = float(np.dot(_prior_emb, face_embedding))
+                                    if _sim > _max_sim_to_prior:
+                                        _max_sim_to_prior = _sim
+                            if _max_sim_to_prior < self.settings.FACE_CONTAMINATION_THRESHOLD:
+                                logger.warning(
+                                    f"Track {track.local_track_id}: Face contamination detected! "
+                                    f"MaxPriorSim={_max_sim_to_prior:.3f} < "
+                                    f"CONTAMINATION_THRESHOLD={self.settings.FACE_CONTAMINATION_THRESHOLD:.2f}. "
+                                    f"Rejecting this frame's face."
+                                )
+                                face_frontal = False
+                                rejection_reason = (
+                                    f"contamination (max_prior_sim={_max_sim_to_prior:.3f} < "
+                                    f"{self.settings.FACE_CONTAMINATION_THRESHOLD:.2f})"
+                                )
+
+                        if face_frontal:
+                            # Use face_quality (det_score × frontality) as the score so that
+                            # a clean frontal detection always ranks higher than an angled one.
+                            face_score = face_result.face_quality
+                            if face_result.face_crop is not None:
+                                face_crop_path = save_image(face_result.face_crop, self.settings.CROP_DIR, prefix=f"face_{self.camera_id}")
+
+                            if (track.best_demographics is None or
+                                    face_score > track.best_demographics.get("face_score", 0.0)):
+                                track.best_demographics = {
+                                    "age":           face_result.age,
+                                    "gender":        _majority_gender,
+                                    "age_group":     face_result.age_group,
+                                    "face_score":    face_score,
+                                    "frontality":    face_result.frontality_score,
+                                    "face_crop_path": face_crop_path,
+                                }
+                                logger.debug(
+                                    f"Demographics updated for track {track.local_track_id}: "
+                                    f"quality={face_score:.2f} frontality={face_result.frontality_score:.2f}"
+                                )
+                        else:
+                            logger.debug(
+                                f"Track {track.local_track_id}: "
+                                f"Face rejected — {rejection_reason}"
+                            )
+            elif _prev_curr_face:
+                # Demographics disabled this frame; prev curr_face file is now orphaned — delete it
+                self._minio_cleanup(_prev_curr_face)
 
             # Update current frame crop quality and path (updated every frame for real-time debug)
             track.current_crop_quality = quality
@@ -866,25 +1011,30 @@ class CameraWorker:
                 window_face_score = best_face_item[4]
                 window_face_crop_path = best_face_item[5]
 
-                # Delete the other unused crops in this window from MinIO
-                from app.modules.storage.minio_client import delete_object as minio_delete
+                # Delete the other unused crops in this window from MinIO.
+                # --- Change 1: build a protected set of face paths already referenced in
+                # face_embedding_list — these will later be stored to PersonFaceEmbedding
+                # and must NOT be deleted, otherwise the DB would hold 404 URLs.
+                _protected_face_paths = {
+                    entry[2] for entry in track.face_embedding_list if entry[2] is not None
+                }
                 for item in accum_list:
                     other_path = item[2]
                     other_face_path = item[5]
+                    if other_path and other_path != best_crop_path:
+                        self._minio_cleanup(other_path)
+                    # Only delete if not the window survivor AND not already referenced
+                    # in face_embedding_list (which will be persisted to DB).
+                    if (other_face_path
+                            and other_face_path != window_face_crop_path
+                            and other_face_path not in _protected_face_paths):
+                        self._minio_cleanup(other_face_path)
 
-                    def _extract_object_name(full_path: str) -> str:
-                        parts = full_path.split("/", 1)
-                        return parts[1] if len(parts) > 1 else full_path
-
-                    try:
-                        if other_path and other_path != best_crop_path:
-                            obj_name = _extract_object_name(other_path)
-                            minio_delete(obj_name)
-                        if other_face_path and other_face_path != window_face_crop_path:
-                            obj_name = _extract_object_name(other_face_path)
-                            minio_delete(obj_name)
-                    except Exception as e:
-                        logger.warning(f"Failed to remove unused crop from MinIO: {e}")
+                # --- Change 5: if current_crop_path was one of the deleted window crops,
+                # point it at the survivor so the active-tracks debug view never shows a 404.
+                _window_body_paths = {item[2] for item in accum_list if item[2]}
+                if track.current_crop_path in _window_body_paths and track.current_crop_path != best_crop_path:
+                    track.current_crop_path = best_crop_path
 
                 accum_list.clear()
 

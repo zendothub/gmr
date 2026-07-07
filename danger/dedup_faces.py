@@ -3,126 +3,145 @@
 dedup_faces.py
 --------------
 READ-ONLY script that scans person_identities for duplicate faces.
+
+Uses an efficient pgvector LATERAL query (O(N·log N) via IVFFlat index) instead
+of the old O(N²) cross-join approach that timed out on large datasets.
+
 Finds pairs of identities whose maximum cross-face-similarity exceeds
-the FACE_MATCH_THRESHOLD (0.48), meaning they are likely the same
-person registered multiple times.
+FACE_MATCH_THRESHOLD (default 0.48), meaning they are likely the same
+person registered multiple times from different camera angles.
 
 Output: prints identity pairs with their IDs, face embedding counts,
-max similarity, and demographics. Does NOT modify any data.
+max similarity, and demographics.  Does NOT modify any data.
 
 Usage:
-    .venv/bin/python dedup_faces.py
+    PYTHONPATH=/gmr/gmr .venv/bin/python dedup_faces.py [--threshold 0.48]
 """
 import asyncio
 import sys
+import argparse
 
 from sqlalchemy import text
 from app.core.db.session import AsyncSessionLocal
 from app.config import get_settings
 
 
-THRESHOLD = None  # set in main()
-
-
-async def find_duplicates():
-    global THRESHOLD
-    settings = get_settings()
-    THRESHOLD = settings.FACE_MATCH_THRESHOLD
-
-    print(f"\n{'='*90}")
-    print(f"  DUPLICATE FACE DETECTION (threshold: {THRESHOLD})")
-    print(f"{'='*90}\n")
+async def find_duplicates(threshold: float):
+    print(f"\n{'='*100}")
+    print(f"  DUPLICATE FACE DETECTION  (threshold: {threshold})")
+    print(f"{'='*100}\n")
 
     async with AsyncSessionLocal() as db:
-        # Get all persons with face embeddings, ordered by first_seen
-        result = await db.execute(text("""
-            SELECT pi.id,
-                   pi.first_seen_at,
-                   pi.last_seen_at,
-                   pi.visit_count,
-                   pi.gender,
-                   pi.estimated_age,
-                   pi.age_group,
-                   pi.best_face_score,
-                   (SELECT count(*) FROM person_face_embeddings pfe
-                    WHERE pfe.person_identity_id = pi.id) as face_emb_count
-            FROM person_identities pi
-            WHERE EXISTS (
-                SELECT 1 FROM person_face_embeddings pfe
-                WHERE pfe.person_identity_id = pi.id
-            )
-            ORDER BY pi.first_seen_at
-        """))
+        # ── Person count ────────────────────────────────────────────────────────
+        count_result = await db.execute(text(
+            "SELECT COUNT(*) FROM person_identities WHERE EXISTS "
+            "(SELECT 1 FROM person_face_embeddings pfe WHERE pfe.person_identity_id = person_identities.id)"
+        ))
+        total_with_face = count_result.scalar()
+        print(f"  Persons with face embeddings: {total_with_face}\n")
 
-        persons = result.fetchall()
-
-        if not persons:
+        if total_with_face == 0:
             print("  No persons with face embeddings found.\n")
             return
 
-        print(f"  Scanning {len(persons)} persons with face embeddings...\n")
+        # ── Efficient duplicate discovery via LATERAL ───────────────────────────
+        # Probes=50 ensures the IVFFlat index scans enough buckets for high recall.
+        await db.execute(text("SET LOCAL ivfflat.probes = 50"))
 
-        duplicates = []
-        checked = 0
+        pairs_result = await db.execute(text("""
+            SELECT
+                LEAST(a.person_identity_id::text, b_near.person_identity_id::text)   AS pid_a,
+                GREATEST(a.person_identity_id::text, b_near.person_identity_id::text) AS pid_b,
+                MAX(1.0 - b_near.dist) AS max_sim
+            FROM person_face_embeddings a
+            CROSS JOIN LATERAL (
+                SELECT pfe.person_identity_id,
+                       pfe.embedding <=> a.embedding AS dist
+                FROM   person_face_embeddings pfe
+                WHERE  pfe.person_identity_id != a.person_identity_id
+                  AND  (1.0 - (pfe.embedding <=> a.embedding)) >= :threshold
+                ORDER  BY dist
+                LIMIT  5
+            ) b_near
+            GROUP  BY pid_a, pid_b
+            HAVING MAX(1.0 - b_near.dist) >= :threshold
+            ORDER  BY max_sim DESC
+        """), {"threshold": threshold})
 
-        for i in range(len(persons)):
-            for j in range(i + 1, len(persons)):
-                pid_a = persons[i][0]
-                pid_b = persons[j][0]
+        pairs = pairs_result.fetchall()
 
-                # Cross-compare ALL face embeddings between the two identities
-                sim_result = await db.execute(text("""
-                    SELECT max(1.0 - (a.embedding <=> b.embedding)) as max_sim,
-                           count(*) as pairs
-                    FROM person_face_embeddings a
-                    CROSS JOIN person_face_embeddings b
-                    WHERE a.person_identity_id = :pid_a
-                      AND b.person_identity_id = :pid_b
-                """), {"pid_a": str(pid_a), "pid_b": str(pid_b)})
-
-                row = sim_result.fetchone()
-                max_sim = float(row[0]) if row[0] is not None else 0.0
-                pair_count = int(row[1]) if row[1] is not None else 0
-
-                checked += 1
-
-                if max_sim >= THRESHOLD:
-                    duplicates.append({
-                        "pid_a": pid_a,
-                        "pid_b": pid_b,
-                        "max_sim": max_sim,
-                        "pairs": pair_count,
-                        "info_a": persons[i],
-                        "info_b": persons[j],
-                    })
-
-        # Print results
-        if not duplicates:
-            print(f"  No duplicate pairs found (checked {checked} pairs).\n")
-            print(f"{'='*90}\n")
+        if not pairs:
+            print(f"  No duplicate pairs found (threshold={threshold}).\n")
+            print(f"{'='*100}\n")
             return
 
-        print(f"  Found {len(duplicates)} duplicate pair(s) out of {checked} checked:\n")
-        print(f"  {'ID A':<38} {'ID B':<38} {'MaxSim':>8} {'A_faces':>8} {'B_faces':>8}  Gender  Age")
-        print(f"  {'-'*38} {'-'*38} {'-'*8} {'-'*8} {'-'*8}  {'-'*7}  {'-'*3}")
+        # ── Fetch metadata for all involved IDs ─────────────────────────────────
+        all_ids = list({str(r[0]) for r in pairs} | {str(r[1]) for r in pairs})
 
-        for d in duplicates:
-            ia = d["info_a"]
-            ib = d["info_b"]
-            print(f"  {str(ia[0])[:36]:<38} {str(ib[0])[:36]:<38} {d['max_sim']:>8.4f} "
-                  f"{ia[8]:>8} {ib[8]:>8}  "
-                  f"{str(ia[4] or '?'):<5}/{str(ib[4] or '?'):<5}  "
-                  f"{str(ia[5] or '?')}/{str(ib[5] or '?')}")
-            print(f"    A: first_seen={ia[1]}, visits={ia[3]}, face_score={ia[7]:.3f}" if ia[7] else f"    A: first_seen={ia[1]}, visits={ia[3]}")
-            print(f"    B: first_seen={ib[1]}, visits={ib[3]}, face_score={ib[7]:.3f}" if ib[7] else f"    B: first_seen={ib[1]}, visits={ib[3]}")
+        meta_result = await db.execute(text("""
+            SELECT
+                pi.id::text,
+                pi.first_seen_at,
+                pi.last_seen_at,
+                pi.visit_count,
+                pi.gender,
+                pi.estimated_age,
+                pi.age_group,
+                pi.best_face_score,
+                COUNT(pfe.id) AS face_emb_count,
+                COUNT(ts.id)  AS track_count
+            FROM person_identities pi
+            LEFT JOIN person_face_embeddings pfe ON pfe.person_identity_id = pi.id
+            LEFT JOIN track_sessions          ts  ON ts.person_identity_id  = pi.id
+            WHERE pi.id::text = ANY(:ids)
+            GROUP BY pi.id
+        """), {"ids": all_ids})
+
+        meta = {r[0]: r for r in meta_result.fetchall()}
+
+        # ── Print results ────────────────────────────────────────────────────────
+        print(f"  Found {len(pairs)} duplicate pair(s):\n")
+        fmt = "  {:<38} {:<38} {:>8}  {:>7}  {:>7}  {:<6}/{:<6}  {}/{}"
+        print(fmt.format("ID A", "ID B", "MaxSim", "A_faces", "B_faces",
+                         "GenderA", "GenderB", "AgeA", "AgeB"))
+        print("  " + "-" * 98)
+
+        for row in pairs:
+            pid_a, pid_b, max_sim = str(row[0]), str(row[1]), float(row[2])
+            ia = meta.get(pid_a)
+            ib = meta.get(pid_b)
+            if not ia or not ib:
+                continue
+
+            print(fmt.format(
+                pid_a[:36], pid_b[:36], f"{max_sim:.4f}",
+                int(ia[8]), int(ib[8]),
+                str(ia[4] or "?"), str(ib[4] or "?"),
+                str(ia[5] or "?"), str(ib[5] or "?"),
+            ))
+            score_a = f"{ia[7]:.3f}" if ia[7] else "n/a"
+            score_b = f"{ib[7]:.3f}" if ib[7] else "n/a"
+            print(f"    A: first={ia[1]}  visits={ia[3]}  tracks={ia[9]}  face_score={score_a}")
+            print(f"    B: first={ib[1]}  visits={ib[3]}  tracks={ib[9]}  face_score={score_b}")
             print()
 
-        print(f"{'='*90}")
-        print(f"  Total duplicates: {len(duplicates)}")
+        print(f"{'='*100}")
+        print(f"  Total duplicate pairs: {len(pairs)}")
         print(f"  These identities SHOULD be merged (same person, multiple registrations).")
-        print(f"  Run reset_tracking_data.py to wipe all and start fresh, or merge manually.")
-        print(f"{'='*90}\n")
+        print(f"  The periodic dedup job (every 10 min) will merge them automatically.")
+        print(f"  Run reset_tracking_data.py --yes for a full clean slate.")
+        print(f"{'='*100}\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(find_duplicates())
+    parser = argparse.ArgumentParser(description="Scan for duplicate person identities.")
+    parser.add_argument(
+        "--threshold", type=float, default=None,
+        help="Face similarity threshold (default: FACE_MATCH_THRESHOLD from config)"
+    )
+    args = parser.parse_args()
+
+    settings = get_settings()
+    threshold = args.threshold if args.threshold is not None else settings.FACE_MATCH_THRESHOLD
+
+    asyncio.run(find_duplicates(threshold))
