@@ -27,6 +27,7 @@ from app.modules.tracking.track_manager import TrackManager, ActiveTrack
 from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.insightface_analyzer import get_shared_analyzer
+from app.modules.reid.mivolo_analyzer import get_shared_mivolo
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
@@ -68,6 +69,7 @@ class CameraWorker:
         self.yolo_pose = get_shared_pose_model() if self.reid_enabled else None
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
         self.insightface_analyzer = get_shared_analyzer(self.settings.INSIGHTFACE_MODEL) if self.demographic_enabled else None
+        self.mivolo_analyzer = get_shared_mivolo() if self.demographic_enabled else None
 
         # Runtime config (zones/rules). Cameras are static -> no ROI/views.
         self.zones: List[dict] = []
@@ -803,7 +805,21 @@ class CameraWorker:
                         self._minio_cleanup(_prev_curr_face)
                     track.current_face_score = face_result.face_quality
                     track.current_face_bbox = face_result.face_bbox
-                    
+
+                    # ── MiVOLO gender + age ───────────────────────────────────
+                    # InsightFace no longer loads the genderage module — MiVOLO
+                    # (ViT-Small, ~103 MB) provides both.  It runs on the face
+                    # crop detected by InsightFace and is more accurate (~95-97%
+                    # vs InsightFace's ~85-90%).
+                    if self.mivolo_analyzer and face_result.face_crop is not None:
+                        _mivolo = await run_inference(
+                            self.mivolo_analyzer.analyze, face_result.face_crop
+                        )
+                        if _mivolo:
+                            face_result.gender    = _mivolo["gender"]
+                            face_result.age       = _mivolo["age"]
+                            face_result.age_group = self.mivolo_analyzer._age_to_group(_mivolo["age"])
+
                     track.face_analysis_count += 1
                     
                     # Validate frontality criteria using settings.

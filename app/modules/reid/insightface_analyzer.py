@@ -76,7 +76,7 @@ class InsightFaceAnalyzer:
             #   CPU   → CPUExecutionProvider
             self.app = FaceAnalysis(
                 name=self.model_name,
-                allowed_modules=['detection', 'genderage', 'recognition'],
+                allowed_modules=['detection', 'recognition'],  # gender/age now handled by MiVOLO
                 providers=providers,
             )
             self.app.prepare(ctx_id=ctx_id, det_size=self.det_size)
@@ -179,10 +179,9 @@ class InsightFaceAnalyzer:
                 "y2": float(bbox[3]),
             }
 
-            age = int(best_face.age)
-            # InsightFace: gender=1 for Male, gender=0 for Female
-            gender_val = getattr(best_face, "gender", -1)
-            gender = "M" if gender_val == 1 else "F"
+            # Gender/age handled by MiVOLO — InsightFace only does detection + embedding
+            age = None
+            gender = None
 
             # Extract face crop with 30% padding for better face recognition
             from app.utils.image_utils import extract_crop
@@ -195,7 +194,7 @@ class InsightFaceAnalyzer:
             result_obj = InsightFaceResult(
                 age=age,
                 gender=gender,
-                age_group=self._age_to_group(age),
+                age_group=self._age_to_group(age) if age is not None else None,
                 face_score=float(best_face.det_score),
                 face_bbox=face_bbox,
                 embedding=getattr(best_face, "embedding", None),

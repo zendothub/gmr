@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5   # Maximum face embeddings stored per person identity (multi-angle)
     BODY_ONLY_CONFIDENCE_LIMIT: float = 0.95  # Body-only (no face) matches require higher confidence for re-identification
     # FACE_SEARCH_THRESHOLD intentionally removed — skip_body_reid logic has been eliminated (caused duplicate registrations)
+
+    # ------------------------------------------------------------------
+    # MiVOLO — gender + age (replaces InsightFace demographics)
+    # ------------------------------------------------------------------
+    MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 FairFace (ViT-Small, 3-class, ~103 MB, auto-downloaded)
     
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
