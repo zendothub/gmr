@@ -21,7 +21,8 @@ class DebugService:
         db: AsyncSession,
         page: int = 1,
         size: int = 10,
-        search: Optional[str] = None
+        search: Optional[str] = None,
+        gender: Optional[str] = None,
     ) -> PaginatedUniquePersonsResponse:
         """Get all unique person identities with basic statistics (paginated)."""
         from app.core.db.models.person import PersonIdentity
@@ -38,6 +39,8 @@ class DebugService:
                     func.cast(PersonIdentity.id, String).ilike(f"%{search}%")
                 )
             )
+        if gender:
+            count_stmt = count_stmt.where(PersonIdentity.gender == gender)
         total_count = (await db.execute(count_stmt)).scalar() or 0
 
         # Build main paginated query with outer join to count tracks and distinct days
@@ -57,6 +60,8 @@ class DebugService:
                     func.cast(PersonIdentity.id, String).ilike(f"%{search}%")
                 )
             )
+        if gender:
+            stmt = stmt.where(PersonIdentity.gender == gender)
         
         stmt = (
             stmt.group_by(PersonIdentity.id)
