@@ -28,6 +28,7 @@ from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.mivolo_analyzer import get_shared_mivolo
+from app.modules.reid.siglip2_analyzer import get_shared_siglip2
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
@@ -70,6 +71,7 @@ class CameraWorker:
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
         self.insightface_analyzer = get_shared_analyzer(self.settings.INSIGHTFACE_MODEL) if self.demographic_enabled else None
         self.mivolo_analyzer = get_shared_mivolo() if self.demographic_enabled else None
+        self.siglip2_analyzer = get_shared_siglip2() if self.demographic_enabled else None
 
         # Runtime config (zones/rules). Cameras are static -> no ROI/views.
         self.zones: List[dict] = []
@@ -929,23 +931,34 @@ class CameraWorker:
                     else:
                         face_result.frontality_score = 0.5
 
-                    # ── MiVOLO gender + age ────────────────────────────────
+                    # ── SigLIP2 gender (100% on clean retail CCTV) ────────
+                    if self.siglip2_analyzer:
+                        _sig = await run_inference(
+                            self.siglip2_analyzer.analyze, face_crop_sq
+                        )
+                        if _sig:
+                            face_result.gender = _sig["gender"]
+
+                    # ── MiVOLO age (kept for age prediction) ─────────────
                     if self.mivolo_analyzer:
                         _mivolo = await run_inference(
                             self.mivolo_analyzer.analyze, face_crop_sq
                         )
                         if _mivolo:
-                            face_result.gender    = _mivolo["gender"]
                             face_result.age       = _mivolo["age"]
                             face_result.age_group = self.mivolo_analyzer._age_to_group(_mivolo["age"])
                             logger.debug(
-                                f"Track {track.local_track_id}: MiVOLO gender={_mivolo['gender']} "
-                                f"age={_mivolo['age']}"
+                                f"Track {track.local_track_id}: SigLIP2={_sig['gender'] if _sig else '?'} "
+                                f"MiVOLO_age={_mivolo['age']}"
                             )
                         else:
                             logger.warning(
                                 f"Track {track.local_track_id}: MiVOLO returned None"
                             )
+                    elif not self.siglip2_analyzer:
+                        logger.warning(
+                            f"Track {track.local_track_id}: No gender/age model available"
+                        )
                     track.current_face_score = face_result.face_quality
                     track.current_face_bbox = face_result.face_bbox
 

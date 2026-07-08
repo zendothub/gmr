@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
 
     # ------------------------------------------------------------------
+    # SigLIP2 — zero-shot gender classifier (pre-computed text embeddings)
+    # ------------------------------------------------------------------
+    SIGLIP2_MODEL_ID: str = "google/siglip2-base-patch16-224"  # zero-shot gender (~18ms/img, ~1.4GB GPU)
+
+    # ------------------------------------------------------------------
     # MiVOLO — gender + age (replaces InsightFace demographics)
     # ------------------------------------------------------------------
     MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 IMDB (ViT-Small, 3-class, ~103 MB, best of 4)
