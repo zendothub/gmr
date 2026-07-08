@@ -106,31 +106,64 @@ class IdentityDecisionEngine:
             # in face search (cross-angle, same person) should still fall through to body
             # ReID rather than creating a duplicate identity.
             if not used_face and mean_embedding is not None:
-                # Search for similar embeddings using pgvector cosine distance (limit 5 candidates)
+                # Search for similar embeddings using pgvector cosine distance.
+                # Candidates are now per-unique-person (deduplicated in _search_similar).
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
+
+                # ── Body consensus gate ──────────────────────────────────
+                # A single body match can be a false positive (OSNet overlaps
+                # same/different distributions at 0.58–0.83).  Require at
+                # least 2 of the top-3 unique-identity candidates to agree
+                # AND exceed REID_MATCH_THRESHOLD before accepting.
+                body_votes: dict = {}
+                body_best_by_id: dict = {}
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
-                    
-                    # === FACE BODY-EXCLUSION GATE ===
-                    # Skip body candidates whose faces definitely contradict the track face.
-                    # Uses FACE_BODY_EXCLUSION_THRESHOLD (0.30) — more permissive than the
-                    # match threshold so that same-person cross-angle similarity (0.40-0.47)
-                    # does NOT exclude a valid body candidate.
+
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
                         if candidate_faces:
                             best_f_sim = max(float(np.dot(f, face_embedding)) for f in candidate_faces)
                             if best_f_sim < self.settings.FACE_BODY_EXCLUSION_THRESHOLD:
-                                logger.debug(
-                                    f"[Body Match] Candidate {str(candidate_id)[:8]} EXCLUDED due to face contradiction "
-                                    f"(BestFaceSim={best_f_sim:.3f} < {self.settings.FACE_BODY_EXCLUSION_THRESHOLD})"
-                                )
-                                continue  # Skip this candidate
-                    
-                    similarity = 1.0 - candidate["distance"]  # cosine distance -> similarity
+                                continue  # face contradicts → skip
+
+                    similarity = 1.0 - candidate["distance"]
                     if similarity > best_similarity:
                         best_similarity = similarity
                         best_candidate = candidate
+
+                    # Collect consensus votes from top-3 unique candidates
+                    if similarity >= self.settings.REID_MATCH_THRESHOLD:
+                        body_votes[candidate_id] = body_votes.get(candidate_id, 0) + 1
+                        if candidate_id not in body_best_by_id or similarity > body_best_by_id[candidate_id]["similarity"]:
+                            body_best_by_id[candidate_id] = candidate
+
+                    # Stop after evaluating 3 unique candidates
+                    if len(body_votes) >= 3 or (len(body_votes) >= 2 and max(body_votes.values()) >= 2):
+                        break
+
+                # Apply consensus: only accept if 2+ of top-3 agree
+                consensus_id = None
+                if body_votes:
+                    max_votes = max(body_votes.values())
+                    if max_votes >= 2:
+                        # Find the ID with the most votes (and best similarity as tiebreaker)
+                        consensus_id = max(
+                            [k for k, v in body_votes.items() if v == max_votes],
+                            key=lambda k: body_best_by_id[k]["similarity"]
+                        )
+                        best_candidate = body_best_by_id[consensus_id]
+                        best_similarity = body_best_by_id[consensus_id]["similarity"]
+                        logger.info(
+                            f"[Body Consensus] {max_votes}/{min(3, len(candidates))} candidates "
+                            f"agree on ID {str(consensus_id)[:8]} (sim={best_similarity:.3f})"
+                        )
+                    else:
+                        best_candidate = None
+                        best_similarity = -1.0
+                        logger.debug(
+                            f"[Body Consensus] No consensus: top votes={body_votes}"
+                        )
 
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
             required_threshold = self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
@@ -298,12 +331,20 @@ class IdentityDecisionEngine:
     async def _search_similar(
         self, db: AsyncSession, embedding: np.ndarray, top_k: int
     ) -> list:
-        """Search for similar body embeddings using pgvector cosine distance."""
+        """Search for similar body embeddings using pgvector cosine distance.
+
+        Deduplicates by person_identity_id — returns the best match per unique
+        person, rather than raw embeddings.  This prevents a single person with
+        10 stored body embeddings from dominating the top-K results.
+        """
         try:
             embedding_list = embedding.tolist()
 
             # Better recall on the IVFFlat index for this transaction
             await db.execute(text("SET LOCAL ivfflat.probes = 10"))
+
+            # Fetch more candidates than needed for dedup by person
+            fetch_limit = max(top_k * 5, 25)
 
             query = text("""
                 SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
@@ -314,24 +355,34 @@ class IdentityDecisionEngine:
                 JOIN person_identities pi ON pe.person_identity_id = pi.id
                 WHERE pe.captured_at > NOW() - INTERVAL '48 hours'
                 ORDER BY pe.embedding <=> :embedding
-                LIMIT :top_k
+                LIMIT :fetch_limit
             """)
 
             result = await db.execute(
-                query, {"embedding": str(embedding_list), "top_k": top_k}
+                query, {"embedding": str(embedding_list), "fetch_limit": fetch_limit}
             )
             rows = result.fetchall()
 
-            candidates = []
+            # Deduplicate: keep only the best match per person_identity_id
+            best_by_person: dict = {}
             for row in rows:
-                candidates.append({
-                    "person_identity_id": row[0],
-                    "camera_id": row[1],
-                    "crop_quality": row[2],
-                    "captured_at": row[3],
-                    "last_seen_at": row[4],
-                    "distance": float(row[5]),
-                })
+                pid = row[0]
+                dist = float(row[5])
+                sim = 1.0 - dist
+                if pid not in best_by_person or sim > best_by_person[pid]["similarity"]:
+                    best_by_person[pid] = {
+                        "person_identity_id": pid,
+                        "camera_id": row[1],
+                        "crop_quality": row[2],
+                        "captured_at": row[3],
+                        "last_seen_at": row[4],
+                        "distance": dist,
+                        "similarity": sim,
+                    }
+
+            candidates = sorted(
+                best_by_person.values(), key=lambda c: c["distance"]
+            )[:top_k]
 
             return candidates
 

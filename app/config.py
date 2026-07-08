@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     YOLO_ALLOWED_CLASSES: str = "0"  # comma-separated class IDs
     OSNET_MODEL_PATH: str = "models/osnet_x1_0.pth"
     REID_EMBEDDING_DIM: int = 512
-    REID_MATCH_THRESHOLD: float = 0.80
+    REID_MATCH_THRESHOLD: float = 0.85   # Body ReID match threshold (raised from 0.80 — OSNet self-sim floors at 0.58, overlap with diff at 0.10-0.40)
     REID_CROP_QUALITY_THRESHOLD: float = 0.30
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
