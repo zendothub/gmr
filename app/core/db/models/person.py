@@ -25,6 +25,7 @@ class PersonIdentity(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     visit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     is_anonymous: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_staff: Mapped[bool] = mapped_column(default=False, nullable=False)  # auto-classified by dedup job
 
     # Demographic fields
     gender: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)

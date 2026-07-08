@@ -14,6 +14,12 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.person import PersonIdentity, PersonEmbedding
+
+# ── Shared staff exclusion subquery ──────────────────────────────────────
+# Used by all purchase/billing count queries so employees (who generate
+# hundreds of billing events per shift) don't inflate analytics.  Staff
+# classification runs every 10 min in the dedup job.
+_STAFF_IDS = select(PersonIdentity.id).where(PersonIdentity.is_staff.is_(True))
 from app.core.db.models.store import Store
 from collections import defaultdict
 from app.modules.analytics.schemas import (
@@ -167,6 +173,7 @@ class AnalyticsService:
         base = select(BillingInteraction).where(
             BillingInteraction.entered_at >= start,
             BillingInteraction.entered_at <= end,
+            BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
         )
         if cam_ids:
             base = base.where(BillingInteraction.camera_id.in_(cam_ids))
@@ -334,10 +341,11 @@ class AnalyticsService:
             entries_q = entries_q.where(Event.camera_id.in_(cam_ids))
         total_entries = (await db.execute(entries_q)).scalar() or 0
 
-        # --- Total purchases (billing interactions) ---
-        purchases_q = select(func.count(BillingInteraction.id)).where(
+        # --- Total purchases (billing interactions, excl. staff) ---
+        purchases_q = select(func.count(func.distinct(BillingInteraction.person_identity_id))).where(
             BillingInteraction.entered_at >= start,
             BillingInteraction.entered_at <= end,
+            BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
         )
         if cam_ids:
             purchases_q = purchases_q.where(BillingInteraction.camera_id.in_(cam_ids))
@@ -916,9 +924,10 @@ class AnalyticsService:
 
         # ── 5. Purchases ──────────────────────────────────────────────────
         def _purchase_q(s, e):
-            q = select(func.count(BillingInteraction.id)).where(
+            q = select(func.count(func.distinct(BillingInteraction.person_identity_id))).where(
                 BillingInteraction.entered_at >= s,
                 BillingInteraction.entered_at <= e,
+                BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
             )
             if cam_ids:
                 q = q.where(BillingInteraction.camera_id.in_(cam_ids))
@@ -1250,9 +1259,10 @@ class AnalyticsService:
             return q
 
         def _purchase_q(s, e):
-            q = select(func.count(BillingInteraction.id)).where(
+            q = select(func.count(func.distinct(BillingInteraction.person_identity_id))).where(
                 BillingInteraction.entered_at >= s,
                 BillingInteraction.entered_at <= e,
+                BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
             )
             if cam_ids:
                 q = q.where(BillingInteraction.camera_id.in_(cam_ids))
@@ -1853,8 +1863,9 @@ class AnalyticsService:
             # Daily map - use IST timezone
             d_bexpr2 = func.date_trunc("day", func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
             dq2 = (
-                select(d_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
-                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
+                select(d_bexpr2.label("b"), func.count(func.distinct(BillingInteraction.person_identity_id)).label("c"))
+                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end,
+                       BillingInteraction.person_identity_id.notin_(_STAFF_IDS))
                 .group_by("b").order_by("b")
             )
             if cam_ids:
@@ -1873,8 +1884,9 @@ class AnalyticsService:
             # Hourly map for peak_hours_label - use IST timezone
             h_bexpr2 = func.date_trunc("hour", func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
             hq2 = (
-                select(h_bexpr2.label("b"), func.count(BillingInteraction.id).label("c"))
-                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end)
+                select(h_bexpr2.label("b"), func.count(func.distinct(BillingInteraction.person_identity_id)).label("c"))
+                .where(BillingInteraction.entered_at >= start, BillingInteraction.entered_at <= end,
+                       BillingInteraction.person_identity_id.notin_(_STAFF_IDS))
                 .group_by("b").order_by("b")
             )
             if cam_ids:

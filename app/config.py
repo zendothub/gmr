@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     # FACE_SEARCH_THRESHOLD intentionally removed — skip_body_reid logic has been eliminated (caused duplicate registrations)
 
     # ------------------------------------------------------------------
+    # Staff detection — auto-classifies frequent visitors so purchase
+    # analytics exclude employees (who generate hundreds of billing events
+    # per shift).  Runs inside the periodic dedup job (every 10 min).
+    # ------------------------------------------------------------------
+    STAFF_DURATION_THRESHOLD_SECONDS: int = 1800   # total visible time across all sessions (default 30 min)
+    STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
+
+    # ------------------------------------------------------------------
     # MiVOLO — gender + age (replaces InsightFace demographics)
     # ------------------------------------------------------------------
     MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 IMDB (ViT-Small, 3-class, ~103 MB, best of 4)

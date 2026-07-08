@@ -1318,6 +1318,7 @@ class CameraWorker:
 
     async def _persist_events(self, db, frame, rule_events: List[RuleEvent], zone_events: List[ZoneEvent]):
         """Persist rule engine events and automatic zone events to PostgreSQL."""
+        from sqlalchemy import select
         from app.core.db.models.event import Event, EventSeverity
         from app.core.db.models.billing import BillingInteraction
 
@@ -1342,8 +1343,18 @@ class CameraWorker:
                 )
                 db.add(event)
 
-                # Billing interactions get an additional structured record
+                # Billing interactions get an additional structured record.
+                # Only create ONE per track_session + zone to prevent
+                # cooldown resets from inflating purchase counts.
                 if ev.rule_type == "billing_interaction":
+                    existing = await db.execute(
+                        select(BillingInteraction).where(
+                            BillingInteraction.track_session_id == ev.track_session_id,
+                            BillingInteraction.zone_id == ev.zone_id,
+                        )
+                    )
+                    if existing.scalar_one_or_none() is not None:
+                        continue  # already recorded for this track+zone combo
                     interaction = BillingInteraction(
                         camera_id=ev.camera_id,
                         person_identity_id=ev.person_identity_id,

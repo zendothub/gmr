@@ -11,6 +11,7 @@ from app.core.db.models.camera import Camera, CameraStatus
 from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
+from app.core.db.models.person import PersonIdentity
 from app.core.db.models.analytics import DailyAnalyticsSummary
 from app.modules.storage.service import cleanup_old_objects as s3_cleanup_old_objects
 from app.utils.time_utils import utc_now
@@ -58,12 +59,15 @@ async def aggregate_daily_analytics():
                 )
             ).scalar()
 
-            # Billing interactions
+            # Billing interactions (unique purchasers excl. staff)
             total_billing = (
                 await db.execute(
-                    select(func.count()).where(
+                    select(func.count(func.distinct(BillingInteraction.person_identity_id))).where(
                         BillingInteraction.entered_at >= day_start,
                         BillingInteraction.entered_at < day_end,
+                        BillingInteraction.person_identity_id.notin_(
+                            select(PersonIdentity.id).where(PersonIdentity.is_staff.is_(True))
+                        ),
                     )
                 )
             ).scalar() or 0
@@ -354,6 +358,41 @@ async def deduplicate_persons():
             swept = await _sweep_orphaned_crops(db)
             if swept > 0:
                 logger.info(f"MinIO sweep: removed {swept} unreferenced crop file(s).")
+
+            # ── Step 5: classify staff ────────────────────────────────────────
+            # A person is flagged as staff if their TOTAL visible session time
+            # across all cameras exceeds the configurable duration threshold
+            # (default 30 min) OR if they have appeared on 3+ distinct days.
+            # Staff persons are excluded from all purchase/billing analytics.
+            _dur = settings.STAFF_DURATION_THRESHOLD_SECONDS
+            _days = settings.STAFF_DISTINCT_DAYS_THRESHOLD
+            promote_result = await db.execute(text("""
+                UPDATE person_identities SET is_staff = TRUE WHERE is_staff = FALSE AND id IN (
+                    SELECT pi.id FROM person_identities pi
+                    LEFT JOIN track_sessions ts ON ts.person_identity_id = pi.id
+                    GROUP BY pi.id
+                    HAVING COALESCE(SUM(EXTRACT(epoch FROM COALESCE(ts.ended_at, ts.last_seen_at) - ts.started_at)), 0) > :dur
+                        OR COUNT(DISTINCT DATE(ts.started_at)) >= :days
+                )
+            """), {"dur": _dur, "days": _days})
+            # Demote persons who no longer meet criteria (e.g., after data reset)
+            # BUT only if they have NO active tracks — staff might be mid-shift.
+            demote_result = await db.execute(text("""
+                UPDATE person_identities SET is_staff = FALSE WHERE is_staff = TRUE AND id NOT IN (
+                    SELECT pi.id FROM person_identities pi
+                    LEFT JOIN track_sessions ts ON ts.person_identity_id = pi.id
+                    GROUP BY pi.id
+                    HAVING COALESCE(SUM(EXTRACT(epoch FROM COALESCE(ts.ended_at, ts.last_seen_at) - ts.started_at)), 0) > :dur
+                        OR COUNT(DISTINCT DATE(ts.started_at)) >= :days
+                )
+            """), {"dur": _dur, "days": _days})
+            await db.commit()
+            if promote_result.rowcount or demote_result.rowcount:
+                logger.info(
+                    f"Staff classification: +{promote_result.rowcount} promoted, "
+                    f"-{demote_result.rowcount} demoted "
+                    f"(dur>{_dur}s OR days>={_days})"
+                )
 
         except Exception as e:
             await db.rollback()
