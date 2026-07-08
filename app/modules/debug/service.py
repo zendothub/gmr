@@ -79,7 +79,7 @@ class DebugService:
                 PersonIdentity,
                 func.count(TrackSession.id).label("total_tracks"),
                 func.count(func.distinct(func.cast(TrackSession.started_at, Date))).label("total_days"),
-                func.coalesce(purchase_subq.c.purchase_count, 0).label("purchase_count"),
+                func.coalesce(func.max(purchase_subq.c.purchase_count), 0).label("purchase_count"),
             )
             .outerjoin(TrackSession, PersonIdentity.id == TrackSession.person_identity_id)
             .outerjoin(purchase_subq, PersonIdentity.id == purchase_subq.c.person_identity_id)
