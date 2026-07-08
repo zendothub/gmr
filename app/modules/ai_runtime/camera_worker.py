@@ -619,6 +619,14 @@ class CameraWorker:
 
                     # Persist demographics to PersonIdentity if available
                     if track.best_demographics:
+                        _votes = track.gender_votes
+                        _gender = track.best_demographics.get("gender")
+                        if _gender is None:
+                            logger.warning(
+                                f"Track {track.local_track_id}: no gender votes cast "
+                                f"(M={_votes.get('M',0)} F={_votes.get('F',0)}) — "
+                                f"PersonIdentity.gender will be NULL"
+                            )
                         person_id_uuid = track.person_identity_id if isinstance(track.person_identity_id, uuid.UUID) else uuid.UUID(str(track.person_identity_id))
                         person_record = await db.get(PersonIdentity, person_id_uuid)
                         if person_record:
@@ -819,6 +827,23 @@ class CameraWorker:
                             face_result.gender    = _mivolo["gender"]
                             face_result.age       = _mivolo["age"]
                             face_result.age_group = self.mivolo_analyzer._age_to_group(_mivolo["age"])
+                            logger.debug(
+                                f"Track {track.local_track_id}: MiVOLO gender={_mivolo['gender']} "
+                                f"age={_mivolo['age']}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Track {track.local_track_id}: MiVOLO returned None (inference failed)"
+                            )
+                    elif self.mivolo_analyzer:
+                        logger.debug(
+                            f"Track {track.local_track_id}: MiVOLO skipped — face_crop is None"
+                        )
+                    else:
+                        logger.warning(
+                            f"Track {track.local_track_id}: MiVOLO not available — "
+                            f"self.mivolo_analyzer is None (demographic_enabled={self.demographic_enabled})"
+                        )
 
                     track.face_analysis_count += 1
                     
@@ -874,7 +899,12 @@ class CameraWorker:
                     # of relying on the handful of perfectly frontal shots.
                     if face_result.gender in ("M", "F"):
                         track.gender_votes[face_result.gender] += 1
-                    _majority_gender = "M" if track.gender_votes.get("M", 0) >= track.gender_votes.get("F", 0) else "F"
+                    _m_votes = track.gender_votes.get("M", 0)
+                    _f_votes = track.gender_votes.get("F", 0)
+                    if _m_votes == 0 and _f_votes == 0:
+                        _majority_gender = None  # no votes yet → unknown
+                    else:
+                        _majority_gender = "M" if _m_votes >= _f_votes else "F"
 
                     # Keep best_demographics gender in sync even for non-frontal frames
                     if track.best_demographics is not None:
