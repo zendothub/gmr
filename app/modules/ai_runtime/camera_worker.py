@@ -917,7 +917,6 @@ class CameraWorker:
                         rx, ry = float(kps[1][0]), float(kps[1][1])
                         face_result.eye_spread = abs(rx - lx) / fw
                     if kps is not None and len(kps) >= 5:
-                        import numpy as np
                         spread_sc = min(1.0, face_result.eye_spread / 0.35)
                         nose_cx = float(kps[2][0])
                         nose_off = abs(nose_cx - fcx) / (fw / 2.0)
