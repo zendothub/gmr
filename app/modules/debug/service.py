@@ -23,13 +23,27 @@ class DebugService:
         size: int = 10,
         search: Optional[str] = None,
         gender: Optional[str] = None,
+        is_staff: Optional[bool] = None,
+        has_purchase: Optional[bool] = None,
     ) -> PaginatedUniquePersonsResponse:
         """Get all unique person identities with basic statistics (paginated)."""
         from app.core.db.models.person import PersonIdentity
         from app.core.db.models.tracking import TrackSession
+        from app.core.db.models.billing import BillingInteraction
         from sqlalchemy import Date, or_, String, func
 
-        # Build count query
+        # ── Purchase count subquery ──────────────────────────────────────
+        purchase_subq = (
+            select(
+                BillingInteraction.person_identity_id,
+                func.count(BillingInteraction.id).label("purchase_count"),
+            )
+            .where(BillingInteraction.person_identity_id.isnot(None))
+            .group_by(BillingInteraction.person_identity_id)
+            .subquery()
+        )
+
+        # ── Count query ──────────────────────────────────────────────────
         count_stmt = select(func.count(PersonIdentity.id))
         if search:
             count_stmt = count_stmt.where(
@@ -41,16 +55,34 @@ class DebugService:
             )
         if gender:
             count_stmt = count_stmt.where(PersonIdentity.gender == gender)
+        if is_staff is not None:
+            count_stmt = count_stmt.where(PersonIdentity.is_staff.is_(is_staff))
+        if has_purchase is not None:
+            if has_purchase:
+                # Persons who have at least one BillingInteraction
+                count_stmt = count_stmt.where(
+                    PersonIdentity.id.in_(
+                        select(purchase_subq.c.person_identity_id)
+                    )
+                )
+            else:
+                count_stmt = count_stmt.where(
+                    PersonIdentity.id.notin_(
+                        select(purchase_subq.c.person_identity_id)
+                    )
+                )
         total_count = (await db.execute(count_stmt)).scalar() or 0
 
-        # Build main paginated query with outer join to count tracks and distinct days
+        # ── Main paginated query ─────────────────────────────────────────
         stmt = (
             select(
                 PersonIdentity,
                 func.count(TrackSession.id).label("total_tracks"),
-                func.count(func.distinct(func.cast(TrackSession.started_at, Date))).label("total_days")
+                func.count(func.distinct(func.cast(TrackSession.started_at, Date))).label("total_days"),
+                func.coalesce(purchase_subq.c.purchase_count, 0).label("purchase_count"),
             )
             .outerjoin(TrackSession, PersonIdentity.id == TrackSession.person_identity_id)
+            .outerjoin(purchase_subq, PersonIdentity.id == purchase_subq.c.person_identity_id)
         )
         if search:
             stmt = stmt.where(
@@ -62,6 +94,21 @@ class DebugService:
             )
         if gender:
             stmt = stmt.where(PersonIdentity.gender == gender)
+        if is_staff is not None:
+            stmt = stmt.where(PersonIdentity.is_staff.is_(is_staff))
+        if has_purchase is not None:
+            if has_purchase:
+                stmt = stmt.where(
+                    PersonIdentity.id.in_(
+                        select(purchase_subq.c.person_identity_id)
+                    )
+                )
+            else:
+                stmt = stmt.where(
+                    PersonIdentity.id.notin_(
+                        select(purchase_subq.c.person_identity_id)
+                    )
+                )
         
         stmt = (
             stmt.group_by(PersonIdentity.id)
@@ -74,7 +121,7 @@ class DebugService:
         rows = result.all()
 
         persons_list = []
-        for person, total_tracks, total_days in rows:
+        for person, total_tracks, total_days, purchase_count in rows:
             persons_list.append(
                 UniquePersonItem(
                     id=person.id,
@@ -88,6 +135,8 @@ class DebugService:
                     visit_count=person.visit_count,
                     total_tracks=total_tracks,
                     total_days=total_days,
+                    is_staff=person.is_staff,
+                    total_purchases=purchase_count,
                 )
             )
 

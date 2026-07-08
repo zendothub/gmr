@@ -39,6 +39,8 @@ async def get_unique_persons(
     size: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None),
     gender: Optional[str] = Query(None, pattern="^(M|F)$"),
+    is_staff: Optional[bool] = Query(None),
+    has_purchase: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -47,8 +49,13 @@ async def get_unique_persons(
 
     - **search**: free-text search across gender, age_group, and UUID
     - **gender**: filter by gender ("M" or "F"), default shows all
+    - **is_staff**: filter by staff status (True/False), default shows all
+    - **has_purchase**: show only persons with (True) or without (False) purchase events
     """
-    return await DebugService.get_unique_persons(db, page=page, size=size, search=search, gender=gender)
+    return await DebugService.get_unique_persons(
+        db, page=page, size=size, search=search, gender=gender,
+        is_staff=is_staff, has_purchase=has_purchase,
+    )
 
 
 @router.get("/unique-persons/{person_id}/tracks", response_model=PaginatedTracksResponse)

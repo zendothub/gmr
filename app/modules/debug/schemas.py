@@ -80,6 +80,8 @@ class UniquePersonItem(BaseModel):
     visit_count: int
     total_tracks: int
     total_days: int
+    is_staff: bool = False
+    total_purchases: int = 0
 
 
 class PaginatedUniquePersonsResponse(BaseModel):
