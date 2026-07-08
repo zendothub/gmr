@@ -931,9 +931,14 @@ class CameraWorker:
                     else:
                         face_result.frontality_score = 0.5
 
-                    # ── SigLIP2 gender (100% on clean retail CCTV) ────────
+                    # ── SigLIP2 gender (face + body combined) ─────────────
                     if self.siglip2_analyzer:
+                        # Body crop padded to 224² for clothing context
+                        body_crop_sq = resize_pad_square(crop, 224) if crop is not None and crop.size > 0 else None
                         _sig = await run_inference(
+                            self.siglip2_analyzer.analyze_with_body,
+                            face_crop_sq, body_crop_sq
+                        ) if body_crop_sq is not None else await run_inference(
                             self.siglip2_analyzer.analyze, face_crop_sq
                         )
                         if _sig:

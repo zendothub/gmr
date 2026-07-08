@@ -168,3 +168,39 @@ class SigLIP2Analyzer:
         except Exception as e:
             logger.error(f"SigLIP2 inference failed: {e}")
             return None
+
+    def analyze_with_body(
+        self, face_crop: np.ndarray, body_crop: np.ndarray
+    ) -> Optional[Dict[str, object]]:
+        """Predict gender from BOTH face and body crops, combining votes.
+
+        Body crop carries full clothing context (saree, kurta, uniform etc.)
+        which dramatically improves gender classification for persons wearing
+        culturally distinctive attire.  Body votes are weighted 3× per crop
+        vs 1× per face crop since they carry more signal.
+        """
+        face_result = self.analyze(face_crop)
+        body_result = self.analyze(body_crop)
+
+        if face_result is None and body_result is None:
+            return None
+
+        # Count weighted votes
+        f_g = face_result["gender"] if face_result else None
+        b_g = body_result["gender"] if body_result else None
+
+        votes = {"M": 0, "F": 0}
+        if f_g:
+            votes[f_g] += 1
+        if b_g:
+            votes[b_g] += 3  # body provides clothing context → higher weight
+
+        gender = "F" if votes["F"] > votes["M"] else "M"
+        total = max(votes["M"] + votes["F"], 1)
+        prob = votes["F"] / total
+
+        return {
+            "gender": gender,
+            "gender_prob": prob,
+            "gender_confidence": max(prob, 1.0 - prob),
+        }
