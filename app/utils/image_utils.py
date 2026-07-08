@@ -96,6 +96,30 @@ async def save_image_async(image: np.ndarray, directory: str, prefix: str = "img
     return await loop.run_in_executor(None, save_image, image, directory, prefix)
 
 
+def resize_pad_square(image: np.ndarray, target_size: int = 224) -> np.ndarray:
+    """Resize an image to fit in a square, preserving aspect ratio, centre-padding
+    with edge-replicated pixels.  No stretching or distortion.
+
+    Args:
+        image:   H×W×3 numpy array (BGR or RGB, preserved)
+        target_size:  square side length in pixels (default 224)
+
+    Returns:
+        target_size × target_size × 3 numpy array
+    """
+    h, w = image.shape[:2]
+    if max(h, w) == 0:
+        return np.zeros((target_size, target_size, image.shape[2] if len(image.shape) > 2 else 1), dtype=image.dtype)
+    scale = target_size / max(h, w)
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_top = (target_size - new_h) // 2
+    pad_left = (target_size - new_w) // 2
+    pad_bottom = target_size - new_h - pad_top
+    pad_right = target_size - new_w - pad_left
+    return cv2.copyMakeBorder(resized, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REPLICATE)
+
+
 def frame_to_jpeg_bytes(frame: np.ndarray, quality: int = 80) -> Optional[bytes]:
     """Convert a frame to JPEG bytes for streaming."""
     try:

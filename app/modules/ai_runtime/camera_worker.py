@@ -31,7 +31,7 @@ from app.modules.reid.mivolo_analyzer import get_shared_mivolo
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
-from app.utils.image_utils import extract_crop, save_image, save_image_async
+from app.utils.image_utils import extract_crop, save_image, save_image_async, resize_pad_square
 
 from app.utils.time_utils import utc_now
 from app.utils.geometry import polygon_from_json
@@ -294,15 +294,78 @@ class CameraWorker:
             sleep_for = max(0.001, interval - elapsed)
             await asyncio.sleep(sleep_for)
 
+    @staticmethod
+    def _match_face_to_track(all_faces: list[dict], body_bbox: dict, frame_h: int, frame_w: int) -> Optional[dict]:
+        """Find the face detection most likely belonging to this body track.
+
+        A face is considered to belong to a body if its centre falls inside the
+        body bounding box (expanded by 15% to account for loose body detections).
+        When multiple faces qualify, the one with the highest composite score
+        (size × centre-proximity × detection-confidence) wins.
+        """
+        if not all_faces:
+            return None
+
+        bx, by, bx2, by2 = body_bbox["x1"], body_bbox["y1"], body_bbox["x2"], body_bbox["y2"]
+        bw, bh = bx2 - bx, by2 - by
+        body_cx = (bx + bx2) / 2.0
+
+        # Expand body bbox by 15% for face-centre membership check
+        margin_h = bh * 0.15
+        margin_w = bw * 0.15
+
+        candidates = []
+        for f in all_faces:
+            fb = f["bbox"]
+            fx_cx = (fb["x1"] + fb["x2"]) / 2.0
+            fy_cy = (fb["y1"] + fb["y2"]) / 2.0
+
+            if not (bx - margin_w <= fx_cx <= bx2 + margin_w):
+                continue
+            if not (by - margin_h <= fy_cy <= by2 + margin_h):
+                continue
+
+            fw = fb["x2"] - fb["x1"]
+            fh = fb["y2"] - fb["y1"]
+            face_area = fw * fh
+            body_area = max(bw * bh, 1.0)
+
+            # Larger face, more centred, higher confidence → likely correct
+            size_score = min(1.0, face_area / (body_area * 0.03))
+            centre_dev = abs(fx_cx - body_cx) / max(bw / 2.0, 1.0)
+            centre_score = max(0.0, 1.0 - centre_dev)
+            geo = 0.5 * size_score + 0.5 * centre_score
+            candidates.append((float(f["det_score"]) * geo, f))
+
+        if not candidates:
+            return None
+
+        # Mark the chosen face as "claimed" so it isn't double-assigned
+        _, best_face = max(candidates, key=lambda x: x[0])
+        best_face["_claimed"] = True
+        # Remove from the list to prevent other tracks from claiming it
+        try:
+            all_faces.remove(best_face)
+        except ValueError:
+            pass
+        return best_face
+
     async def _process_frame(self, frame):
         """Run the full pipeline on a single frame."""
+        height, width = frame.shape[:2]
+
         # 1) Unified YOLO Detection & Tracking on the shared inference pool
         tracked_detections = await run_inference(self.detector.track, frame)
 
-        # 2) Update in-memory track state and zones; collect pending DB work
-        #    (Cameras are static — no ROI filtering needed; detection runs on full frame)
+        # 2) Full-frame face detection (ONE InsightFace call for ALL tracks)
+        all_faces: list[dict] = []
+        if self.demographic_enabled and self.insightface_analyzer:
+            all_faces = await run_inference(
+                self.insightface_analyzer.detect_all_faces, frame
+            )
+
+        # 3) Update in-memory track state and zones; match faces to tracks; collect pending DB work
         now_mono = time.monotonic()
-        height, width = frame.shape[:2]
         active_tracks: List[ActiveTrack] = []
         new_tracks: List[ActiveTrack] = []
         reid_tracks: List[ActiveTrack] = []
@@ -324,6 +387,13 @@ class CameraWorker:
                     and track.should_run_reid()
                 ):
                     reid_tracks.append(track)
+
+                # Match a face from full-frame detection to this body track.
+                # Stored on the track for _run_reid to consume; avoids calling
+                # InsightFace per-track and gives native-resolution face crops.
+                track._matched_face = self._match_face_to_track(
+                    all_faces, td.bbox, height, width
+                )
 
                 # Sampled observation (1 per track every OBS_SAMPLE_SECONDS)
                 last_obs = self._last_obs_time.get(track.local_track_id, 0.0)
@@ -800,28 +870,70 @@ class CameraWorker:
             track.current_face_crop_path = None
             track.current_face_score = 0.0
             track.current_face_bbox = None
-            if self.demographic_enabled and self.insightface_analyzer:
-                face_result = await run_inference(self.insightface_analyzer.analyze, crop)
-                if face_result:
-                    # Save current frame's detected face crop for real-time debug
-                    current_face_path = None
-                    if face_result.face_crop is not None:
-                        current_face_path = await save_image_async(face_result.face_crop, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}")
+
+            # ── Full-frame face (NO per-track InsightFace call) ────────────
+            # face was pre-detected on the full frame in _process_frame and
+            # matched to this track.  Extract the face crop at NATIVE resolution
+            # from the full frame (not the body crop), pad-resize to 224² for
+            # MiVOLO, and build an InsightFaceResult for the downstream pipeline.
+            _face_info = getattr(track, '_matched_face', None)
+            if _face_info:
+                face_bbox = _face_info["bbox"]
+                face_crop_raw = await asyncio.to_thread(
+                    extract_crop, frame, face_bbox, padding_pct=0.30
+                )
+                if face_crop_raw is not None and face_crop_raw.size > 0:
+                    # Pad-resize to square (preserves aspect ratio, no distortion)
+                    face_crop_sq = resize_pad_square(face_crop_raw, 224)
+
+                    # Save for real-time debug
+                    current_face_path = await save_image_async(
+                        face_crop_sq, self.settings.CROP_DIR, prefix=f"curr_face_{self.camera_id}"
+                    )
                     track.current_face_crop_path = current_face_path
-                    # Delete the previous curr_face file — it has been replaced
                     if _prev_curr_face and _prev_curr_face != current_face_path:
                         self._minio_cleanup(_prev_curr_face)
-                    track.current_face_score = face_result.face_quality
-                    track.current_face_bbox = face_result.face_bbox
 
-                    # ── MiVOLO gender + age ───────────────────────────────────
-                    # InsightFace no longer loads the genderage module — MiVOLO
-                    # (ViT-Small, ~103 MB) provides both.  It runs on the face
-                    # crop detected by InsightFace and is more accurate (~95-97%
-                    # vs InsightFace's ~85-90%).
-                    if self.mivolo_analyzer and face_result.face_crop is not None:
+                    # Build result — age/gender come from MiVOLO below
+                    from app.modules.reid.insightface_analyzer import InsightFaceResult
+                    face_result = InsightFaceResult(
+                        age=None, gender=None, age_group=None,
+                        face_score=float(_face_info.get("det_score", 0.0)),
+                        face_bbox=face_bbox,
+                        embedding=_face_info.get("embedding"),
+                        face_crop=face_crop_sq,
+                        kps=_face_info.get("kps"),
+                    )
+                    from app.modules.reid.crop_quality import assess_face_quality as a_fq
+                    face_result.face_quality = a_fq(face_result)
+
+                    # Compute eye_spread / frontality from kps (matches original)
+                    fw = max(face_bbox["x2"] - face_bbox["x1"], 1.0)
+                    fh = max(face_bbox["y2"] - face_bbox["y1"], 1.0)
+                    fcx = (face_bbox["x1"] + face_bbox["x2"]) / 2.0
+                    kps = _face_info.get("kps")
+                    if kps is not None and len(kps) >= 2:
+                        lx, ly = float(kps[0][0]), float(kps[0][1])
+                        rx, ry = float(kps[1][0]), float(kps[1][1])
+                        face_result.eye_spread = abs(rx - lx) / fw
+                    if kps is not None and len(kps) >= 5:
+                        import numpy as np
+                        spread_sc = min(1.0, face_result.eye_spread / 0.35)
+                        nose_cx = float(kps[2][0])
+                        nose_off = abs(nose_cx - fcx) / (fw / 2.0)
+                        nose_sc = max(0.0, 1.0 - nose_off)
+                        eye_vert = abs(float(kps[1][1]) - float(kps[0][1])) / fh
+                        sym_sc = max(0.0, 1.0 - eye_vert * 4.0)
+                        face_result.frontality_score = 0.55 * spread_sc + 0.30 * nose_sc + 0.15 * sym_sc
+                    elif kps is not None and len(kps) >= 2:
+                        face_result.frontality_score = min(1.0, face_result.eye_spread / 0.35)
+                    else:
+                        face_result.frontality_score = 0.5
+
+                    # ── MiVOLO gender + age ────────────────────────────────
+                    if self.mivolo_analyzer:
                         _mivolo = await run_inference(
-                            self.mivolo_analyzer.analyze, face_result.face_crop
+                            self.mivolo_analyzer.analyze, face_crop_sq
                         )
                         if _mivolo:
                             face_result.gender    = _mivolo["gender"]
@@ -833,19 +945,17 @@ class CameraWorker:
                             )
                         else:
                             logger.warning(
-                                f"Track {track.local_track_id}: MiVOLO returned None (inference failed)"
+                                f"Track {track.local_track_id}: MiVOLO returned None"
                             )
-                    elif self.mivolo_analyzer:
-                        logger.debug(
-                            f"Track {track.local_track_id}: MiVOLO skipped — face_crop is None"
-                        )
-                    else:
-                        logger.warning(
-                            f"Track {track.local_track_id}: MiVOLO not available — "
-                            f"self.mivolo_analyzer is None (demographic_enabled={self.demographic_enabled})"
-                        )
+                    track.current_face_score = face_result.face_quality
+                    track.current_face_bbox = face_result.face_bbox
 
-                    track.face_analysis_count += 1
+                    # Clean up previous curr_face if face_crop failed (no new upload)
+                elif _prev_curr_face:
+                    self._minio_cleanup(_prev_curr_face)
+
+            # If we got a face, proceed with frontality checks etc.
+            if face_result:
                     
                     # Validate frontality criteria using settings.
                     # face_quality from assess_face_quality() now encodes both det_score

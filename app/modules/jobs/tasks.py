@@ -184,7 +184,7 @@ async def deduplicate_persons():
     """
     from app.config import get_settings
     settings = get_settings()
-    threshold = settings.FACE_MATCH_THRESHOLD
+    threshold = 0.40  # empirically determined from retail CCTV face distribution
 
     async with AsyncSessionLocal() as db:
         try:

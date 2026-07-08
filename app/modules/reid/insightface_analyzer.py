@@ -85,6 +85,51 @@ class InsightFaceAnalyzer:
             logger.error(f"Failed to initialize InsightFace analyzer: {e}")
             self.app = None
 
+    def detect_all_faces(self, frame: np.ndarray) -> list[dict]:
+        """Run SCRFD detection + ArcFace embedding on the FULL frame (not a body crop).
+
+        Returns a flat list of raw face detections in full-frame pixel coordinates.
+        Each dict has keys: ``bbox`` (x1,y1,x2,y2), ``embedding`` (512-dim),
+        ``kps`` (5-point landmarks), ``det_score`` (float).
+
+        The caller is responsible for matching faces to body tracks by checking
+        whether a face centre falls inside a body bounding box.
+        """
+        if self.app is None or frame is None or frame.size == 0:
+            return []
+
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            faces = self.app.get(rgb_frame)
+            if not faces:
+                return []
+
+            h, w = frame.shape[:2]
+            detections = []
+            for f in faces:
+                bbox = f.bbox
+                f_x1, f_y1, f_x2, f_y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                f_w = f_x2 - f_x1
+                f_h = f_y2 - f_y1
+
+                # Skip tiny / implausible faces
+                if f_w < 5 or f_h < 5:
+                    continue
+                # Skip faces at the very edge of the frame
+                if f_x1 < 0 or f_y1 < 0 or f_x2 > w or f_y2 > h:
+                    continue
+
+                detections.append({
+                    "bbox": {"x1": f_x1, "y1": f_y1, "x2": f_x2, "y2": f_y2},
+                    "embedding": getattr(f, "embedding", None),
+                    "kps": getattr(f, "kps", None),
+                    "det_score": float(f.det_score),
+                })
+            return detections
+        except Exception as e:
+            logger.error(f"Full-frame face detection failed: {e}")
+            return []
+
     def analyze(self, crop: np.ndarray) -> Optional[InsightFaceResult]:
         """
         Run face detection, demographic analysis, and face embedding extraction on a person crop.

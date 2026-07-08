@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # MiVOLO — gender + age (replaces InsightFace demographics)
     # ------------------------------------------------------------------
-    MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 FairFace (ViT-Small, 3-class, ~103 MB, auto-downloaded)
+    MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 IMDB (ViT-Small, 3-class, ~103 MB, best of 4)
     
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
