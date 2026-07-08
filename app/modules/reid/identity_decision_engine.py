@@ -512,6 +512,33 @@ class IdentityDecisionEngine:
                         )
                     return
 
+            # ── Contamination gate ──────────────────────────────────────────
+            # If existing face embeddings for this person form a cluster (positive
+            # mutual similarity), the new face must belong to that cluster.
+            # A negative cosine similarity (< 0) means it's from a DIFFERENT person
+            # whose body crop overlapped ours.
+            existing_result = await db.execute(text(
+                "SELECT embedding FROM person_face_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                " ORDER BY face_score DESC LIMIT 5"
+            ), {"pid": str(person_id)})
+            existing_faces = existing_result.fetchall()
+            if existing_faces:
+                import numpy as np
+                new_emb = np.array(face_embedding.tolist(), dtype=np.float32)
+                min_sim = float('inf')
+                for row in existing_faces:
+                    emb = np.array(row[0], dtype=np.float32)
+                    sim = float(np.dot(emb, new_emb))
+                    if sim < min_sim:
+                        min_sim = sim
+                if min_sim < 0.0:
+                    logger.warning(
+                        f"Face embedding CONTAMINATION rejected for person {person_id}: "
+                        f"min_sim_to_existing={min_sim:.3f} < 0 (different person's face)"
+                    )
+                    return  # skip — this face doesn't belong to this person
+
             face_emb = PersonFaceEmbedding(
                 person_identity_id=person_id,
                 embedding=face_embedding.tolist(),
