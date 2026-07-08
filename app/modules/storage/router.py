@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.storage import service as storage_svc
@@ -45,6 +46,13 @@ async def get_presigned_url(
             object_name=object_name,
             expires=timedelta(seconds=expires),
         )
+        # Rewrite internal MinIO host to the public-facing base URL
+        # so the browser can fetch assets via the public domain.
+        public_base = get_settings().MINIO_PUBLIC_BASE_URL
+        if public_base and url.startswith("http://"):
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            url = urlunparse(parsed._replace(netloc=urlparse(public_base).netloc, scheme="https"))
         return {"url": url, "expires_in": expires}
     except Exception as exc:
         logger.warning(f"presigned-url failed: bucket={bucket} object={object_name} error={exc}")
