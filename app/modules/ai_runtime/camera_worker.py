@@ -1040,6 +1040,28 @@ class CameraWorker:
                                 face_frontal = False
                                 rejection_reason = "nose offset from eye-midpoint (hallucinated landmarks)"
 
+                    # ── Skin color check ──────────────────────────────────
+                    # InsightFace falsely detects faces on hair, clothing, and
+                    # objects. A real face crop has a significant portion of
+                    # skin-colored pixels (HSV). If the crop is mostly non-skin
+                    # (hair, fabric, wall), it's a false positive.
+                    # False positive example: 2.4% skin. Real face: 15.5% skin.
+                    if face_frontal and face_result.face_crop is not None:
+                        try:
+                            import cv2
+                            hsv = cv2.cvtColor(face_result.face_crop, cv2.COLOR_BGR2HSV)
+                            skin_mask = cv2.inRange(
+                                hsv,
+                                (0, 20, 70),   # lower HSV skin bound
+                                (20, 255, 255) # upper HSV skin bound
+                            )
+                            skin_pct = skin_mask.sum() / 255 / (face_result.face_crop.shape[0] * face_result.face_crop.shape[1])
+                            if skin_pct < 0.03:
+                                face_frontal = False
+                                rejection_reason = f"skin color check failed: {skin_pct*100:.1f}% skin pixels (hair/object false positive)"
+                        except Exception as e:
+                            logger.debug(f"Skin color check failed: {e}")
+
                     if face_frontal and face_result.face_score < self.settings.FACE_MIN_DET_SCORE:
                         face_frontal = False
                         rejection_reason = f"det_score {face_result.face_score:.2f} < {self.settings.FACE_MIN_DET_SCORE}"

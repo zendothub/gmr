@@ -652,7 +652,7 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
 
         # Move to winner
         await db.execute(text("""
-            UPDATE person_face_embeddings SET person_identity_id = :winner::uuid
+            UPDATE person_face_embeddings SET person_identity_id = :winner
             WHERE id = :row_id
         """), {"winner": winner_id, "row_id": row[0]})
         winner_embs.append(loser_emb)
@@ -663,7 +663,7 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
         await db.execute(text("""
             DELETE FROM person_face_embeddings WHERE id IN (
                 SELECT id FROM person_face_embeddings
-                WHERE person_identity_id = :pid::uuid
+                WHERE person_identity_id = :pid
                 ORDER BY face_score DESC OFFSET :keep
             )
         """), {"pid": winner_id, "keep": max_faces})
@@ -720,7 +720,7 @@ async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies:
 
         # Move to winner
         await db.execute(text("""
-            UPDATE person_embeddings SET person_identity_id = :winner::uuid
+            UPDATE person_embeddings SET person_identity_id = :winner
             WHERE id = :row_id
         """), {"winner": winner_id, "row_id": row[0]})
         winner_embs.append(loser_emb)
@@ -731,7 +731,7 @@ async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies:
         await db.execute(text("""
             DELETE FROM person_embeddings WHERE id IN (
                 SELECT id FROM person_embeddings
-                WHERE person_identity_id = :pid::uuid
+                WHERE person_identity_id = :pid
                 ORDER BY crop_quality DESC OFFSET :keep
             )
         """), {"pid": winner_id, "keep": max_bodies})
