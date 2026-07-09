@@ -1,5 +1,6 @@
 """Background job task implementations."""
 
+import asyncio
 from datetime import datetime, timedelta, date
 
 import anyio
@@ -315,7 +316,20 @@ async def deduplicate_persons():
                         f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
                     ), params)
 
-                    # Collect paths to delete from MinIO BEFORE cascade-deleting the loser row
+                    # ── Absorb face embeddings from loser → winner ──────────
+                    # Move loser's face embeddings to winner (up to MAX_FACE_EMBEDDINGS_PER_PERSON=5).
+                    # Skip faces that are >0.95 sim to existing winner faces (duplicate angle).
+                    max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
+                    await _absorb_face_embeddings(db, winner_id, loser_id, max_faces)
+
+                    # ── Absorb body embeddings from loser → winner ──────────
+                    max_bodies = 10  # MAX_EMBEDDINGS_PER_PERSON
+                    await _absorb_body_embeddings(db, winner_id, loser_id, max_bodies)
+
+                    # ── Re-vote gender from ALL tracks ──────────────────────
+                    await _revote_person_gender(db, winner_id)
+
+                    # ── Collect loser's crop paths for MinIO cleanup ────────
                     paths_result = await db.execute(text("""
                         SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
                         UNION ALL
@@ -325,7 +339,7 @@ async def deduplicate_persons():
                     """), {"loser": loser_id})
                     paths_to_remove = [r[0] for r in paths_result.fetchall() if r[0]]
 
-                    # Delete loser (CASCADE removes person_embeddings + person_face_embeddings)
+                    # Delete loser (embeddings already absorbed → no cascade)
                     await db.execute(
                         text("DELETE FROM person_identities WHERE id::text = :loser"),
                         {"loser": loser_id}
@@ -343,7 +357,8 @@ async def deduplicate_persons():
                     merged_count += 1
                     logger.info(
                         f"Dedup: merged {loser_id[:8]} → {winner_id[:8]} "
-                        f"(sim>{threshold:.2f}, +{extra_visits} visits)"
+                        f"(sim>{threshold:.2f}, +{extra_visits} visits, "
+                        f"faces+body absorbed, gender re-voted)"
                     )
 
                 except Exception as e:
@@ -354,12 +369,24 @@ async def deduplicate_persons():
             await db.commit()
             logger.info(f"Dedup job complete: merged {merged_count} duplicate identit(ies).")
 
-            # ── Step 4: sweep orphaned MinIO objects ─────────────────────────
+            # ── Step 4: clean contaminated face embeddings ──────────────────
+            face_removed = await _clean_contaminated_face_embeddings(db, settings)
+            if face_removed > 0:
+                await db.commit()
+                logger.info(f"Face contamination cleanup: removed {face_removed} face embedding(s).")
+
+            # ── Step 5: clean contaminated body embeddings ──────────────────
+            body_removed = await _clean_contaminated_body_embeddings(db, settings)
+            if body_removed > 0:
+                await db.commit()
+                logger.info(f"Body contamination cleanup: removed {body_removed} body embedding(s).")
+
+            # ── Step 6: sweep orphaned MinIO objects ─────────────────────────
             swept = await _sweep_orphaned_crops(db)
             if swept > 0:
                 logger.info(f"MinIO sweep: removed {swept} unreferenced crop file(s).")
 
-            # ── Step 5: classify staff ────────────────────────────────────────
+            # ── Step 7: classify staff ────────────────────────────────────────
             # A person is flagged as staff if their TOTAL visible session time
             # across all cameras exceeds the configurable duration threshold
             # (default 30 min) OR if they have appeared on 3+ distinct days.
@@ -399,6 +426,360 @@ async def deduplicate_persons():
             logger.error(f"Dedup job failed: {e}")
 
 
+async def _clean_contaminated_face_embeddings(db, settings) -> int:
+    """
+    Remove face embeddings that don't match the face cluster for a person.
+
+    For each person with >=2 face embeddings, compute all pairwise cosine
+    similarities. Any embedding that has similarity < FACE_CONTAMINATION_THRESHOLD
+    (0.35) to the majority cluster is contaminated — it belongs to a different
+    person whose body ReID was a false positive.
+
+    The numpy computation runs in a thread pool (asyncio.to_thread) to avoid
+    blocking the FastAPI event loop at 1k+ persons scale.
+
+    Returns the number of embeddings removed.
+    """
+    import numpy as np
+
+    r = await db.execute(text("""
+        SELECT pi.id FROM person_identities pi
+        WHERE (SELECT COUNT(*) FROM person_face_embeddings
+               WHERE person_identity_id = pi.id) >= 2
+    """))
+    person_ids = [row[0] for row in r.fetchall()]
+
+    # Fetch all embeddings upfront (avoids interleaving DB + numpy work)
+    person_data = []
+    for pid in person_ids:
+        r2 = await db.execute(text("""
+            SELECT id, embedding, face_score FROM person_face_embeddings
+            WHERE person_identity_id = :pid AND embedding IS NOT NULL
+            ORDER BY face_score DESC
+        """), {"pid": str(pid)})
+        rows = r2.fetchall()
+        if len(rows) < 2:
+            continue
+        ids = [r[0] for r in rows]
+        embs = []
+        for row in rows:
+            if isinstance(row[1], str):
+                embs.append(np.array(eval(row[1]), dtype=np.float32))
+            else:
+                embs.append(np.array(row[1], dtype=np.float32))
+        person_data.append((str(pid), ids, embs))
+
+    # Run the numpy-heavy clustering in a thread to avoid blocking the event loop
+    def _compute_face_removals():
+        threshold = settings.FACE_CONTAMINATION_THRESHOLD
+        results = []
+        for pid, ids, embs in person_data:
+            N = len(embs)
+            # Normalize each embedding (InsightFace embeddings are NOT L2-normalized)
+            for emb in embs:
+                _n = np.linalg.norm(emb)
+                if _n > 0:
+                    emb /= _n
+            sims = np.zeros((N, N), dtype=np.float32)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    s = float(np.dot(embs[i], embs[j]))
+                    sims[i][j] = s
+                    sims[j][i] = s
+            keep_idx = {0}
+            for i in range(1, N):
+                compatible = any(sims[i][k] >= threshold for k in keep_idx)
+                if compatible:
+                    keep_idx.add(i)
+            remove_idx = set(range(N)) - keep_idx
+            if remove_idx:
+                remove_ids = [ids[i] for i in sorted(remove_idx)]
+                results.append((pid, remove_ids, len(keep_idx), N))
+        return results
+
+    removal_results = await asyncio.to_thread(_compute_face_removals)
+
+    total_removed = 0
+    for pid, remove_ids, keep_count, total_count in removal_results:
+        logger.info(
+            f"Face contamination cleanup: person {pid[:12]} "
+            f"keeping {keep_count}/{total_count} faces, removing {len(remove_ids)}"
+        )
+        await db.execute(text(
+            "DELETE FROM person_face_embeddings WHERE id = ANY(:ids)"
+        ), {"ids": remove_ids})
+        total_removed += len(remove_ids)
+
+    return total_removed
+
+
+async def _clean_contaminated_body_embeddings(db, settings) -> int:
+    """
+    Remove body embeddings that don't match the body cluster for a person.
+
+    Uses iterative median-based outlier removal: for each person with >=3 body
+    embeddings, repeatedly removes the embedding with the lowest median
+    similarity to the rest until all remaining embeddings have median
+    >= BODY_CONTAMINATION_THRESHOLD (0.60) or the cluster drops below 3.
+
+    The numpy computation runs in a thread pool (asyncio.to_thread) to avoid
+    blocking the FastAPI event loop at 1k+ persons scale.
+
+    Returns the number of embeddings removed.
+    """
+    import numpy as np
+
+    r = await db.execute(text("""
+        SELECT pi.id FROM person_identities pi
+        WHERE (SELECT COUNT(*) FROM person_embeddings
+               WHERE person_identity_id = pi.id) >= 3
+    """))
+    person_ids = [row[0] for row in r.fetchall()]
+
+    # Fetch all embeddings upfront
+    person_data = []
+    for pid in person_ids:
+        r2 = await db.execute(text("""
+            SELECT id, embedding, crop_quality FROM person_embeddings
+            WHERE person_identity_id = :pid AND embedding IS NOT NULL
+            ORDER BY crop_quality DESC
+        """), {"pid": str(pid)})
+        rows = r2.fetchall()
+        if len(rows) < 3:
+            continue
+        ids = [r[0] for r in rows]
+        embs = []
+        for row in rows:
+            if isinstance(row[1], str):
+                embs.append(np.array(eval(row[1]), dtype=np.float32))
+            else:
+                embs.append(np.array(row[1], dtype=np.float32))
+        person_data.append((str(pid), ids, embs))
+
+    threshold = settings.BODY_CONTAMINATION_THRESHOLD
+
+    # Run the numpy-heavy iterative median computation in a thread
+    def _compute_body_removals():
+        results = []
+        for pid, ids, embs in person_data:
+            N = len(embs)
+            remove_idx = set()
+            active = set(range(N))
+
+            while len(active) >= 3:
+                medians = []
+                for i in active:
+                    sims = []
+                    for j in active:
+                        if i != j:
+                            sims.append(float(np.dot(embs[i], embs[j])))
+                    medians.append((i, float(np.median(sims))))
+
+                worst_idx, worst_median = min(medians, key=lambda x: x[1])
+
+                if worst_median >= threshold:
+                    break
+
+                remove_idx.add(worst_idx)
+                active.discard(worst_idx)
+
+            if remove_idx:
+                remove_ids = [ids[i] for i in sorted(remove_idx)]
+                results.append((pid, remove_ids, len(active), N))
+        return results
+
+    removal_results = await asyncio.to_thread(_compute_body_removals)
+
+    total_removed = 0
+    for pid, remove_ids, active_count, total_count in removal_results:
+        logger.info(
+            f"Body contamination cleanup: person {pid[:12]} "
+            f"keeping {active_count}/{total_count} bodies, removing {len(remove_ids)} "
+            f"(threshold={threshold})"
+        )
+        await db.execute(text(
+            "DELETE FROM person_embeddings WHERE id = ANY(:ids)"
+        ), {"ids": remove_ids})
+        total_removed += len(remove_ids)
+
+    return total_removed
+
+
+async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: int):
+    """Move face embeddings from loser to winner, skipping duplicate angles (>0.95 sim).
+
+    After moving, prunes the winner down to max_faces by face_score.
+    """
+    import numpy as np
+
+    # Get winner's existing face embeddings
+    winner_faces = await db.execute(text("""
+        SELECT embedding FROM person_face_embeddings
+        WHERE person_identity_id::text = :pid AND embedding IS NOT NULL
+    """), {"pid": winner_id})
+    winner_embs = []
+    for row in winner_faces.fetchall():
+        if isinstance(row[0], str):
+            winner_embs.append(np.array(eval(row[0]), dtype=np.float32))
+        else:
+            winner_embs.append(np.array(row[0], dtype=np.float32))
+
+    # Get loser's face embeddings
+    loser_faces = await db.execute(text("""
+        SELECT id, embedding, face_score FROM person_face_embeddings
+        WHERE person_identity_id::text = :pid AND embedding IS NOT NULL
+        ORDER BY face_score DESC
+    """), {"pid": loser_id})
+    loser_rows = loser_faces.fetchall()
+
+    if not loser_rows:
+        return
+
+    moved = 0
+    for row in loser_rows:
+        loser_emb = np.array(row[1], dtype=np.float32) if not isinstance(row[1], str) else np.array(eval(row[1]), dtype=np.float32)
+
+        # Check if this face is a duplicate angle (>0.95 sim) to any winner face
+        is_dup = False
+        for w_emb in winner_embs:
+            sim = float(np.dot(w_emb, loser_emb))
+            if sim > 0.95:
+                is_dup = True
+                break
+
+        if is_dup:
+            continue
+
+        # Move to winner
+        await db.execute(text("""
+            UPDATE person_face_embeddings SET person_identity_id = :winner::uuid
+            WHERE id = :row_id
+        """), {"winner": winner_id, "row_id": row[0]})
+        winner_embs.append(loser_emb)
+        moved += 1
+
+    if moved > 0:
+        # Prune winner to max_faces (keep highest face_score)
+        await db.execute(text("""
+            DELETE FROM person_face_embeddings WHERE id IN (
+                SELECT id FROM person_face_embeddings
+                WHERE person_identity_id = :pid::uuid
+                ORDER BY face_score DESC OFFSET :keep
+            )
+        """), {"pid": winner_id, "keep": max_faces})
+        logger.info(
+            f"Dedup: absorbed {moved} face embedding(s) from {loser_id[:8]} → {winner_id[:8]} "
+            f"(winner now has up to {max_faces} faces)"
+        )
+
+
+async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies: int):
+    """Move body embeddings from loser to winner, skipping duplicate angles (>0.95 sim).
+
+    After moving, prunes the winner down to max_bodies by crop_quality.
+    """
+    import numpy as np
+
+    # Get winner's existing body embeddings
+    winner_bodies = await db.execute(text("""
+        SELECT embedding FROM person_embeddings
+        WHERE person_identity_id::text = :pid AND embedding IS NOT NULL
+    """), {"pid": winner_id})
+    winner_embs = []
+    for row in winner_bodies.fetchall():
+        if isinstance(row[0], str):
+            winner_embs.append(np.array(eval(row[0]), dtype=np.float32))
+        else:
+            winner_embs.append(np.array(row[0], dtype=np.float32))
+
+    # Get loser's body embeddings
+    loser_bodies = await db.execute(text("""
+        SELECT id, embedding, crop_quality FROM person_embeddings
+        WHERE person_identity_id::text = :pid AND embedding IS NOT NULL
+        ORDER BY crop_quality DESC
+    """), {"pid": loser_id})
+    loser_rows = loser_bodies.fetchall()
+
+    if not loser_rows:
+        return
+
+    moved = 0
+    for row in loser_rows:
+        loser_emb = np.array(row[1], dtype=np.float32) if not isinstance(row[1], str) else np.array(eval(row[1]), dtype=np.float32)
+
+        # Check if near-duplicate (>0.95 sim) to any winner body
+        is_dup = False
+        for w_emb in winner_embs:
+            sim = float(np.dot(w_emb, loser_emb))
+            if sim > 0.95:
+                is_dup = True
+                break
+
+        if is_dup:
+            continue
+
+        # Move to winner
+        await db.execute(text("""
+            UPDATE person_embeddings SET person_identity_id = :winner::uuid
+            WHERE id = :row_id
+        """), {"winner": winner_id, "row_id": row[0]})
+        winner_embs.append(loser_emb)
+        moved += 1
+
+    if moved > 0:
+        # Prune winner to max_bodies (keep highest crop_quality)
+        await db.execute(text("""
+            DELETE FROM person_embeddings WHERE id IN (
+                SELECT id FROM person_embeddings
+                WHERE person_identity_id = :pid::uuid
+                ORDER BY crop_quality DESC OFFSET :keep
+            )
+        """), {"pid": winner_id, "keep": max_bodies})
+        logger.info(
+            f"Dedup: absorbed {moved} body embedding(s) from {loser_id[:8]} → {winner_id[:8]} "
+            f"(winner now has up to {max_bodies} bodies)"
+        )
+
+
+async def _revote_person_gender(db, person_id: str):
+    """Re-vote person-level gender from ALL assigned track sessions.
+
+    Uses majority vote across all tracks that have a non-null gender.
+    If tied or no votes, keeps the existing gender.
+    """
+    r = await db.execute(text("""
+        SELECT ts.gender, COUNT(*) as votes
+        FROM track_sessions ts
+        WHERE ts.person_identity_id::text = :pid
+          AND ts.gender IS NOT NULL
+        GROUP BY ts.gender
+        ORDER BY votes DESC
+    """), {"pid": person_id})
+    votes = r.fetchall()
+
+    if not votes:
+        return
+
+    majority = votes[0][0]
+    majority_count = votes[0][1]
+
+    # Check if there's a tie (M and F have same count)
+    if len(votes) > 1 and votes[0][1] == votes[1][1]:
+        logger.debug(
+            f"Dedup: gender vote tied for {person_id[:8]} — keeping existing gender"
+        )
+        return
+
+    await db.execute(text("""
+        UPDATE person_identities SET gender = :gender WHERE id::text = :pid
+    """), {"gender": majority, "pid": person_id})
+
+    logger.info(
+        f"Dedup: gender re-voted for {person_id[:8]} → {majority} "
+        f"({majority_count} track votes)"
+    )
+
+
 async def _sweep_orphaned_crops(db) -> int:
     """
     Delete MinIO objects under the ``crops/`` prefix that are NOT referenced by
@@ -410,15 +791,15 @@ async def _sweep_orphaned_crops(db) -> int:
       • person_embeddings.crop_path
       • track_sessions.best_crop_path
 
-    The function also drains ``CameraWorker._pending_minio_deletes`` — every
-    path that was queued for deferred deletion by the AI runtime is also
-    processed here so the set stays bounded.
+    When running in the same process as the API server, this also drains
+    ``CameraWorker._pending_minio_deletes``. When running in the separate
+    worker process, the pending set is not accessible — unreferenced crops
+    are still deleted by the DB cross-reference, just one sweep cycle later.
 
     Returns the number of objects removed from MinIO.
     """
     from app.config import get_settings
     from app.modules.storage.minio_client import get_client, BUCKET_PREFIX
-    from app.modules.ai_runtime.camera_worker import CameraWorker
 
     settings = get_settings()
     client = get_client()
@@ -455,17 +836,21 @@ async def _sweep_orphaned_crops(db) -> int:
     for row in r.fetchall():
         known.add(row[0])
 
-    if not known:
-        # DB is empty — don't sweep (avoids accidentally deleting everything
-        # during/after a reset)
+    # ── 2. Drain the pending MinIO deletes queue (if in-process) ────────────
+    # When running in the separate worker process, CameraWorker is not
+    # importable (no API server). The sweep still works — it just relies
+    # on the DB cross-reference alone instead of the "hint" set.
+    pending: set[str] = set()
+    try:
+        from app.modules.ai_runtime.camera_worker import CameraWorker
+        pending = CameraWorker._pending_minio_deletes.copy()
         CameraWorker._pending_minio_deletes.clear()
-        return 0
+    except Exception:
+        pass  # running in separate worker process — no in-memory state
 
-    # ── 2. Build a set of MinIO object keys (strip bucket prefix) ───────────
-    # Also drain the pending queue into the check set so those paths are
-    # processed even if they aren't referenced by the DB.
-    pending = CameraWorker._pending_minio_deletes.copy()
-    CameraWorker._pending_minio_deletes.clear()
+    if not known and not pending:
+        # DB is empty and no pending deletes — don't sweep
+        return 0
 
     # Normalise: "retaileye/crops/foo.jpg" → "crops/foo.jpg"
     def _normalise(path: str) -> str:
@@ -484,13 +869,6 @@ async def _sweep_orphaned_crops(db) -> int:
             objects_to_check.add(key)
 
             if full_key not in known and key not in known:
-                # Also check: is this key referenced by a pending path?
-                pending_match = any(
-                    _normalise(p) == key for p in pending
-                )
-                # Only delete if it was explicitly queued for deletion
-                # (pending) OR it's been unreferenced for a full sweep cycle.
-                # For safety, we DO delete all truly unreferenced objects.
                 try:
                     client.remove_object(bucket, key)
                     removed += 1

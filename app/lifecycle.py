@@ -41,12 +41,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize MinIO: {e}")
         raise
 
-    # Start background job scheduler
-    try:
-        from app.modules.jobs.scheduler import start_scheduler
-        start_scheduler()
-    except Exception as e:
-        logger.warning(f"Could not start background job scheduler: {e}")
+    # Background job scheduler runs in a SEPARATE process (retail-ai-worker.service).
+    # Do NOT start APScheduler here — it blocks the event loop during heavy
+    # DB/MinIO operations (dedup, sweep) and freezes the API for 1-2 minutes.
+    logger.info("Background jobs handled by retail-ai-worker.service (separate process)")
 
     # Wait for MediaMTX to be ready before restoring camera workers.
     # On boot, the docker-compose service may have started but MediaMTX
@@ -143,12 +141,8 @@ async def lifespan(app: FastAPI):
     # --- SHUTDOWN ---
     logger.info("Shutting down application...")
 
-    # Stop background job scheduler
-    try:
-        from app.modules.jobs.scheduler import stop_scheduler
-        stop_scheduler()
-    except Exception as e:
-        logger.warning(f"Error stopping job scheduler during shutdown: {e}")
+    # Background job scheduler is in a separate process (retail-ai-worker.service).
+    # It is not stopped here — it manages its own lifecycle via systemd.
 
     # Stop AI runtime workers if running
     try:

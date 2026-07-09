@@ -46,6 +46,11 @@ class ActiveTrack:
     current_face_score: float = 0.0
     current_face_bbox: Optional[dict] = None
 
+    # Temporal face-matching anchor: (cx, cy) of the last matched face in
+    # full-frame coordinates. Used by the global assignment to give a
+    # continuity bonus to faces near the previous frame's position.
+    last_face_center: Optional[tuple] = None
+
     # Track's best crop (body)
     best_crop_quality: float = 0.0
     best_crop_path: Optional[str] = None

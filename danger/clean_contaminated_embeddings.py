@@ -3,10 +3,10 @@
 clean_contaminated_embeddings.py — remove face embeddings from different people
 stored under the same PersonIdentity.
 
-Strategy: for each person with ≥2 embeddings, compute all pairwise cosine similarities.
-Any embedding that has negative similarity (< 0) to any other embedding for the same
-identity is contaminated — it belongs to a DIFFERENT person whose body crop overlapped
-the tracked person's during detection.
+Strategy: for each person with >=2 embeddings, compute all pairwise cosine similarities.
+Any embedding that has low similarity (< FACE_CONTAMINATION_THRESHOLD, default 0.35) to
+the majority cluster is contaminated — it belongs to a DIFFERENT person whose body crop
+overlapped the tracked person's during detection.
 
 Usage:
     PYTHONPATH=/gmr/gmr venv/bin/python danger/clean_contaminated_embeddings.py [--apply]
@@ -15,9 +15,13 @@ Usage:
 import asyncio, argparse, sys, numpy as np
 from sqlalchemy import text
 from app.core.db.session import AsyncSessionLocal
+from app.config import get_settings
 
 
 async def clean(apply_fix: bool) -> int:
+    settings = get_settings()
+    threshold = settings.FACE_CONTAMINATION_THRESHOLD  # 0.35
+
     async with AsyncSessionLocal() as db:
         r = await db.execute(text("""
             SELECT pi.id FROM person_identities pi
@@ -27,7 +31,8 @@ async def clean(apply_fix: bool) -> int:
 
         print(f"\n{'='*60}")
         print(f"  Face contamination cleaner — {'APPLY' if apply_fix else 'DRY RUN'}")
-        print(f"  Persons with ≥2 embeddings: {len(person_ids)}")
+        print(f"  Persons with >=2 embeddings: {len(person_ids)}")
+        print(f"  Contamination threshold: {threshold}")
         print(f"{'='*60}\n")
 
         total_removed = 0
@@ -49,28 +54,38 @@ async def clean(apply_fix: bool) -> int:
                 else:
                     embs.append(np.array(r[1], dtype=np.float32))
 
-            # Find contaminated: any embedding with negative sim to another
-            contaminated = set()
+            # Normalize embeddings before comparison — InsightFace face
+            # embeddings are NOT L2-normalized (norms 12-27).
+            for emb in embs:
+                _n = np.linalg.norm(emb)
+                if _n > 0:
+                    emb /= _n
+
+            # Build similarity matrix
+            sims = np.zeros((N, N), dtype=np.float32)
             for i in range(N):
                 for j in range(i + 1, N):
-                    sim = float(np.dot(embs[i], embs[j]))
-                    if sim < 0.0:
-                        # The one with lower avg similarity to the rest is the contaminant
-                        i_avg = np.mean([float(np.dot(embs[i], embs[k])) for k in range(N) if k != i])
-                        j_avg = np.mean([float(np.dot(embs[j], embs[k])) for k in range(N) if k != j])
-                        if i_avg < j_avg:
-                            contaminated.add(i)
-                        else:
-                            contaminated.add(j)
+                    s = float(np.dot(embs[i], embs[j]))
+                    sims[i][j] = s
+                    sims[j][i] = s
+
+            # Find the largest cluster (mutual sim >= threshold)
+            keep_idx = {0}  # always keep top-scored face (rows sorted by score)
+            for i in range(1, N):
+                compatible = any(sims[i][k] >= threshold for k in keep_idx)
+                if compatible:
+                    keep_idx.add(i)
+
+            contaminated = set(range(N)) - keep_idx
 
             if not contaminated:
                 continue
 
             remove_ids = [ids[i] for i in contaminated]
-            print(f"  {str(pid)[:12]}  total={N}  remove={len(contaminated)}")
+            print(f"  {str(pid)[:12]}  total={N}  keep={len(keep_idx)}  remove={len(contaminated)}")
             for ci in sorted(contaminated):
-                sims = [f"{float(np.dot(embs[ci], embs[k])):.2f}" for k in range(N) if k != ci]
-                print(f"    emb[{ci}]: sims_to_others={sims}")
+                sims_to_keep = [f"{sims[ci][k]:.2f}" for k in sorted(keep_idx)]
+                print(f"    emb[{ci}]: sims_to_cluster={sims_to_keep}")
 
             if apply_fix:
                 await db.execute(text(

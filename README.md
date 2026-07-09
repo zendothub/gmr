@@ -1,211 +1,116 @@
-# Retail AI Platform
+# Retail Eye Insights — Backend
 
-Production-ready **single modular FastAPI application** for an on-prem AI CCTV retail analytics system (pharmacy). All capabilities live as internal modules of one application with clean boundaries — no microservices — so any module can be split out later if needed.
+On-premises AI CCTV retail analytics for pharmacies.
+FastAPI (Python 3.10) + PostgreSQL/pgvector + MinIO + RTX 4070 Ti GPU.
 
-## Stack
+## Architecture — Three Processes
 
-| Concern | Technology |
-| --- | --- |
-| API | FastAPI (async), Pydantic v2 |
-| Database | PostgreSQL 16 + `uuid-ossp` + `pgvector` |
-| ORM / Migrations | SQLAlchemy 2.0 (async) / Alembic |
-| Camera I/O | OpenCV (RTSP test + runtime frame reading) |
-| Detection | Ultralytics YOLO (person by default) |
-| Tracking | YOLO11 built-in tracker (ByteTrack) |
-| ReID | torchreid OSNet 512-dim embeddings stored in `VECTOR(512)` (pgvector cosine search) |
-| Media storage | Local filesystem (snapshots / crops / clips / reports) |
-| Background jobs | APScheduler (in-process) |
-| Auth | JWT (python-jose) + bcrypt |
+The backend runs as **three separate systemd services**, each with its own process:
 
-## Architecture
+### 1. `retail-ai.service` — API Server (Main)
 
 ```
-retail-ai-platform/
-├── app/
-│   ├── main.py               # FastAPI app, router registration
-│   ├── config.py             # Pydantic settings (.env driven)
-│   ├── dependencies.py       # DI: DB session, current user, superuser
-│   ├── lifecycle.py          # startup/shutdown (storage dirs, scheduler, workers)
-│   ├── core/db/              # Base, async/sync sessions, SQLAlchemy models
-│   ├── modules/
-│   │   ├── auth/             # signup / login / JWT
-│   │   ├── users/            # user & role admin
-│   │   ├── cameras/          # camera CRUD + RTSP test + start/stop/health
-│   │   ├── camera_views/     # ROI polygons (full_frame, entry_gate_view, ...)
-│   │   ├── zones/            # polygon/line zones (entry_line, billing_zone, ...)
-│   │   ├── rules/            # rule CRUD (line_crossing, zone_dwell, ...)
-│   │   ├── ai_runtime/       # worker_supervisor, camera_worker, frame_buffer
-│   │   ├── detection/        # yolo_detector.py (DetectionResult)
-│   │   ├── tracking/         # track_manager.py
-│   │   ├── reid/             # crop_quality, osnet_extractor, identity_decision_engine
-│   │   ├── rule_engine/      # rule_evaluator, camera_view_engine, config_loader
-│   │   ├── events/           # event listing / ack / false-positive
-│   │   ├── billing/          # billing_interactions
-│   │   ├── analytics/        # footfall / billing / dwell / occupancy / journey
-│   │   ├── storage/          # local filesystem + storage_objects registry
-│   │   └── jobs/             # APScheduler: daily analytics, cleanup
-│   └── utils/                # geometry, image, time, encryption, pagination
-├── alembic/                  # migrations (initial schema + pgvector index)
-├── database/init.sql         # extensions (uuid-ossp, vector)
-├── deployment/               # systemd unit, nginx example
-├── tests/
-├── docker-compose.yml        # PostgreSQL (pgvector) + app
-├── Dockerfile
-├── requirements.txt
-└── .env.example
+Start:    systemctl start retail-ai.service
+Command:  uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+Memory:   ~3.4 GB (GPU models: InsightFace, OSNet, SigLIP2, MiVOLO)
 ```
 
-## AI Pipeline (per camera worker)
+The main FastAPI HTTP server. Handles:
+- REST API endpoints (`/api/v1/...`)
+- Camera workers (YOLO + ByteTrack, per-camera)
+- AI pipeline (face detection, gender, age, body ReID, identity matching)
+- Stream broadcasters (FFmpeg NVENC → MediaMTX → WebRTC)
+- In-memory track state (ByteTrack, face accumulation, gender voting)
+- GPU model inference
+
+**Critical:** Must run with `--workers 1` — camera workers share in-process state.
+**No background jobs run here** — they are offloaded to the worker process to prevent
+API freezes during heavy DB/MinIO operations.
+
+### 2. `retail-ai-worker.service` — Background Job Worker
 
 ```
-RTSP stream ──> LatestFrameBuffer (capture thread, keeps newest frame only, with rotation support)
-   │  sampled at camera.fps_target (exactly 10 FPS / 100ms throttle by default)
-   ▼
-YOLO11 tracking (person class, built-in ByteTrack) ──> camera-view ROI filter (center point in polygon)
-   ▼
-TrackManager (in-memory state + track_sessions in PostgreSQL)
-   ▼
-Zone update (point-in-polygon, dwell seconds per zone) ──> ZoneEventDetector (automatic enter/exit/dwell events)
-   ▼
-ReID (gated):  height >= 100px, reid_frame_count < 20, not reid_confident
-   crop ─> quality (reject < 0.70) ─> OSNet 512-dim embedding
-   5-frame accumulation ─> mean embedding ─> pgvector cosine search (threshold 0.60, confidence 0.75)
-   Refinement continues at frames 10, 15, 20. Identity switches prune old temporary visitors.
-   ▼
-InsightFace demographics (buffalo_l, max 5 runs per track, selects highest face score demographics)
-   ▼
-Rule engine (in-memory cache, cooldown_seconds dedup) ──> events + billing_interactions
+Start:    systemctl start retail-ai-worker.service
+Command:  python -m app.worker
+Memory:   ~100 MB (no GPU models, no camera workers)
 ```
 
-**No per-frame DB queries** for configuration: rules/zones/views are cached in memory and refreshed only via `POST /api/runtime/reload-config`.
+Standalone process running APScheduler with all periodic background jobs.
+Does NOT load any GPU models or camera workers — pure DB + MinIO operations.
 
-## Quick Start (Docker)
+**Scheduled jobs:**
+
+| Job | Interval | Purpose |
+|---|---|---|
+| `deduplicate_persons` | every 10 min | Merge duplicate persons, absorb face/body embeddings, re-vote gender, clean contaminated embeddings, sweep MinIO, classify staff |
+| `close_stale_track_sessions` | every 5 min | Close track sessions that stopped receiving updates |
+| `probe_camera_statuses` | every 2 min | Probe RTSP streams and update camera status (ACTIVE/INACTIVE) |
+| `aggregate_daily_analytics` | daily 00:15 | Aggregate yesterday's metrics into daily summary |
+| `cleanup_old_storage` | daily 02:00 | Delete snapshots/crops older than retention period |
+
+**Why separate?** The dedup job performs heavy DB queries (pgvector LATERAL with
+`probes=50`), numpy computations (pairwise similarity matrices for 1k+ persons),
+and MinIO batch deletions (15k+ objects). Running these in the API server's event
+loop caused 1-2 minute freezes on all HTTP requests.
+
+### 3. `reextract-faces.timer` — Face Re-extraction (GPU Worker)
+
+```
+Start:    systemctl start reextract-faces.timer
+Command:  python danger/reextract_or_delete_faceless.py
+Memory:   ~1.5 GB (loads InsightFace buffalo_l temporarily, freed on exit)
+Runs:     every 20 min via systemd timer (OnUnitActiveSec=1200)
+```
+
+Standalone oneshot process that runs periodically via systemd timer.
+Loads InsightFace to re-extract face embeddings from track crops for persons
+left faceless by contamination cleanup. If no face is found in any crop, deletes
+the person entirely (tracks are orphaned — they'll be re-identified on next visit).
+
+**Why separate from the worker?** This job loads InsightFace (1.5 GB GPU memory).
+Running it inside the worker would contend with the API server's GPU models.
+As a oneshot process, it allocates GPU memory only during execution and frees it
+on exit.
+
+## Startup Order
 
 ```bash
-cd retail-ai-platform
-cp .env.example .env          # adjust SECRET_KEY etc.
-docker compose up --build
+# 1. Start the API server (loads GPU models, starts camera workers)
+sudo systemctl start retail-ai.service
+
+# 2. Start the background worker (DB + MinIO jobs, no GPU)
+sudo systemctl start retail-ai-worker.service
+
+# 3. The face re-extraction timer auto-starts on boot (OnBootSec=120)
+sudo systemctl start reextract-faces.timer
 ```
 
-- API: http://localhost:8000 — Swagger: http://localhost:8000/docs
-- PostgreSQL (pgvector/pgvector:pg16) is initialized with `uuid-ossp` and `vector` extensions; Alembic migrations run automatically on app start.
+All three are `enabled` by default and start automatically on boot.
 
-## Quick Start (local, without Docker)
+## Logs
 
-```bash
-# 1. PostgreSQL with pgvector
-docker run -d --name retail_pg -p 5432:5432 \
-  -e POSTGRES_USER=retail_user -e POSTGRES_PASSWORD=retail_pass \
-  -e POSTGRES_DB=retail_ai_db pgvector/pgvector:pg16
-psql postgresql://retail_user:retail_pass@localhost:5432/retail_ai_db \
-  -c 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; CREATE EXTENSION IF NOT EXISTS vector;'
+| Service | Log location |
+|---|---|
+| API server | `/gmr/gmr/logs/ai_processing.log` + `/gmr/gmr/logs/retail-ai.log` |
+| Background worker | `journalctl -u retail-ai-worker.service` |
+| Face re-extraction | `journalctl -u reextract-faces.service` |
 
-# 2. Python env
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+## Configuration
 
-# 3. Configure
-cp .env.example .env   # set STORAGE_ROOT to a writable local path, e.g. ./storage
+All thresholds and settings are in `app/config.py` (Pydantic Settings).
+Environment overrides via `.env` file in the project root.
 
-# 4. Migrate + run
-alembic upgrade head
-uvicorn app.main:app --reload
-```
+See `/gmr/CONTEXT.md` for the complete architecture, model choices, threshold
+rationales, and known issues.
 
-### Model weights (TODO stubs included)
+## Danger Scripts
 
-Place real weights in `models/` (configured via `.env`):
+Diagnostic and fix scripts live in `danger/`. See `/gmr/CONTEXT.md` for the full
+list. Key scripts:
 
-- `models/yolov8n.pt` — auto-downloaded by ultralytics on first run, or copy manually.
-- `models/osnet_x1_0.pth` — torchreid OSNet weights. Until provided, the extractor runs a deterministic stub (marked `TODO` in `osnet_extractor.py`).
-- ByteTrack: handled internally by Ultralytics YOLO11 (`bytetrack.yaml`). No external weights needed.
-
-## Typical Workflow
-
-1. `POST /api/auth/signup` → `POST /api/auth/login` → use `Bearer` token.
-2. `POST /api/cameras/test-rtsp` — verify the stream with OpenCV before saving.
-3. `POST /api/cameras` — save camera (role: `entry_gate` / `billing_counter` / `queue` / `product_shelf`, plus `fps_target`, `detection_model`, `reid_enabled`, `demographic_enabled`, `resolution`).
-4. `POST /api/cameras/{id}/views` — draw ROI polygon (`full_frame`, `entry_gate_view`, `billing_counter_view`, `queue_view`, `product_shelf_view`, `ignore_area`).
-5. `POST /api/camera-views/{view_id}/zones` — create zones (`entry_line`, `exit_line`, `billing_zone`, `queue_zone`, `product_zone`, `ignore_zone`, `restricted_zone`) as polygon or line JSON.
-6. `POST /api/rules` — configure rules (`line_crossing`, `zone_dwell`, `billing_interaction`, `queue_count`, `possible_purchase`, `restricted_zone`) with `cooldown_seconds`.
-7. `POST /api/cameras/{id}/start` (or `POST /api/runtime/start` for all active cameras).
-8. After editing config: `POST /api/runtime/reload-config`.
-9. Monitor: `GET /api/runtime/status`, `GET /api/cameras/{id}/health`, `GET /api/events`, `GET /api/analytics/*`.
-
-## API Surface
-
-| Area | Endpoints |
-| --- | --- |
-| Auth | `POST /api/auth/signup`, `POST /api/auth/login`, `GET /api/auth/me` |
-| Users | `POST/GET /api/users`, `GET/PUT/DELETE /api/users/{id}`, roles |
-| Cameras | `POST /api/cameras/test-rtsp`, CRUD `/api/cameras`, `/{id}/start`, `/{id}/stop`, `/{id}/health` |
-| Views | `POST/GET /api/cameras/{id}/views`, `GET/PUT/DELETE /api/camera-views/{id}`, `/{id}/set-default` |
-| Zones | `POST/GET /api/camera-views/{id}/zones`, `GET/PUT/DELETE /api/zones/{id}` |
-| Rules | CRUD `/api/rules`, `/{id}/enable`, `/{id}/disable` |
-| Runtime | `POST /api/runtime/reload-config`, `/start`, `/stop`, `GET /status` |
-| Events | `GET /api/events`, `GET /{id}`, `POST /{id}/acknowledge`, `POST /{id}/false-positive` |
-| Billing | `GET /api/billing/interactions` |
-| Analytics | `GET /api/analytics/footfall`, `/billing`, `/dwell`, `/zone-occupancy`, `/person-journey/{person_id}` |
-| Storage | `GET /api/storage/objects`, `/{id}/download` |
-
-## Database Tables
-
-`users`, `roles`, `stores`, `cameras`, `camera_views`, `zones`, `rules`,
-`track_sessions`, `track_observations`, `person_identities`,
-`person_embeddings` (`VECTOR(512)` + IVFFlat cosine index), `events`,
-`billing_interactions`, `daily_analytics_summary`, `storage_objects`.
-
-## Background Jobs
-
-- `daily_analytics_aggregation` — 00:15 daily, fills `daily_analytics_summary`.
-- `close_stale_track_sessions` — every 5 min, closes orphaned sessions.
-- `storage_cleanup` — 02:00 daily, removes media older than 30 days.
-
-## Testing
-
-```bash
-pytest tests/ -v
-```
-
-## Production Notes
-
-- Run a **single uvicorn worker** (`--workers 1`): camera workers and rule caches are in-process state.
-- Set a strong `SECRET_KEY`, restrict CORS origins in `app/main.py`.
-- Bare-metal deployment: see `deployment/retail-ai.service` (systemd) and `deployment/nginx.conf`.
-- GPU: install CUDA-enabled torch and ultralytics will use it automatically.
-
-## Danger Zone 🔴
-
-Scripts in `danger/` perform **irreversible destructive operations**. Always stop all camera workers before running them.
-
-### `danger/reset_tracking_data.py` — Full data wipe
-
-Deletes all tracking, person identity, embedding, event, analytics and billing data from PostgreSQL **and** purges all crop/snapshot files from MinIO. Configuration tables are preserved.
-
-**Tables cleared (in FK-safe order):**
-
-| Table | What's in it |
-| --- | --- |
-| `track_observations` | Per-frame bounding box history |
-| `billing_interactions` | Dwell / purchase events |
-| `events` | All person entry / exit / rule events |
-| `track_sessions` | All track session records |
-| `person_embeddings` | Body ReID vectors (512-dim) |
-| `person_face_embeddings` | Face embedding vectors |
-| `person_identities` | All registered person records |
-| `daily_analytics_summary` | Aggregated analytics |
-| `storage_objects` | File reference records |
-
-**MinIO prefixes wiped:**
-- `retail/crops/` — all body and face crop JPEGs
-- `retail/snapshots/` — all event snapshot frames
-
-**Preserved (not touched):** `users`, `roles`, `cameras`, `zones`, `stores`, `rules`, `areas`, `store_categories`, `store_levels`, `store_zones`, `store_terminals`.
-
-```bash
-# With confirmation prompt
-PYTHONPATH=. venv/bin/python danger/reset_tracking_data.py
-
-# Skip prompt (scripted / CI use)
-PYTHONPATH=. venv/bin/python danger/reset_tracking_data.py --yes
-```
+| Script | Purpose |
+|---|---|
+| `reset_tracking_data.py` | Full data reset (preserves config) + rebuilds pgvector indexes |
+| `normalize_face_embeddings.py` | One-time migration: L2-normalize all face embeddings + rebuild index |
+| `diagnose_persons.py` | Deep-dive diagnostic for specific person IDs |
+| `reextract_or_delete_faceless.py` | Re-extract faces or delete faceless persons (runs via systemd timer) |

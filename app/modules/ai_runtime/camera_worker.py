@@ -297,60 +297,56 @@ class CameraWorker:
             await asyncio.sleep(sleep_for)
 
     @staticmethod
-    def _match_face_to_track(all_faces: list[dict], body_bbox: dict, frame_h: int, frame_w: int) -> Optional[dict]:
-        """Find the face detection most likely belonging to this body track.
+    def _score_face_for_track(face: dict, body_bbox: dict, track: "ActiveTrack") -> Optional[float]:
+        """Score a face candidate for a body track.
 
-        A face is considered to belong to a body if its centre falls inside the
-        body bounding box (expanded by 15% to account for loose body detections).
-        When multiple faces qualify, the one with the highest composite score
-        (size × centre-proximity × detection-confidence) wins.
+        Returns the composite score if the face centre falls inside the
+        ORIGINAL body bbox (no expansion), or None if the face is outside.
+        Uses temporal continuity — faces near the last frame's matched face
+        position get a bonus to prevent frame-to-frame assignment flips.
+
+        Scoring weights:
+          - Without last_face_center: 0.50 × size + 0.50 × centre
+          - With last_face_center:    0.35 × size + 0.30 × centre + 0.35 × continuity
         """
-        if not all_faces:
+        fb = face["bbox"]
+        fx_cx = (fb["x1"] + fb["x2"]) / 2.0
+        fy_cy = (fb["y1"] + fb["y2"]) / 2.0
+
+        bx = body_bbox["x1"]
+        by = body_bbox["y1"]
+        bx2 = body_bbox["x2"]
+        by2 = body_bbox["y2"]
+
+        # Membership check — use ORIGINAL bbox, no expansion.
+        # The 15% expansion caused adjacent persons' faces to qualify when
+        # people stood shoulder-to-shoulder.
+        if not (bx <= fx_cx <= bx2):
+            return None
+        if not (by <= fy_cy <= by2):
             return None
 
-        bx, by, bx2, by2 = body_bbox["x1"], body_bbox["y1"], body_bbox["x2"], body_bbox["y2"]
-        bw, bh = bx2 - bx, by2 - by
+        bw = bx2 - bx
+        bh = by2 - by
         body_cx = (bx + bx2) / 2.0
+        fw = fb["x2"] - fb["x1"]
+        fh = fb["y2"] - fb["y1"]
+        face_area = fw * fh
+        body_area = max(bw * bh, 1.0)
 
-        # Expand body bbox by 15% for face-centre membership check
-        margin_h = bh * 0.15
-        margin_w = bw * 0.15
+        size_score = min(1.0, face_area / (body_area * 0.03))
+        centre_dev = abs(fx_cx - body_cx) / max(bw / 2.0, 1.0)
+        centre_score = max(0.0, 1.0 - centre_dev)
 
-        candidates = []
-        for f in all_faces:
-            fb = f["bbox"]
-            fx_cx = (fb["x1"] + fb["x2"]) / 2.0
-            fy_cy = (fb["y1"] + fb["y2"]) / 2.0
+        if track.last_face_center is not None:
+            _prev_cx, _prev_cy = track.last_face_center
+            _dist = ((fx_cx - _prev_cx) ** 2 + (fy_cy - _prev_cy) ** 2) ** 0.5
+            continuity_score = max(0.0, 1.0 - _dist / 300.0)
+            geo = 0.35 * size_score + 0.30 * centre_score + 0.35 * continuity_score
+        else:
+            geo = 0.50 * size_score + 0.50 * centre_score
 
-            if not (bx - margin_w <= fx_cx <= bx2 + margin_w):
-                continue
-            if not (by - margin_h <= fy_cy <= by2 + margin_h):
-                continue
-
-            fw = fb["x2"] - fb["x1"]
-            fh = fb["y2"] - fb["y1"]
-            face_area = fw * fh
-            body_area = max(bw * bh, 1.0)
-
-            # Larger face, more centred, higher confidence → likely correct
-            size_score = min(1.0, face_area / (body_area * 0.03))
-            centre_dev = abs(fx_cx - body_cx) / max(bw / 2.0, 1.0)
-            centre_score = max(0.0, 1.0 - centre_dev)
-            geo = 0.5 * size_score + 0.5 * centre_score
-            candidates.append((float(f["det_score"]) * geo, f))
-
-        if not candidates:
-            return None
-
-        # Mark the chosen face as "claimed" so it isn't double-assigned
-        _, best_face = max(candidates, key=lambda x: x[0])
-        best_face["_claimed"] = True
-        # Remove from the list to prevent other tracks from claiming it
-        try:
-            all_faces.remove(best_face)
-        except ValueError:
-            pass
-        return best_face
+        return float(face["det_score"]) * geo
 
     async def _process_frame(self, frame):
         """Run the full pipeline on a single frame."""
@@ -390,13 +386,6 @@ class CameraWorker:
                 ):
                     reid_tracks.append(track)
 
-                # Match a face from full-frame detection to this body track.
-                # Stored on the track for _run_reid to consume; avoids calling
-                # InsightFace per-track and gives native-resolution face crops.
-                track._matched_face = self._match_face_to_track(
-                    all_faces, td.bbox, height, width
-                )
-
                 # Sampled observation (1 per track every OBS_SAMPLE_SECONDS)
                 last_obs = self._last_obs_time.get(track.local_track_id, 0.0)
                 if now_mono - last_obs >= OBS_SAMPLE_SECONDS:
@@ -409,6 +398,45 @@ class CameraWorker:
                             "zone_ids": sorted(track.current_zones),
                         }
                     )
+
+        # ── Global face-to-track assignment ───────────────────────────────
+        # Instead of greedily assigning faces per-track in output order (which
+        # lets the first track steal the best face from the track it belongs to),
+        # collect ALL (track, face, score) candidates, sort by score descending,
+        # and assign greedily — each face and each track used at most once.
+        # Uses original body bbox (no expansion) for membership check and
+        # temporal continuity (last_face_center) for scoring.
+        if all_faces and active_tracks:
+            all_candidates = []
+            for track in active_tracks:
+                if track.bbox is None:
+                    continue
+                for fi, f in enumerate(all_faces):
+                    score = self._score_face_for_track(f, track.bbox, track)
+                    if score is not None:
+                        all_candidates.append((score, track, fi))
+
+            all_candidates.sort(key=lambda x: x[0], reverse=True)
+            claimed_faces: set[int] = set()
+            assigned_tracks: set[int] = set()
+            for score, track, fi in all_candidates:
+                if fi in claimed_faces or track.local_track_id in assigned_tracks:
+                    continue
+                track._matched_face = all_faces[fi]
+                claimed_faces.add(fi)
+                assigned_tracks.add(track.local_track_id)
+
+            # Update last_face_center for temporal continuity in next frame
+            for track in active_tracks:
+                if getattr(track, '_matched_face', None) is not None:
+                    fb = track._matched_face["bbox"]
+                    track.last_face_center = (
+                        (fb["x1"] + fb["x2"]) / 2.0,
+                        (fb["y1"] + fb["y2"]) / 2.0
+                    )
+        else:
+            for track in active_tracks:
+                track._matched_face = None
 
         # 4) Automatic zone event detection
         zone_events = self.zone_event_detector.detect(active_tracks)
@@ -658,7 +686,12 @@ class CameraWorker:
                         if face_emb is None:
                             continue
                         if best_emb is not None:
-                            sim_to_best = float(np.dot(best_emb, face_emb))
+                            _best_n = np.linalg.norm(best_emb)
+                            _face_n = np.linalg.norm(face_emb)
+                            if _best_n > 0 and _face_n > 0:
+                                sim_to_best = float(np.dot(best_emb, face_emb) / (_best_n * _face_n))
+                            else:
+                                sim_to_best = 0.0
                             if sim_to_best > 0.95:
                                 continue
                         try:
@@ -1055,10 +1088,18 @@ class CameraWorker:
                         # whose body crop overlapped ours — reject this frame's face.
                         if (face_embedding is not None
                                 and len(track.face_embedding_list) >= 2):
+                            # InsightFace embeddings are NOT L2-normalized (norms 12-27),
+                            # so raw np.dot() gives values in the hundreds, not [-1, +1].
+                            # Normalize both vectors before the dot product.
+                            _face_n = np.linalg.norm(face_embedding)
                             _max_sim_to_prior = 0.0
                             for _prior_emb, _prior_scr, _ in track.face_embedding_list:
                                 if _prior_emb is not None:
-                                    _sim = float(np.dot(_prior_emb, face_embedding))
+                                    _prior_n = np.linalg.norm(_prior_emb)
+                                    if _face_n > 0 and _prior_n > 0:
+                                        _sim = float(np.dot(_prior_emb, face_embedding) / (_prior_n * _face_n))
+                                    else:
+                                        _sim = 0.0
                                     if _sim > _max_sim_to_prior:
                                         _max_sim_to_prior = _sim
                             if _max_sim_to_prior < self.settings.FACE_CONTAMINATION_THRESHOLD:
@@ -1072,6 +1113,12 @@ class CameraWorker:
                                 rejection_reason = (
                                     f"contamination (max_prior_sim={_max_sim_to_prior:.3f} < "
                                     f"{self.settings.FACE_CONTAMINATION_THRESHOLD:.2f})"
+                                )
+                            else:
+                                logger.info(
+                                    f"Track {track.local_track_id}: Face PASSED contamination gate "
+                                    f"(max_prior_sim={_max_sim_to_prior:.3f}, "
+                                    f"prior_faces={len(track.face_embedding_list)})"
                                 )
 
                         if face_frontal:
@@ -1147,12 +1194,29 @@ class CameraWorker:
                 # consecutive windows should not be stored multiple times.
                 if face_embedding is not None:
                     is_duplicate = False
+                    _face_n = np.linalg.norm(face_embedding)
+                    _sims_to_existing = []
                     for existing_emb, _, _ in track.face_embedding_list:
-                        if float(np.dot(existing_emb, face_embedding)) > 0.95:
+                        _existing_n = np.linalg.norm(existing_emb)
+                        if _face_n > 0 and _existing_n > 0:
+                            _sim = float(np.dot(existing_emb, face_embedding) / (_existing_n * _face_n))
+                        else:
+                            _sim = 0.0
+                        _sims_to_existing.append(_sim)
+                        if _sim > 0.95:
                             is_duplicate = True
                             break
                     if not is_duplicate:
                         track.face_embedding_list.append((face_embedding, face_score, face_crop_path))
+                        logger.info(
+                            f"Track {track.local_track_id}: Face ACCUMULATED (#{len(track.face_embedding_list)}) "
+                            f"(score={face_score:.2f}, sims_to_prior={[f'{s:.3f}' for s in _sims_to_existing]})"
+                        )
+                    else:
+                        logger.debug(
+                            f"Track {track.local_track_id}: Face SKIPPED as duplicate "
+                            f"(sims_to_prior={[f'{s:.3f}' for s in _sims_to_existing]})"
+                        )
                     # Keep the best face embedding for the identity matching step
                     if face_score > track.best_face_score_for_id:
                         track.best_face_embedding = face_embedding
@@ -1226,6 +1290,15 @@ class CameraWorker:
 
                 is_temp = track.person_identity_id in self.temporary_person_ids
 
+                logger.info(
+                    f"Track {track.local_track_id}: ReID window firing — "
+                    f"accumulated_faces={len(track.face_embedding_list)}, "
+                    f"good_face_count={track.good_face_count}, "
+                    f"best_face_score={track.best_face_score_for_id:.2f}, "
+                    f"current_person={str(track.person_identity_id)[:8] if track.person_identity_id else 'None'}, "
+                    f"is_temp={is_temp}"
+                )
+
                 person_id, score, is_confident, is_new, prune_old_id = await self.identity_engine.decide_identity(
                     db=db,
                     mean_embedding=selected_embedding,
@@ -1260,20 +1333,34 @@ class CameraWorker:
                     from app.core.db.models.person import PersonIdentity
                     person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
                     best_emb = track.best_face_embedding
+                    stored_count = 0
                     for face_emb, face_scr, face_crp in track.face_embedding_list:
                         if face_emb is None:
                             continue
                         # Skip the face that decide_identity already stored (the best one)
                         if best_emb is not None:
-                            sim_to_best = float(np.dot(best_emb, face_emb))
+                            _best_n = np.linalg.norm(best_emb)
+                            _face_n = np.linalg.norm(face_emb)
+                            if _best_n > 0 and _face_n > 0:
+                                sim_to_best = float(np.dot(best_emb, face_emb) / (_best_n * _face_n))
+                            else:
+                                sim_to_best = 0.0
                             if sim_to_best > 0.95:
                                 continue
                         try:
                             await self.identity_engine._store_face_embedding(
                                 db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
                             )
+                            stored_count += 1
                         except Exception as e:
                             logger.warning(f"Failed to store additional face embedding: {e}")
+
+                    logger.info(
+                        f"Track {track.local_track_id}: Identity resolved — "
+                        f"person={str(person_id)[:8]}, "
+                        f"faces_in_list={len(track.face_embedding_list)}, "
+                        f"face_stored_via_store={stored_count}"
+                    )
 
 
 

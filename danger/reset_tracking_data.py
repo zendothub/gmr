@@ -87,12 +87,30 @@ async def reset():
             sys.exit(0)
 
     # ── Database ──────────────────────────────────────────────────────────────
-    print("\n🗑️  Clearing database tables...\n")
+    print("\n  Clearing database tables...\n")
     async with AsyncSessionLocal() as db:
         for table in TABLES_IN_ORDER:
             result = await db.execute(text(f"DELETE FROM {table}"))
             print(f"   ✓ {table}: {result.rowcount} rows deleted")
         await db.commit()
+
+    # ── Rebuild pgvector indexes + vacuum ─────────────────────────────────────
+    # After a full data wipe, the IVFFlat indexes are empty but may have
+    # stale statistics / dead tuples. Rebuild + vacuum ensures the indexes
+    # are clean for fresh data ingestion.
+    print("\n  Rebuilding pgvector indexes + vacuum...\n")
+    from app.core.db.session import sync_engine
+    with sync_engine.connect() as conn:
+        conn.execution_options(isolation_level="AUTOCOMMIT")
+        conn.execute(text("REINDEX INDEX idx_person_face_embeddings_embedding"))
+        print("   ✓ Rebuilt: idx_person_face_embeddings_embedding (IVFFlat)")
+        conn.execute(text("REINDEX TABLE person_embeddings"))
+        print("   ✓ Rebuilt: person_embeddings indexes (incl. IVFFlat)")
+        conn.execute(text("VACUUM ANALYZE person_face_embeddings"))
+        conn.execute(text("VACUUM ANALYZE person_embeddings"))
+        conn.execute(text("VACUUM ANALYZE person_identities"))
+        conn.execute(text("VACUUM ANALYZE track_sessions"))
+        print("   ✓ Vacuumed + analyzed all person/tracking tables")
 
     # ── MinIO ─────────────────────────────────────────────────────────────────
     print("\n🗑️  Clearing MinIO objects...\n")

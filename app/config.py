@@ -63,6 +63,12 @@ class Settings(BaseSettings):
                                                 # cosine similarity < 0.35 to ALL previously accumulated faces for this
                                                 # track, it is rejected as contamination (face from adjacent person).
                                                 # Same person cross-angle range: 0.40–0.70+.  Different person: 0.10–0.30.
+    BODY_CONTAMINATION_THRESHOLD: float = 0.60 # When storing a body embedding, if median cosine similarity to existing
+                                                # body embeddings (>=3) is below this, reject as contamination. Also used
+                                                # by periodic dedup cleanup to remove cluster outliers.
+                                                # OSNet same-person median sim range 0.83-0.93, different-person medians
+                                                # drop to 0.54-0.63. 0.60 cleanly separates the clusters.
+
     FACE_IDENTITY_MIN_SCORE: float = 0.60     # Minimum face quality score required to create a new PersonIdentity
     FACE_IDENTITY_MIN_DETECTIONS: int = 2     # Minimum good face detections across track lifetime required for identity creation
     MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5   # Maximum face embeddings stored per person identity (multi-angle)

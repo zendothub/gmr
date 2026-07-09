@@ -24,6 +24,21 @@ class IdentityDecisionEngine:
         self.settings = get_settings()
         self.match_threshold = self.settings.REID_MATCH_THRESHOLD
 
+    @staticmethod
+    def _face_sim(a: np.ndarray, b: np.ndarray) -> float:
+        """Cosine similarity between two face embeddings.
+
+        InsightFace buffalo_l embeddings are NOT L2-normalized (norms 12-27),
+        so raw np.dot() gives values in the hundreds, not [-1, +1].
+        This helper normalizes both vectors before the dot product so the
+        result is a proper cosine similarity in [-1, +1].
+        """
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+
     async def decide_identity(
         self,
         db: AsyncSession,
@@ -69,7 +84,7 @@ class IdentityDecisionEngine:
             if current_person_id is not None and face_embedding is not None:
                 current_faces = await self._get_person_face_embeddings(db, current_person_id)
                 if current_faces:
-                    best_face_sim = max(float(np.dot(f, face_embedding)) for f in current_faces)
+                    best_face_sim = max(self._face_sim(f, face_embedding) for f in current_faces)
                     if best_face_sim < self.settings.FACE_CONTRADICTION_THRESHOLD:
                         current_id_contradicted = True
                         logger.warning(
@@ -123,7 +138,7 @@ class IdentityDecisionEngine:
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
                         if candidate_faces:
-                            best_f_sim = max(float(np.dot(f, face_embedding)) for f in candidate_faces)
+                            best_f_sim = max(self._face_sim(f, face_embedding) for f in candidate_faces)
                             if best_f_sim < self.settings.FACE_BODY_EXCLUSION_THRESHOLD:
                                 continue  # face contradicts → skip
 
@@ -494,9 +509,48 @@ class IdentityDecisionEngine:
         crop_quality_score: float,
         crop_path: Optional[str],
     ):
-        """Store a new embedding for an existing person (capped per identity)."""
+        """Store a new embedding for an existing person (capped per identity).
+
+        Body contamination gate: if this person already has >=3 stored body
+        embeddings, checks the median cosine similarity of the new embedding
+        to existing ones. If median < BODY_CONTAMINATION_THRESHOLD (0.60),
+        reject it — it belongs to a different person whose body ReID falsely
+        matched. Uses median instead of min to avoid single-edge false positives
+        (OSNet chains different-person clusters via weak edges around 0.66-0.75).
+        """
         if embedding is None:
             return
+
+        # ── Body contamination gate ───────────────────────────────────────
+        import numpy as np
+        new_emb = np.array(embedding.tolist(), dtype=np.float32)
+        existing_body = await db.execute(text(
+            "SELECT embedding FROM person_embeddings"
+            " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+            " ORDER BY crop_quality DESC LIMIT 10"
+        ), {"pid": str(person_id)})
+        existing_rows = existing_body.fetchall()
+        if len(existing_rows) >= 3:
+            sims = []
+            for row in existing_rows:
+                raw = row[0]
+                if isinstance(raw, str):
+                    emb = np.array(eval(raw), dtype=np.float32)
+                else:
+                    emb = np.array(raw, dtype=np.float32)
+                sim = float(np.dot(emb, new_emb))
+                sims.append(sim)
+            median_sim = float(np.median(sims))
+            if median_sim < self.settings.BODY_CONTAMINATION_THRESHOLD:
+                logger.warning(
+                    f"Body embedding CONTAMINATION rejected for person {person_id}: "
+                    f"median_sim_to_existing={median_sim:.3f} < "
+                    f"{self.settings.BODY_CONTAMINATION_THRESHOLD} "
+                    f"samples={[f'{s:.3f}' for s in sorted(sims)[:5]]} "
+                    f"(different person's body — OSNet false positive)"
+                )
+                return
+
         emb = PersonEmbedding(
             person_identity_id=person_id,
             embedding=embedding.tolist(),
@@ -564,10 +618,12 @@ class IdentityDecisionEngine:
                     return
 
             # ── Contamination gate ──────────────────────────────────────────
-            # If existing face embeddings for this person form a cluster (positive
-            # mutual similarity), the new face must belong to that cluster.
-            # A negative cosine similarity (< 0) means it's from a DIFFERENT person
-            # whose body crop overlapped ours.
+            # If existing face embeddings for this person form a cluster, the
+            # new face must belong to that cluster.  A cosine similarity below
+            # FACE_CONTAMINATION_THRESHOLD (0.35) to the cluster means it's from
+            # a DIFFERENT person whose body crop overlapped ours.
+            # Uses _face_sim() which normalizes both vectors first — InsightFace
+            # embeddings are NOT L2-normalized (norms 12-27).
             existing_result = await db.execute(text(
                 "SELECT embedding FROM person_face_embeddings"
                 " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
@@ -579,20 +635,35 @@ class IdentityDecisionEngine:
                 new_emb = np.array(face_embedding.tolist(), dtype=np.float32)
                 min_sim = float('inf')
                 for row in existing_faces:
-                    emb = np.array(row[0], dtype=np.float32)
-                    sim = float(np.dot(emb, new_emb))
+                    raw = row[0]
+                    if isinstance(raw, str):
+                        emb = np.array(eval(raw), dtype=np.float32)
+                    else:
+                        emb = np.array(raw, dtype=np.float32)
+                    sim = self._face_sim(emb, new_emb)
                     if sim < min_sim:
                         min_sim = sim
-                if min_sim < 0.0:
+                if min_sim < self.settings.FACE_CONTAMINATION_THRESHOLD:
                     logger.warning(
                         f"Face embedding CONTAMINATION rejected for person {person_id}: "
-                        f"min_sim_to_existing={min_sim:.3f} < 0 (different person's face)"
+                        f"min_sim_to_existing={min_sim:.3f} < "
+                        f"{self.settings.FACE_CONTAMINATION_THRESHOLD} (different person's face)"
                     )
                     return  # skip — this face doesn't belong to this person
 
+            # Normalize the face embedding before storing so future comparisons
+            # can use raw np.dot() as cosine similarity.  Existing DB rows that
+            # were stored before this fix are handled by the migration script
+            # (danger/normalize_face_embeddings.py) and by _face_sim() which
+            # normalizes at comparison time as a safety net.
+            _face_emb_to_store = face_embedding
+            _norm = np.linalg.norm(face_embedding)
+            if _norm > 0:
+                _face_emb_to_store = face_embedding / _norm
+
             face_emb = PersonFaceEmbedding(
                 person_identity_id=person_id,
-                embedding=face_embedding.tolist(),
+                embedding=_face_emb_to_store.tolist(),
                 camera_id=camera_id,
                 face_score=face_score,
                 face_crop_path=face_crop_path,
@@ -767,9 +838,13 @@ class IdentityDecisionEngine:
         
         if face_embedding is not None and face_score > 0:
             from app.core.db.models.person import PersonFaceEmbedding
+            _face_emb = face_embedding
+            _norm = np.linalg.norm(face_embedding)
+            if _norm > 0:
+                _face_emb = face_embedding / _norm
             face_emb = PersonFaceEmbedding(
                 person_identity_id=person.id,
-                embedding=face_embedding.tolist(),
+                embedding=_face_emb.tolist(),
                 camera_id=camera_id,
                 face_score=face_score,
                 face_crop_path=face_crop_path,
