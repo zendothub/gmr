@@ -35,6 +35,16 @@
 
 6. **Keep CONTEXT.md updated** — After any significant change (new model, threshold adjustment, architectural decision), update CONTEXT.md with the rationale, data, and date.
 
+7. **Recent-window matching is feature-flagged** — `ENABLE_RECENT_WINDOW_MATCHING` in `config.py`. Body-only merge (no usable face) is valid ONLY within the 5-min window (`RECENT_WINDOW_MINUTES`). Outside it, strict 0.40 face / 0.50 body + 2-of-3 consensus applies. Body ReID is clothing-dependent — never trust body alone across days.
+
+8. **Camera-aware overlap** — Cross-camera overlap (entry + counter simultaneously) is expected for the same person. Only same-camera overlap blocks a merge. The backfill script (`danger/merge_recent_window_duplicates.py`) and any future merge logic must distinguish cameras, not use a global overlap check.
+
+9. **Contamination cleanup uses median, not greedy** — `_clean_contaminated_face_embeddings` and `_clean_contaminated_body_embeddings` both use iterative median-outlier removal. Greedy single-linkage chains contamination through bridge embeddings. Never revert to the greedy approach.
+
+10. **Absorb must check cluster fit** — `_absorb_face_embeddings` / `_absorb_body_embeddings` must DROP a loser embedding that doesn't fit the winner's cluster (median sim < 0.35 face / < 0.50 body). Never move embeddings without this check — it was the root cause of staff-identity pollution.
+
+11. **Worker logging uses shared setup** — `app/worker.py` calls `app/logging_config.py::setup_logging()`. Do not add ad-hoc loguru sinks in the worker; use the shared helper so background job activity stays in `logs/ai_processing.log`.
+
 ---
 
 ## Key Files to Know
@@ -44,10 +54,14 @@
 | Gender classification | `app/modules/reid/siglip2_analyzer.py` |
 | Age prediction | `app/modules/reid/mivolo_analyzer.py` |
 | Face detection | `app/modules/reid/insightface_analyzer.py` |
-| Identity matching | `app/modules/reid/identity_decision_engine.py` |
+| Identity matching (incl. recent-window) | `app/modules/reid/identity_decision_engine.py` |
 | Camera pipeline | `app/modules/ai_runtime/camera_worker.py` |
 | Analytics | `app/modules/analytics/service.py` |
-| Background jobs | `app/modules/jobs/tasks.py` |
-| All thresholds | `app/config.py` |
+| Background jobs (dedup, cleanup, staff) | `app/modules/jobs/tasks.py` |
+| All thresholds (incl. recent-window) | `app/config.py` |
+| Shared logging setup | `app/logging_config.py` |
 | DB schema | `app/core/db/models/` |
-| Diagnostic scripts | `danger/` |
+| Diagnostic + fix scripts | `danger/` |
+| Contamination cleanup | `danger/clean_contaminated_embeddings.py` |
+| Historical backfill merge | `danger/merge_recent_window_duplicates.py` |
+| Recent-window + contamination design | `docs/RECENT_WINDOW_AND_CONTAMINATION_FIX.md` |
