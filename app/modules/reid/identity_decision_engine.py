@@ -126,10 +126,10 @@ class IdentityDecisionEngine:
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
 
                 # ── Body consensus gate ──────────────────────────────────
-                # A single body match can be a false positive (OSNet overlaps
-                # same/different distributions at 0.58–0.83).  Require at
-                # least 2 of the top-3 unique-identity candidates to agree
-                # AND exceed REID_MATCH_THRESHOLD before accepting.
+                # A single body match can be a false positive (OSNet same-person
+                # median=0.680, diff-person p90=0.534 — overlap at 0.50–0.55).
+                # Require at least 2 of the top-3 unique-identity candidates to
+                # agree AND exceed REID_MATCH_THRESHOLD before accepting.
                 body_votes: dict = {}
                 body_best_by_id: dict = {}
                 for candidate in candidates:
@@ -513,7 +513,7 @@ class IdentityDecisionEngine:
 
         Body contamination gate: if this person already has >=3 stored body
         embeddings, checks the median cosine similarity of the new embedding
-        to existing ones. If median < BODY_CONTAMINATION_THRESHOLD (0.60),
+        to existing ones. If median < BODY_CONTAMINATION_THRESHOLD (0.50),
         reject it — it belongs to a different person whose body ReID falsely
         matched. Uses median instead of min to avoid single-edge false positives
         (OSNet chains different-person clusters via weak edges around 0.66-0.75).

@@ -230,10 +230,10 @@ async def deduplicate_persons():
             parent: dict[str, str] = {}
 
             def find(x: str) -> str:
-                while parent.get(x, x) != x:
-                    parent[x] = parent.get(parent.get(x, x), x)  # path compression
-                    x = parent.get(x, x)
-                return x
+                p = parent.get(x, x)
+                if p != x:
+                    parent[x] = find(p)
+                return parent.get(x, x)
 
             def union(x: str, y: str):
                 parent[find(x)] = find(y)
@@ -520,7 +520,7 @@ async def _clean_contaminated_body_embeddings(db, settings) -> int:
     Uses iterative median-based outlier removal: for each person with >=3 body
     embeddings, repeatedly removes the embedding with the lowest median
     similarity to the rest until all remaining embeddings have median
-    >= BODY_CONTAMINATION_THRESHOLD (0.60) or the cluster drops below 3.
+    >= BODY_CONTAMINATION_THRESHOLD (0.50) or the cluster drops below 3.
 
     The numpy computation runs in a thread pool (asyncio.to_thread) to avoid
     blocking the FastAPI event loop at 1k+ persons scale.

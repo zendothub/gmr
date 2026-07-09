@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     YOLO_ALLOWED_CLASSES: str = "0"  # comma-separated class IDs
     OSNET_MODEL_PATH: str = "models/osnet_x1_0.pth"
     REID_EMBEDDING_DIM: int = 512
-    REID_MATCH_THRESHOLD: float = 0.85   # Body ReID match threshold (raised from 0.80 — OSNet self-sim floors at 0.58, overlap with diff at 0.10-0.40)
+    REID_MATCH_THRESHOLD: float = 0.50   # Body ReID match threshold. With MSMT17-trained OSNet weights, same-person
+                                           # cross-camera median=0.680 (p10=0.393), diff-person median=0.386 (p90=0.534).
+                                           # Best F1=0.49. 0.50 + 2-of-3 consensus gate gives clean separation.
+                                           # Previously 0.85 (calibrated against broken ImageNet-backbone weights — see
+                                           # CONTEXT.md issue #16, corrected 2026-07-09).
     REID_CROP_QUALITY_THRESHOLD: float = 0.30
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
@@ -65,11 +69,13 @@ class Settings(BaseSettings):
                                                 # cosine similarity < 0.35 to ALL previously accumulated faces for this
                                                 # track, it is rejected as contamination (face from adjacent person).
                                                 # Same person cross-angle range: 0.40–0.70+.  Different person: 0.10–0.30.
-    BODY_CONTAMINATION_THRESHOLD: float = 0.60 # When storing a body embedding, if median cosine similarity to existing
+    BODY_CONTAMINATION_THRESHOLD: float = 0.50 # When storing a body embedding, if median cosine similarity to existing
                                                 # body embeddings (>=3) is below this, reject as contamination. Also used
                                                 # by periodic dedup cleanup to remove cluster outliers.
-                                                # OSNet same-person median sim range 0.83-0.93, different-person medians
-                                                # drop to 0.54-0.63. 0.60 cleanly separates the clusters.
+                                                # With MSMT17 OSNet weights: same-person median=0.680 (p25=0.537),
+                                                # diff-person median=0.386 (p75=0.444). 0.50 cleanly separates with
+                                                # good margin on both sides. Previously 0.60 (too close to same-person
+                                                # p25=0.537, rejected valid cross-angle embeddings).
 
     FACE_IDENTITY_MIN_SCORE: float = 0.60     # Minimum face quality score required to create a new PersonIdentity
     FACE_IDENTITY_MIN_DETECTIONS: int = 2     # Minimum good face detections across track lifetime required for identity creation

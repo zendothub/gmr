@@ -1,0 +1,17 @@
+# systemd timer for RetailEye Face Re-extraction
+# Triggers reextract-faces.service every 20 minutes (OnUnitActiveSec=1200)
+# and 2 minutes after boot (OnBootSec=120).
+#
+# Install:
+#   sudo systemctl enable --now reextract-faces.timer
+
+[Unit]
+Description=Run face re-extraction/deletion every 20 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=1200
+Unit=reextract-faces.service
+
+[Install]
+WantedBy=timers.target

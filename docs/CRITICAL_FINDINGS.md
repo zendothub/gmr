@@ -584,24 +584,41 @@ Face crops are extracted from the **full frame** at native resolution (100-400px
 
 ---
 
-## 14. Body ReID Dedup + Consensus Gate + 0.85 Threshold
+## 14. Body ReID Dedup + Consensus Gate + Missing-Weights Root Cause
 
-**Status:** FIXED (July 8, 2026)  
-**Files changed:** `identity_decision_engine.py`, `config.py`
+**Status:** FIXED (July 8, 2026 — consensus gate), **ROOT CAUSE FOUND** (July 9, 2026 — missing MSMT17 weights)  
+**Files changed:** `identity_decision_engine.py`, `config.py`, `osnet_extractor.py`
 
-### Problem
-OSNet body embedding similarity overlaps heavily between same-person (0.58-0.83) and different-person (0.10-0.40) on CCTV — a 0.18 gap with heavy contamination in the overlap zone. With REID_MATCH_THRESHOLD=0.80, both false positives and false negatives occurred. Additionally, `_search_similar` returned raw top-5 embeddings without deduplicating by person — a single person with 10 stored body embeddings could monopolize all 5 candidates.
+### Original Problem (July 8)
+OSNet body embedding similarity was non-discriminative — same-person and different-person distributions overlapped heavily. `_search_similar` returned raw top-5 embeddings without deduplicating by person — a single person with 10 stored body embeddings could monopolize all 5 candidates.
 
-### Fix — Three-layer Defense
+### Root Cause — Missing ReID Weights (July 9)
+The configured `OSNET_MODEL_PATH = "models/osnet_x1_0.pth"` **did not exist on disk**. `FeatureExtractor` silently fell back to `pretrained=True`, loading ONLY the ImageNet backbone (`osnet_x1_0_imagenet.pth` from `~/.cache/torch/`). The ReID `fc` embedding head (512-dim) stayed **randomly-initialized**. All stored body embeddings were non-discriminative — they encoded scene appearance (pharmacy background, lighting, color histograms) rather than person identity. This is why different-person body sims (median 0.763) **exceeded** same-person sims (median 0.730) — different people in the same pharmacy scene looked MORE similar than the same person across cameras.
+
+### Fix
+
+**Layer 0: Download MSMT17-trained OSNet checkpoint (July 9)**
+Replaced missing `models/osnet_x1_0.pth` with `osnet_x1_0_msmt17_combineall` checkpoint (17.3 MB, from HuggingFace `kaiyangzhou/osnet`). Startup guard added in `osnet_extractor.py:_load_model` that refuses to start if the model file is missing AND verifies `fc.*` keys loaded from the checkpoint via `_verify_reid_weights_loaded()`. 292 existing `person_embeddings` recomputed from MinIO crops + IVFFlat index rebuilt.
+
+**New distributions (MSMT17 weights, 32 multi-camera persons + 60 concurrent pairs):**
+```
+SAME-person: n=88   median=0.680  p10=0.393  p90=0.845
+DIFF-person: n=145  median=0.386  p10=0.294  p90=0.534
+```
+Same-person median (0.680) >> diff-person median (0.386). Best F1 threshold=0.49 (F1=0.793).
+
+**Thresholds retuned:**
+- `REID_MATCH_THRESHOLD`: 0.85 → **0.50** (was calibrated against broken ImageNet-backbone weights)
+- `BODY_CONTAMINATION_THRESHOLD`: 0.60 → **0.50** (was too close to same-person p25=0.537, rejected valid cross-angle embeddings)
 
 **Layer 1: Person-identity deduplication in `_search_similar`**
 Mirrors the face search behavior: fetches 25 raw embeddings, keeps only the best match per unique person_identity_id, returns top-K unique identities. Prevents one person from dominating candidates.
 
 **Layer 2: Body consensus gate (2 of top-3 must agree)**
-A single body match at 0.85 can still be a false positive. Requires at least 2 of the top-3 unique-identity candidates to agree on the same person before accepting a body ReID merge. Two false positives at 0.85 is exponentially unlikely (p² ≈ 0.01).
+A single body match at 0.50 can still be a false positive. Requires at least 2 of the top-3 unique-identity candidates to agree on the same person AND exceed REID_MATCH_THRESHOLD before accepting a body ReID merge. With the new MSMT17 weights, 2-of-3 false positives at 0.50 is exponentially unlikely (diff-person p90=0.534, so the probability of 2 wrong persons both exceeding 0.50 is low).
 
-**Layer 3: REID_MATCH_THRESHOLD raised to 0.85**
-0.80 was too close to the OSNet self-sim floor (0.58). 0.85 gives cleaner separation from the different-person range (max ~0.40). Missed same-person pairs are caught by the dedup job.
+**Layer 3: Body contamination gate (store-time, 0.50 median)**
+When storing a new body embedding, if the median cosine similarity to the existing cluster (≥3 embeddings) is below 0.50, reject it. At 0.50, same-person embeddings (median 0.680) are kept, diff-person embeddings (median 0.386) are rejected. Clean separation with good margin on both sides. The dedup job's iterative median-based outlier removal also uses this threshold.
 
 ---
 
@@ -713,7 +730,8 @@ PYTHONPATH=. venv/bin/python danger/test_siglip2_body.py [person_id ...]
 | `FACE_IDENTITY_MIN_SCORE` | `0.60` | Min face_quality for identity creation |
 | `FACE_IDENTITY_MIN_DETECTIONS` | `2` | Min good face detections per track |
 | `MAX_FACE_EMBEDDINGS_PER_PERSON` | `5` | Multi-angle face storage cap |
-| `REID_MATCH_THRESHOLD` | `0.85` | Body ReID match threshold (raised from 0.80) |
+| `REID_MATCH_THRESHOLD` | `0.50` | Body ReID match threshold (MSMT17 OSNet, same-person median=0.680, diff-person median=0.386, best F1=0.49. Previously 0.85 — calibrated against broken ImageNet-backbone weights) |
+| `BODY_CONTAMINATION_THRESHOLD` | `0.50` | Body contamination gate (store-time + dedup cleanup). Was 0.60, lowered to 0.50 with MSMT17 weights — same-person p25=0.537, diff-person p75=0.444. |
 | `SIGLIP2_MODEL_ID` | `google/siglip2-base-patch16-224` | Gender model (100% on clean CCTV) |
 | `MIVOLO_MODEL_PATH` | `models/mivolo/mivolo_fairface.pth.tar` | Age model (MiVOLO kept for age only) |
 | `STAFF_DURATION_THRESHOLD_SECONDS` | `1800` | Staff detection: total visible time >30 min |

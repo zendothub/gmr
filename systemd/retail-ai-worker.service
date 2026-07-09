@@ -1,0 +1,30 @@
+# systemd unit for RetailEye Background Worker (retail-ai-worker service)
+# Runs APScheduler with all periodic background jobs — dedup, MinIO sweep,
+# staff classification, analytics aggregation, storage cleanup.
+#
+# Separate from the API server to avoid blocking the event loop during
+# heavy DB/MinIO operations. No GPU models, no camera workers, no HTTP.
+#
+# Install:
+#   sudo cp systemd/retail-ai-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now retail-ai-worker.service
+
+[Unit]
+Description=Retail AI Background Worker (Jobs Scheduler)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=retaileye
+Group=retaileye
+WorkingDirectory=/gmr/gmr
+Environment="PATH=/gmr/gmr/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/gmr/gmr"
+ExecStart=/gmr/gmr/venv/bin/python -m app.worker
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

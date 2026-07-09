@@ -1,0 +1,28 @@
+# systemd unit for RetailEye Face Re-extraction (reextract-faces service)
+# Oneshot service that loads InsightFace, re-extracts face embeddings from
+# track crops for persons left faceless by contamination cleanup, and deletes
+# persons where no face is found in any crop.
+#
+# Runs as a separate process (not inside the worker) because it loads
+# InsightFace (~1.5 GB GPU). As a oneshot, GPU memory is freed on exit.
+#
+# Install:
+#   sudo cp systemd/reextract-faces.service /etc/systemd/system/
+#   sudo cp systemd/reextract-faces.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now reextract-faces.timer
+
+[Unit]
+Description=Re-extract or delete faceless persons (Retail AI)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=retaileye
+Group=retaileye
+WorkingDirectory=/gmr/gmr
+Environment="PATH=/gmr/gmr/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/gmr/gmr"
+ExecStart=/gmr/gmr/venv/bin/python danger/reextract_or_delete_faceless.py
+TimeoutStartSec=120

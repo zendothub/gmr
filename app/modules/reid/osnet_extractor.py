@@ -42,19 +42,91 @@ class OSNetExtractor:
         self._load_model()
 
     def _load_model(self):
-        """Load OSNet model."""
+        """Load OSNet model.
+
+        Safety guard: if ``model_path`` is configured but the file is missing,
+        ``FeatureExtractor`` silently falls back to ``pretrained=True`` which
+        loads ONLY the ImageNet backbone — the ReID ``fc`` embedding head stays
+        randomly-initialized, producing non-discriminative embeddings. This
+        previously caused OSNet body ReID to be completely broken (CONTEXT.md
+        issues #1/#16). We refuse to start in that state.
+        """
         try:
+            import os
+            import torch
             from torchreid.reid.utils import FeatureExtractor
-            # Note: FeatureExtractor automatically handles resizing and transforms
+
+            if self.model_path and not os.path.isfile(self.model_path):
+                raise FileNotFoundError(
+                    f"OSNET_MODEL_PATH='{self.model_path}' does not exist. "
+                    f"Without ReID-finetuned weights the fc embedding head is "
+                    f"random-init and body ReID is non-discriminative. "
+                    f"Download osnet_x1_0_msmt17 to {self.model_path}."
+                )
+
+            # FeatureExtractor internally builds with pretrained=(not(model_path
+            # and check_isfile(model_path))) and then calls
+            # load_pretrained_weights when the path is valid. With the file now
+            # present, pretrained=False so the ImageNet backbone is NOT
+            # auto-downloaded; the ReID checkpoint is the sole weight source.
             self.model = FeatureExtractor(
                 model_name='osnet_x1_0',
                 model_path=self.model_path if self.model_path else None,
-                device=self.device
+                device=self.device,
+                verbose=False,
             )
+            # FeatureExtractor builds with pretrained=(not(model_path and
+            # check_isfile(model_path))) and then calls load_pretrained_weights
+            # only when the path is valid. When it does, verify the ReID ``fc``
+            # embedding head actually loaded (not just the conv backbone).
+            if self.model_path and os.path.isfile(self.model_path):
+                self._verify_reid_weights_loaded()
+
             logger.info(f"OSNet FeatureExtractor loaded: {self.model_path}")
         except Exception as e:
             logger.error(f"Failed to initialize OSNet extractor: {e}")
             self.model = None
+
+    def _verify_reid_weights_loaded(self):
+        """Confirm the ReID ``fc`` embedding head matched the checkpoint.
+
+        ``load_pretrained_weights`` only prints matched/discarded layers; a
+        silent fallback (e.g. checkpoint key mismatch) would leave ``fc``
+        random-init with no error. We re-run the name+size match against the
+        checkpoint and fail loudly if the ``fc`` keys did not load.
+        """
+        import os
+        from collections import OrderedDict
+        import torch
+
+        try:
+            ckpt = torch.load(self.model_path, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            model_dict = self.model.model.state_dict()
+            fc_matched, fc_missing = [], []
+            for k, v in state_dict.items():
+                if k.startswith("module."):
+                    k = k[7:]
+                if k.startswith("fc."):
+                    if k in model_dict and model_dict[k].shape == v.shape:
+                        fc_matched.append(k)
+                    else:
+                        fc_missing.append(k)
+            if len(fc_matched) == 0:
+                raise RuntimeError(
+                    f"OSNet checkpoint {self.model_path} did NOT match any "
+                    f"fc.* keys in the model — the ReID embedding head is "
+                    f"random-init. Body ReID will be non-discriminative. "
+                    f"fc_missing={fc_missing}"
+                )
+            logger.info(
+                f"OSNet ReID weights verified: {len(fc_matched)} fc keys loaded "
+                f"({fc_matched}). Body ReID embedding head is trained."
+            )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning(f"OSNet ReID weight verification skipped: {e}")
 
     def extract(self, crop: np.ndarray) -> Optional[np.ndarray]:
         """

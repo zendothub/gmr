@@ -1,7 +1,6 @@
 # systemd unit for RetailEye Backend (retail-ai service)
 # This service runs the FastAPI backend application
 #
-# Canonical source: systemd/retail-ai.service
 # Install:
 #   sudo cp systemd/retail-ai.service /etc/systemd/system/
 #   sudo systemctl daemon-reload

@@ -87,6 +87,44 @@ sudo systemctl start reextract-faces.timer
 
 All three are `enabled` by default and start automatically on boot.
 
+### Installing the systemd services
+
+All service files are in the `systemd/` directory. To install:
+
+```bash
+# Copy all service and timer files
+sudo cp systemd/retail-ai.service /etc/systemd/system/
+sudo cp systemd/retail-ai-worker.service /etc/systemd/system/
+sudo cp systemd/reextract-faces.service /etc/systemd/system/
+sudo cp systemd/reextract-faces.timer /etc/systemd/system/
+
+# Reload systemd and enable all services
+sudo systemctl daemon-reload
+sudo systemctl enable retail-ai.service
+sudo systemctl enable retail-ai-worker.service
+sudo systemctl enable reextract-faces.timer
+
+# Start all services
+sudo systemctl start retail-ai.service
+sudo systemctl start retail-ai-worker.service
+sudo systemctl start reextract-faces.timer
+```
+
+To check status of all services:
+
+```bash
+systemctl status retail-ai.service retail-ai-worker.service reextract-faces.timer
+```
+
+To restart individual services:
+
+```bash
+sudo systemctl restart retail-ai.service          # restart API server
+sudo systemctl restart retail-ai-worker.service    # restart background worker
+```
+
+**Note:** Edit the `WorkingDirectory` and paths in the service files if your install path is not `/gmr/gmr`.
+
 ## Logs
 
 | Service | Log location |
