@@ -2,7 +2,7 @@
 
 import uuid
 from typing import Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -110,11 +110,30 @@ class IdentityDecisionEngine:
                     face_candidate = await self._search_similar_face(db, search_emb)
                     if face_candidate:
                         face_sim = 1.0 - face_candidate["distance"]
+                        # Strict face match (unchanged, works for any age of candidate)
                         if face_sim >= self.settings.FACE_MATCH_THRESHOLD and face_sim > best_similarity:
                             best_candidate = face_candidate
                             best_similarity = face_sim
                             used_face = True
                             logger.info(f"[Face Match] Score: {face_sim:.3f}, Person: {str(face_candidate['person_identity_id'])[:8]}")
+                        # Recent-window relaxed face match: same-visit cross-angle handoff
+                        # whose best face pair falls in [0.35, 0.40) — would be missed by the
+                        # strict threshold and create a duplicate. Only for candidates whose
+                        # first_seen_at is within RECENT_WINDOW_MINUTES (same visit, small pool).
+                        elif (
+                            self.settings.ENABLE_RECENT_WINDOW_MATCHING
+                            and face_sim >= self.settings.FACE_MATCH_THRESHOLD_RECENT
+                            and face_sim > best_similarity
+                            and self._is_recent(face_candidate.get("first_seen_at"))
+                        ):
+                            best_candidate = face_candidate
+                            best_similarity = face_sim
+                            used_face = True
+                            logger.info(
+                                f"[Face Match RECENT] Score: {face_sim:.3f} (≥{self.settings.FACE_MATCH_THRESHOLD_RECENT}, "
+                                f"relaxed from {self.settings.FACE_MATCH_THRESHOLD}), Person: "
+                                f"{str(face_candidate['person_identity_id'])[:8]}"
+                            )
 
             # Step 2: Fallback to Body ReID matching (with face contradiction gate).
             # skip_body_reid logic intentionally removed — high-quality face that misses
@@ -134,12 +153,22 @@ class IdentityDecisionEngine:
                 body_best_by_id: dict = {}
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
+                    is_recent_candidate = self._is_recent(candidate.get("first_seen_at"))
 
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
                         if candidate_faces:
                             best_f_sim = max(self._face_sim(f, face_embedding) for f in candidate_faces)
-                            if best_f_sim < self.settings.FACE_BODY_EXCLUSION_THRESHOLD:
+                            # Face-contradiction gate. Use the stricter 0.30 (FACE_BODY_EXCLUSION_THRESHOLD)
+                            # for older candidates; relax to 0.25 (FACE_CONTRADICTION_THRESHOLD) for
+                            # recent candidates so same-visit cross-angle faces in [0.25, 0.30) don't
+                            # block the body-only recent-window path.
+                            exclusion_bar = (
+                                self.settings.FACE_CONTRADICTION_THRESHOLD
+                                if is_recent_candidate
+                                else self.settings.FACE_BODY_EXCLUSION_THRESHOLD
+                            )
+                            if best_f_sim < exclusion_bar:
                                 continue  # face contradicts → skip
 
                     similarity = 1.0 - candidate["distance"]
@@ -178,6 +207,47 @@ class IdentityDecisionEngine:
                         best_similarity = -1.0
                         logger.debug(
                             f"[Body Consensus] No consensus: top votes={body_votes}"
+                        )
+
+                # ── Recent-window single-candidate body override ────────────
+                # When the store is quiet (1-2 people in frame), the 2-of-3
+                # consensus is structurally impossible — only 1 candidate exists.
+                # Within a same-visit window the candidate pool is small AND body
+                # ReID is reliable (same clothing). Accept a single body candidate
+                # whose median body sim ≥ 0.60, candidate is recent, has ≥2 body
+                # embeddings, and whose face does NOT contradict the track's face
+                # (face exclusion already applied above, so candidates reaching
+                # here are face-compatible or faceless). This catches the
+                # cross-camera handoff / brief re-appearance cases that otherwise
+                # create duplicates. Outside the window: strict consensus only.
+                if (
+                    self.settings.ENABLE_RECENT_WINDOW_MATCHING
+                    and consensus_id is None
+                    and best_candidate is not None
+                    and self._is_recent(best_candidate.get("first_seen_at"))
+                ):
+                    cand_id = best_candidate["person_identity_id"]
+                    body_median = await self._person_body_median_sim(db, cand_id, mean_embedding)
+                    n_bodies = await self._person_body_count(db, cand_id)
+                    if (
+                        body_median is not None
+                        and body_median >= self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD
+                        and n_bodies >= 2
+                    ):
+                        best_similarity = body_median  # report the median we actually gated on
+                        logger.info(
+                            f"[Body RECENT single] ID {str(cand_id)[:8]} body_median={body_median:.3f} "
+                            f"≥{self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD} (n_bodies={n_bodies}, "
+                            f"window={self.settings.RECENT_WINDOW_MINUTES}min) — accepting without consensus"
+                        )
+                        # used_face stays False — body-only match, demoted to non-confident downstream
+                    else:
+                        # Recent candidate but body evidence insufficient → reject
+                        best_candidate = None
+                        best_similarity = -1.0
+                        logger.debug(
+                            f"[Body RECENT] candidate {str(cand_id)[:8]} body_median={body_median} "
+                            f"n_bodies={n_bodies} — below recent body bar, rejected"
                         )
 
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
@@ -364,7 +434,7 @@ class IdentityDecisionEngine:
             query = text("""
                 SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
                        pe.captured_at,
-                       pi.last_seen_at,
+                       pi.last_seen_at, pi.first_seen_at,
                        pe.embedding <=> :embedding AS distance
                 FROM person_embeddings pe
                 JOIN person_identities pi ON pe.person_identity_id = pi.id
@@ -382,7 +452,7 @@ class IdentityDecisionEngine:
             best_by_person: dict = {}
             for row in rows:
                 pid = row[0]
-                dist = float(row[5])
+                dist = float(row[6])
                 sim = 1.0 - dist
                 if pid not in best_by_person or sim > best_by_person[pid]["similarity"]:
                     best_by_person[pid] = {
@@ -391,6 +461,7 @@ class IdentityDecisionEngine:
                         "crop_quality": row[2],
                         "captured_at": row[3],
                         "last_seen_at": row[4],
+                        "first_seen_at": row[5],
                         "distance": dist,
                         "similarity": sim,
                     }
@@ -425,7 +496,7 @@ class IdentityDecisionEngine:
             query = text("""
                 SELECT pfe.person_identity_id, pfe.camera_id, pfe.face_score,
                        pfe.captured_at,
-                       pi.last_seen_at,
+                       pi.last_seen_at, pi.first_seen_at,
                        pfe.embedding <=> :embedding AS distance
                 FROM person_face_embeddings pfe
                 JOIN person_identities pi ON pfe.person_identity_id = pi.id
@@ -445,7 +516,7 @@ class IdentityDecisionEngine:
             best_by_person = {}
             for row in rows:
                 pid = row[0]
-                dist = float(row[5])
+                dist = float(row[6])
                 sim = 1.0 - dist
                 if pid not in best_by_person or sim > best_by_person[pid]["similarity"]:
                     best_by_person[pid] = {
@@ -454,6 +525,7 @@ class IdentityDecisionEngine:
                         "face_score": row[2],
                         "captured_at": row[3],
                         "last_seen_at": row[4],
+                        "first_seen_at": row[5],
                         "distance": dist,
                         "similarity": sim,
                     }
@@ -486,6 +558,64 @@ class IdentityDecisionEngine:
         except Exception as e:
             logger.debug(f"Failed to retrieve face embeddings for person {person_id}: {e}")
             return []
+
+    # ── Recent-window matching helpers (plan 2026-07-09) ────────────────────
+    def _is_recent(self, first_seen_at) -> bool:
+        """True if a candidate's first_seen_at is within RECENT_WINDOW_MINUTES."""
+        if first_seen_at is None:
+            return False
+        try:
+            if isinstance(first_seen_at, str):
+                fs = datetime.fromisoformat(first_seen_at.replace("Z", "+00:00"))
+            else:
+                fs = first_seen_at
+            if fs.tzinfo is None:
+                fs = fs.replace(tzinfo=utc_now().tzinfo)
+            return (utc_now() - fs) <= timedelta(minutes=self.settings.RECENT_WINDOW_MINUTES)
+        except Exception:
+            return False
+
+    async def _person_body_count(self, db: AsyncSession, person_id) -> int:
+        try:
+            r = await db.execute(text(
+                "SELECT COUNT(*) FROM person_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+            ), {"pid": str(person_id)})
+            return int(r.scalar() or 0)
+        except Exception:
+            return 0
+
+    async def _person_body_median_sim(self, db: AsyncSession, person_id, query_embedding: np.ndarray) -> Optional[float]:
+        """Median cosine similarity of `query_embedding` to ALL of a person's
+        stored body embeddings (consistency check — a single lucky crop is not
+        enough). OSNet embeddings are L2-normalized at extract; query is
+        normalized here defensively."""
+        try:
+            q = np.asarray(query_embedding, dtype=np.float32)
+            nq = np.linalg.norm(q)
+            if nq > 0:
+                q = q / nq
+            r = await db.execute(text(
+                "SELECT embedding FROM person_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+            ), {"pid": str(person_id)})
+            sims = []
+            for row in r.fetchall():
+                raw = row[0]
+                if isinstance(raw, str):
+                    e = np.array(eval(raw), dtype=np.float32)
+                else:
+                    e = np.array(raw, dtype=np.float32)
+                ne = np.linalg.norm(e)
+                if ne > 0:
+                    e = e / ne
+                sims.append(float(np.dot(q, e)))
+            if not sims:
+                return None
+            return float(np.median(sims))
+        except Exception as e:
+            logger.debug(f"body median sim failed for {person_id}: {e}")
+            return None
 
     async def _update_person(self, db: AsyncSession, person_id: uuid.UUID):
         """Update existing person's last_seen and visit count."""

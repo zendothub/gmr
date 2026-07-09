@@ -284,75 +284,72 @@ async def deduplicate_persons():
                 return
 
             # ── Step 3: merge each loser into its winner ────────────────────
+            # Each merge runs in its own SAVEPOINT (begin_nested). A single bad
+            # pair rolls back ONLY that merge and the batch continues — previously
+            # one failure did `rollback() + return`, aborting ALL remaining merges
+            # and skipping the downstream cleanup/sweep/staff steps for the whole
+            # 10-min cycle (a "poison pill" that could block dedup indefinitely).
             merged_count = 0
+            failed_count = 0
+            deferred_minio_paths: list[str] = []  # delete after commit (safe)
             for winner_id, loser_id in merges:
                 try:
-                    # Reassign FK references
-                    for tbl, col in [
-                        ("track_sessions",      "person_identity_id"),
-                        ("events",              "person_identity_id"),
-                        ("billing_interactions","person_identity_id"),
-                        ("storage_objects",     "person_identity_id"),
-                    ]:
+                    extra_visits = meta.get(loser_id, {}).get("visits", 0)
+                    async with db.begin_nested():
+                        # Reassign FK references
+                        for tbl, col in [
+                            ("track_sessions",      "person_identity_id"),
+                            ("events",              "person_identity_id"),
+                            ("billing_interactions","person_identity_id"),
+                            ("storage_objects",     "person_identity_id"),
+                        ]:
+                            await db.execute(text(
+                                f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
+                            ), {"winner": winner_id, "loser": loser_id})
+
+                        # Absorb visit_count and first_seen_at into winner
+                        loser_meta  = meta.get(loser_id, {})
+                        winner_meta = meta.get(winner_id, {})
+                        loser_first  = loser_meta.get("first_seen")
+                        winner_first = winner_meta.get("first_seen")
+
+                        update_parts = ["visit_count = visit_count + :extra_visits"]
+                        params: dict = {"extra_visits": extra_visits, "winner": winner_id}
+
+                        if loser_first and winner_first and loser_first < winner_first:
+                            update_parts.append("first_seen_at = :loser_first")
+                            params["loser_first"] = loser_first
+
                         await db.execute(text(
-                            f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
-                        ), {"winner": winner_id, "loser": loser_id})
+                            f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
+                        ), params)
 
-                    # Absorb visit_count and first_seen_at into winner
-                    loser_meta  = meta.get(loser_id, {})
-                    winner_meta = meta.get(winner_id, {})
-                    extra_visits = loser_meta.get("visits", 0)
-                    loser_first  = loser_meta.get("first_seen")
-                    winner_first = winner_meta.get("first_seen")
+                        # ── Absorb face/body embeddings (FIXED, contamination-gated) ──
+                        max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
+                        await _absorb_face_embeddings(db, winner_id, loser_id, max_faces)
+                        max_bodies = 10  # MAX_EMBEDDINGS_PER_PERSON
+                        await _absorb_body_embeddings(db, winner_id, loser_id, max_bodies)
 
-                    update_parts = ["visit_count = visit_count + :extra_visits"]
-                    params: dict = {"extra_visits": extra_visits, "winner": winner_id}
+                        # ── Re-vote gender from ALL tracks ──────────────────────
+                        await _revote_person_gender(db, winner_id)
 
-                    if loser_first and winner_first and loser_first < winner_first:
-                        update_parts.append("first_seen_at = :loser_first")
-                        params["loser_first"] = loser_first
+                        # ── Collect loser's crop paths for deferred MinIO cleanup ─
+                        # (deferred to after commit so a savepoint rollback never
+                        # leaves MinIO files deleted while their DB references survive)
+                        paths_result = await db.execute(text("""
+                            SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
+                            UNION ALL
+                            SELECT face_crop_path   FROM person_face_embeddings WHERE person_identity_id::text = :loser
+                            UNION ALL
+                            SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
+                        """), {"loser": loser_id})
+                        deferred_minio_paths.extend(r[0] for r in paths_result.fetchall() if r[0])
 
-                    await db.execute(text(
-                        f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
-                    ), params)
-
-                    # ── Absorb face embeddings from loser → winner ──────────
-                    # Move loser's face embeddings to winner (up to MAX_FACE_EMBEDDINGS_PER_PERSON=5).
-                    # Skip faces that are >0.95 sim to existing winner faces (duplicate angle).
-                    max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
-                    await _absorb_face_embeddings(db, winner_id, loser_id, max_faces)
-
-                    # ── Absorb body embeddings from loser → winner ──────────
-                    max_bodies = 10  # MAX_EMBEDDINGS_PER_PERSON
-                    await _absorb_body_embeddings(db, winner_id, loser_id, max_bodies)
-
-                    # ── Re-vote gender from ALL tracks ──────────────────────
-                    await _revote_person_gender(db, winner_id)
-
-                    # ── Collect loser's crop paths for MinIO cleanup ────────
-                    paths_result = await db.execute(text("""
-                        SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
-                        UNION ALL
-                        SELECT face_crop_path   FROM person_face_embeddings WHERE person_identity_id::text = :loser
-                        UNION ALL
-                        SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
-                    """), {"loser": loser_id})
-                    paths_to_remove = [r[0] for r in paths_result.fetchall() if r[0]]
-
-                    # Delete loser (embeddings already absorbed → no cascade)
-                    await db.execute(
-                        text("DELETE FROM person_identities WHERE id::text = :loser"),
-                        {"loser": loser_id}
-                    )
-
-                    # Delete MinIO files for the loser's crops
-                    from app.modules.storage.minio_client import delete_object as minio_del
-                    for path in set(paths_to_remove):
-                        try:
-                            key = path.split("/", 1)[1] if "/" in path else path
-                            minio_del(key)
-                        except Exception as e:
-                            logger.warning(f"Dedup: MinIO delete failed for {path}: {e}")
+                        # Delete loser (embeddings already absorbed → no cascade)
+                        await db.execute(
+                            text("DELETE FROM person_identities WHERE id::text = :loser"),
+                            {"loser": loser_id}
+                        )
 
                     merged_count += 1
                     logger.info(
@@ -362,12 +359,32 @@ async def deduplicate_persons():
                     )
 
                 except Exception as e:
-                    logger.error(f"Dedup: failed to merge {loser_id[:8]} → {winner_id[:8]}: {e}")
-                    await db.rollback()
-                    return  # abort this run; retry in 10 min
+                    # Savepoint rolled back automatically; outer transaction intact.
+                    # Continue with the remaining merges so one bad pair can't
+                    # block the whole dedup cycle.
+                    failed_count += 1
+                    logger.error(f"Dedup: failed to merge {loser_id[:8]} → {winner_id[:8]}: {e} — skipping (batch continues)")
 
             await db.commit()
-            logger.info(f"Dedup job complete: merged {merged_count} duplicate identit(ies).")
+
+            # ── Deferred MinIO cleanup for merged losers ──────────────────────
+            # Done AFTER the commit so a savepoint rollback can never delete a
+            # MinIO object whose DB reference survived the rollback. Failures are
+            # non-fatal — the periodic sweep cross-references DB and cleans up
+            # any leftover unreferenced files.
+            if deferred_minio_paths:
+                from app.modules.storage.minio_client import delete_object as minio_del
+                for path in set(deferred_minio_paths):
+                    try:
+                        key = path.split("/", 1)[1] if "/" in path else path
+                        minio_del(key)
+                    except Exception as e:
+                        logger.warning(f"Dedup: MinIO delete failed for {path}: {e}")
+
+            logger.info(
+                f"Dedup job: merged {merged_count} duplicate identit(ies)"
+                f"{f', {failed_count} failed (skipped)' if failed_count else ''}."
+            )
 
             # ── Step 4: clean contaminated face embeddings ──────────────────
             face_removed = await _clean_contaminated_face_embeddings(db, settings)
@@ -430,10 +447,26 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
     """
     Remove face embeddings that don't match the face cluster for a person.
 
-    For each person with >=2 face embeddings, compute all pairwise cosine
-    similarities. Any embedding that has similarity < FACE_CONTAMINATION_THRESHOLD
-    (0.35) to the majority cluster is contaminated — it belongs to a different
-    person whose body ReID was a false positive.
+    Uses iterative median-based outlier removal (the same approach as the body
+    version): for each person with >=2 face embeddings, repeatedly removes the
+    embedding with the lowest median similarity to the rest until all remaining
+    embeddings have median >= FACE_CONTAMINATION_THRESHOLD (0.35) or the
+    cluster drops below 2.
+
+    Why median, not the previous "compatible with ANY kept" greedy:
+    single-linkage greedy clustering chains through borderline bridge
+    embeddings (similar ~0.35-0.49 to BOTH real people), allowing contamination
+    to slip through undetected. The median approach correctly isolates the
+    majority cluster and rejects outliers — verified by hand against the two
+    real contaminated identities found on 2026-07-09 (9b6053ac: 2-person split
+    with a bridge embedding; cf793282: single outlier with greedy-chain link).
+
+    Aggressive-reject tuning: any embedding whose median similarity to the
+    rest of the cluster is < threshold is removed — no leniency, no "keep if
+    borderline" behaviour. This is intentional: storing a contaminated face
+    pollutes the person's identity and causes future false merges; deleting a
+    borderline-same-person face is recoverable (reextract_or_delete_faceless.py
+    will re-extract from track crops on the next 20-min cycle).
 
     The numpy computation runs in a thread pool (asyncio.to_thread) to avoid
     blocking the FastAPI event loop at 1k+ persons scale.
@@ -469,9 +502,10 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
                 embs.append(np.array(row[1], dtype=np.float32))
         person_data.append((str(pid), ids, embs))
 
-    # Run the numpy-heavy clustering in a thread to avoid blocking the event loop
+    threshold = settings.FACE_CONTAMINATION_THRESHOLD
+
+    # Run the numpy-heavy iterative median computation in a thread
     def _compute_face_removals():
-        threshold = settings.FACE_CONTAMINATION_THRESHOLD
         results = []
         for pid, ids, embs in person_data:
             N = len(embs)
@@ -480,21 +514,33 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
                 _n = np.linalg.norm(emb)
                 if _n > 0:
                     emb /= _n
-            sims = np.zeros((N, N), dtype=np.float32)
-            for i in range(N):
-                for j in range(i + 1, N):
-                    s = float(np.dot(embs[i], embs[j]))
-                    sims[i][j] = s
-                    sims[j][i] = s
-            keep_idx = {0}
-            for i in range(1, N):
-                compatible = any(sims[i][k] >= threshold for k in keep_idx)
-                if compatible:
-                    keep_idx.add(i)
-            remove_idx = set(range(N)) - keep_idx
+
+            remove_idx = set()
+            active = set(range(N))
+
+            while len(active) >= 2:
+                medians = []
+                for i in active:
+                    sims = []
+                    for j in active:
+                        if i != j:
+                            sims.append(float(np.dot(embs[i], embs[j])))
+                    # With 1 other member, median == that single sim.
+                    # With 2+, median is the middle value — robust to a single
+                    # borderline-bridge edge.
+                    medians.append((i, float(np.median(sims)) if sims else 0.0))
+
+                worst_idx, worst_median = min(medians, key=lambda x: x[1])
+
+                if worst_median >= threshold:
+                    break
+
+                remove_idx.add(worst_idx)
+                active.discard(worst_idx)
+
             if remove_idx:
                 remove_ids = [ids[i] for i in sorted(remove_idx)]
-                results.append((pid, remove_ids, len(keep_idx), N))
+                results.append((pid, remove_ids, len(active), N))
         return results
 
     removal_results = await asyncio.to_thread(_compute_face_removals)
@@ -503,7 +549,8 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
     for pid, remove_ids, keep_count, total_count in removal_results:
         logger.info(
             f"Face contamination cleanup: person {pid[:12]} "
-            f"keeping {keep_count}/{total_count} faces, removing {len(remove_ids)}"
+            f"keeping {keep_count}/{total_count} faces, removing {len(remove_ids)} "
+            f"(threshold={threshold})"
         )
         await db.execute(text(
             "DELETE FROM person_face_embeddings WHERE id = ANY(:ids)"
@@ -606,11 +653,26 @@ async def _clean_contaminated_body_embeddings(db, settings) -> int:
 
 
 async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: int):
-    """Move face embeddings from loser to winner, skipping duplicate angles (>0.95 sim).
+    """Move face embeddings from loser to winner, skipping duplicate angles and contamination.
 
-    After moving, prunes the winner down to max_faces by face_score.
+    For each loser face, three gates before moving it to the winner:
+      1. Duplicate angle (sim > 0.95 to an existing winner face) → skip.
+      2. Contamination gate — median similarity to the winner's *existing* face
+         cluster must be >= FACE_CONTAMINATION_THRESHOLD (0.35). If below, the
+         face belongs to a different person (the merge was likely a false positive
+         on a borderline face pair); DROP it instead of moving it. This is the
+         fix for the previously-unchecked absorption path that was silently
+         re-injecting contamination into winner identities on every dedup merge
+         (root cause of the staff-identity pollution seen on 2026-07-09).
+      3. Winner is full (already has max_faces) → prune lowest-score after move.
+
+    Note: gate 2 uses median (not max) similarity so a single borderline-bridge
+    face on the winner side cannot chain a stranger's face in. With <2 existing
+    winner faces, falls back to max similarity (can't compute a median of 1).
     """
     import numpy as np
+
+    threshold = 0.35  # FACE_CONTAMINATION_THRESHOLD — inlined to avoid settings re-fetch
 
     # Get winner's existing face embeddings
     winner_faces = await db.execute(text("""
@@ -624,6 +686,12 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
         else:
             winner_embs.append(np.array(row[0], dtype=np.float32))
 
+    # Normalize winner embeddings (InsightFace embeddings are NOT L2-normalized)
+    for w in winner_embs:
+        _n = np.linalg.norm(w)
+        if _n > 0:
+            w /= _n
+
     # Get loser's face embeddings
     loser_faces = await db.execute(text("""
         SELECT id, embedding, face_score FROM person_face_embeddings
@@ -636,26 +704,50 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
         return
 
     moved = 0
+    rejected = 0
     for row in loser_rows:
         loser_emb = np.array(row[1], dtype=np.float32) if not isinstance(row[1], str) else np.array(eval(row[1]), dtype=np.float32)
+        _n = np.linalg.norm(loser_emb)
+        if _n > 0:
+            loser_emb_norm = loser_emb / _n
+        else:
+            loser_emb_norm = loser_emb
 
-        # Check if this face is a duplicate angle (>0.95 sim) to any winner face
+        # Gate 1: duplicate angle
         is_dup = False
         for w_emb in winner_embs:
-            sim = float(np.dot(w_emb, loser_emb))
+            sim = float(np.dot(w_emb, loser_emb_norm))
             if sim > 0.95:
                 is_dup = True
                 break
-
         if is_dup:
             continue
+
+        # Gate 2: contamination — must fit the winner's existing cluster
+        if winner_embs:
+            sims_to_winner = [float(np.dot(w_emb, loser_emb_norm)) for w_emb in winner_embs]
+            if len(sims_to_winner) >= 2:
+                fit_sim = float(np.median(sims_to_winner))
+            else:
+                fit_sim = max(sims_to_winner)
+            if fit_sim < threshold:
+                # Different person's face — drop instead of move
+                await db.execute(text(
+                    "DELETE FROM person_face_embeddings WHERE id = :row_id"
+                ), {"row_id": row[0]})
+                rejected += 1
+                logger.info(
+                    f"Dedup absorb: REJECTED contaminated face from {loser_id[:8]} → "
+                    f"{winner_id[:8]} (cluster_fit={fit_sim:.3f} < {threshold}, dropped)"
+                )
+                continue
 
         # Move to winner
         await db.execute(text("""
             UPDATE person_face_embeddings SET person_identity_id = :winner
             WHERE id = :row_id
         """), {"winner": winner_id, "row_id": row[0]})
-        winner_embs.append(loser_emb)
+        winner_embs.append(loser_emb_norm)
         moved += 1
 
     if moved > 0:
@@ -669,16 +761,28 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
         """), {"pid": winner_id, "keep": max_faces})
         logger.info(
             f"Dedup: absorbed {moved} face embedding(s) from {loser_id[:8]} → {winner_id[:8]} "
-            f"(winner now has up to {max_faces} faces)"
+            f"(winner now has up to {max_faces} faces, rejected {rejected} contaminated)"
+        )
+    elif rejected > 0:
+        logger.info(
+            f"Dedup: rejected all {rejected} face embedding(s) from {loser_id[:8]} as "
+            f"contamination (none absorbed into {winner_id[:8]})"
         )
 
 
 async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies: int):
-    """Move body embeddings from loser to winner, skipping duplicate angles (>0.95 sim).
+    """Move body embeddings from loser to winner, skipping duplicate angles and contamination.
 
-    After moving, prunes the winner down to max_bodies by crop_quality.
+    Same contamination-gate logic as _absorb_face_embeddings but using
+    BODY_CONTAMINATION_THRESHOLD (0.50) — median similarity to the winner's
+    existing body cluster must clear it before a loser body is moved. Previously
+    this function had NO contamination check (only a >0.95 duplicate-angle
+    check), silently absorbing a stranger's body into the winner on every
+    dedup merge.
     """
     import numpy as np
+
+    threshold = 0.50  # BODY_CONTAMINATION_THRESHOLD
 
     # Get winner's existing body embeddings
     winner_bodies = await db.execute(text("""
@@ -692,6 +796,12 @@ async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies:
         else:
             winner_embs.append(np.array(row[0], dtype=np.float32))
 
+    # OSNet embeddings are L2-normalized at extract time, but be defensive
+    for w in winner_embs:
+        _n = np.linalg.norm(w)
+        if _n > 0:
+            w /= _n
+
     # Get loser's body embeddings
     loser_bodies = await db.execute(text("""
         SELECT id, embedding, crop_quality FROM person_embeddings
@@ -704,26 +814,50 @@ async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies:
         return
 
     moved = 0
+    rejected = 0
     for row in loser_rows:
         loser_emb = np.array(row[1], dtype=np.float32) if not isinstance(row[1], str) else np.array(eval(row[1]), dtype=np.float32)
+        _n = np.linalg.norm(loser_emb)
+        if _n > 0:
+            loser_emb_norm = loser_emb / _n
+        else:
+            loser_emb_norm = loser_emb
 
-        # Check if near-duplicate (>0.95 sim) to any winner body
+        # Gate 1: near-duplicate
         is_dup = False
         for w_emb in winner_embs:
-            sim = float(np.dot(w_emb, loser_emb))
+            sim = float(np.dot(w_emb, loser_emb_norm))
             if sim > 0.95:
                 is_dup = True
                 break
-
         if is_dup:
             continue
+
+        # Gate 2: contamination — must fit the winner's existing body cluster
+        if winner_embs:
+            sims_to_winner = [float(np.dot(w_emb, loser_emb_norm)) for w_emb in winner_embs]
+            if len(sims_to_winner) >= 2:
+                fit_sim = float(np.median(sims_to_winner))
+            else:
+                fit_sim = max(sims_to_winner)
+            if fit_sim < threshold:
+                # Different person's body — drop instead of move
+                await db.execute(text(
+                    "DELETE FROM person_embeddings WHERE id = :row_id"
+                ), {"row_id": row[0]})
+                rejected += 1
+                logger.info(
+                    f"Dedup absorb: REJECTED contaminated body from {loser_id[:8]} → "
+                    f"{winner_id[:8]} (cluster_fit={fit_sim:.3f} < {threshold}, dropped)"
+                )
+                continue
 
         # Move to winner
         await db.execute(text("""
             UPDATE person_embeddings SET person_identity_id = :winner
             WHERE id = :row_id
         """), {"winner": winner_id, "row_id": row[0]})
-        winner_embs.append(loser_emb)
+        winner_embs.append(loser_emb_norm)
         moved += 1
 
     if moved > 0:
@@ -737,7 +871,12 @@ async def _absorb_body_embeddings(db, winner_id: str, loser_id: str, max_bodies:
         """), {"pid": winner_id, "keep": max_bodies})
         logger.info(
             f"Dedup: absorbed {moved} body embedding(s) from {loser_id[:8]} → {winner_id[:8]} "
-            f"(winner now has up to {max_bodies} bodies)"
+            f"(winner now has up to {max_bodies} bodies, rejected {rejected} contaminated)"
+        )
+    elif rejected > 0:
+        logger.info(
+            f"Dedup: rejected all {rejected} body embedding(s) from {loser_id[:8]} as "
+            f"contamination (none absorbed into {winner_id[:8]})"
         )
 
 

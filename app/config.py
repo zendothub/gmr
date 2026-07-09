@@ -83,6 +83,21 @@ class Settings(BaseSettings):
     BODY_ONLY_CONFIDENCE_LIMIT: float = 0.95  # Body-only (no face) matches require higher confidence for re-identification
     # FACE_SEARCH_THRESHOLD intentionally removed — skip_body_reid logic has been eliminated (caused duplicate registrations)
 
+    # ── Recent-window matching (plan 2026-07-09) ─────────────────────────────
+    # Within a short window of a person's first_seen_at, body ReID is reliable
+    # (same visit → same clothing) and the candidate pool is small. Allow a
+    # relaxed face threshold + a single-candidate body override in that window
+    # to catch same-person cross-angle/cross-camera handoffs that the strict
+    # thresholds miss (which otherwise create duplicate identities that the
+    # dedup job then has to merge).
+    #
+    # Outside the window: unchanged strict behaviour (clothing changes make body
+    # ReID unreliable; larger candidate pool raises false-positive risk).
+    ENABLE_RECENT_WINDOW_MATCHING: bool = True
+    RECENT_WINDOW_MINUTES: int = 5
+    FACE_MATCH_THRESHOLD_RECENT: float = 0.35   # relaxed face match within the window (strict 0.40 outside)
+    RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 bodies each side, non-overlapping tracks on same camera, faces don't contradict at 0.25)
+
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase
     # analytics exclude employees (who generate hundreds of billing events

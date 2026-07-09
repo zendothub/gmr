@@ -18,6 +18,13 @@ Starts as a systemd service: retail-ai-worker.service
 import asyncio
 from loguru import logger
 
+# Configure the same rotating file sink as the API server so background job
+# activity (dedup, sweep, staff classification, ...) is visible in
+# logs/ai_processing.log instead of only in the systemd journal.
+from app.logging_config import setup_logging
+
+setup_logging()
+
 
 async def main():
     logger.info("=" * 60)
