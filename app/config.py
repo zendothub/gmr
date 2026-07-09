@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"
     INSIGHTFACE_DET_SIZE: str = "640,640"
-    FACE_MATCH_THRESHOLD: float = 0.48        # Positive face match threshold (face search result must exceed this)
+    FACE_MATCH_THRESHOLD: float = 0.40        # Positive face match threshold — same as dedup. Same-person cross-angle
+                                                # 0.40-0.70, different-person 0.10-0.30. 0.40 catches all same-person
+                                                # matches. False merges are corrected by dedup job (same threshold).
     FACE_CONTRADICTION_THRESHOLD: float = 0.25 # Disassociation threshold — only trigger if face is DEFINITELY different
                                                 # (same person cross-angle ~0.40-0.47, so 0.25 avoids false disassociation)
     FACE_BODY_EXCLUSION_THRESHOLD: float = 0.30 # Body candidate exclusion gate — more permissive than match threshold
