@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
     MINIO_BUCKET_PREFIX: str = "retail"
+    MINIO_PUBLIC_URL: str = ""
+    MINIO_PUBLIC_ENDPOINT: str = ""
+    MINIO_PUBLIC_SECURE: bool = True
+    MINIO_REGION: str = "us-east-1"
     # Object-name prefixes for categorising blobs inside the bucket.
     SNAPSHOT_DIR: str = "snapshots"
     CROP_DIR: str = "crops"
@@ -97,6 +101,11 @@ class Settings(BaseSettings):
     RECENT_WINDOW_MINUTES: int = 5
     FACE_MATCH_THRESHOLD_RECENT: float = 0.35   # relaxed face match within the window (strict 0.40 outside)
     RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 bodies each side, non-overlapping tracks on same camera, faces don't contradict at 0.25)
+    FACE_MATCH_MEDIAN_THRESHOLD: float = 0.30  # When recent face best-pair is in grey zone [0.35, 0.40),
+                                                 # require median of ALL cross-pairs >= this. Same-person
+                                                 # min median=0.401, diff-person p50=0.200. At 0.30:
+                                                 # 0% same-person rejected, 97.5% diff-person rejected.
+                                                 # Only checked when >= 3 total cross-pairs.
 
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase

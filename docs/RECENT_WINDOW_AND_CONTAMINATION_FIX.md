@@ -1,7 +1,7 @@
 # Recent-Window Matching + Contamination Cleanup + Backfill Merge
 
-> **Date:** July 9, 2026
-> **Status:** Implemented, committed as `bd61c8c`
+> **Date:** July 9–10, 2026
+> **Status:** Implemented, committed as `bd61c8c` (initial), face median check + `last_seen_at` fix (2026-07-10)
 > **Files changed:** `config.py`, `identity_decision_engine.py`, `jobs/tasks.py`, `worker.py`, `logging_config.py` (new), `danger/clean_contaminated_embeddings.py`, `danger/merge_recent_window_duplicates.py` (new)
 
 Full rationale, threshold values, and empirical data: see `/gmr/CONTEXT.md` issues #17–#22.
@@ -30,9 +30,10 @@ Additionally, contamination was silently polluting winner identities via two bug
 | `RECENT_WINDOW_MINUTES` | `5` | Same-visit window |
 | `FACE_MATCH_THRESHOLD_RECENT` | `0.35` | Relaxed face (strict 0.40 outside) |
 | `RECENT_BODY_SINGLE_MATCH_THRESHOLD` | `0.55` | Body-only override (median, ≥2 bodies/side) |
+| `FACE_MATCH_MEDIAN_THRESHOLD` | `0.30` | Face median check for grey-zone [0.35, 0.40) matches (added 2026-07-10) |
 
-### Within 5-min window of candidate's `first_seen_at`:
-- **Face path**: `face_max ≥ 0.35` (best cross-pair, matches dedup job MAX() semantics)
+### Within 5-min window of candidate's `last_seen_at`:
+- **Face path**: `face_max ≥ 0.35` (best cross-pair). If ≥3 total cross-pairs AND median < 0.30 → REJECT (single lucky crop, different person). Same-person min median=0.401, diff-person p50=0.200.
 - **Body-only path**: `body_median ≥ 0.55` AND `≥2 bodies each side` AND `non-overlapping on SAME camera` AND `faces don't contradict` (faceless side OR `face_max ≥ 0.25`)
 
 ### Outside the window:
@@ -44,8 +45,11 @@ Cross-camera overlap (entry + counter simultaneously) is **expected** for the sa
 ### Non-contradiction gate
 Recent candidates use `FACE_CONTRADICTION_THRESHOLD` (0.25) instead of `FACE_BODY_EXCLUSION_THRESHOLD` (0.30) for the face-exclusion gate. This allows cross-angle faces in [0.25, 0.30) to use the body path. Older candidates still use 0.30.
 
-### Critical safety finding
-Body-alone is NOT trustworthy even in a short window. A "body-chameleon" person matched 5+ strangers at body_median 0.6–0.7 while faces contradicted (<0.20). The non-contradiction gate is what prevents those false merges — body threshold is just a coarse filter.
+### Critical safety findings
+1. Body-alone is NOT trustworthy even in a short window. A "body-chameleon" person matched 5+ strangers at body_median 0.6–0.7 while faces contradicted (<0.20). The non-contradiction gate is what prevents those false merges — body threshold is just a coarse filter.
+2. Uniformed staff (`b33a2586`↔`d01adabc`, body median 0.586, confirmed different people) are indistinguishable by OSNet — body ReID cannot separate staff wearing similar uniforms. Face is the sole authority.
+3. `_is_recent` must use `last_seen_at` not `first_seen_at` — a staff member who arrived 6h ago but was tracked 30s ago IS recent. Using `first_seen_at` caused `86e763dd` to split from `fe34af9d` (same staff, 10-min tracking gap, face best-pair 0.357 in grey zone, `first_seen_at` was 6h old → recent path blocked → duplicate created).
+4. Face best-pair in [0.35, 0.40) is unreliable: 38/55 pairs (69%) that fire the recent face match are different people with a single lucky cross-pair. The median check at 0.30 blocks 97.5% of these with 0% same-person false rejections.
 
 ---
 

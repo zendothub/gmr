@@ -47,16 +47,20 @@ class MediaMTXManager:
         """Public base URL used by the browser.
 
         Resolution order:
-        1. ``public_host`` (e.g. derived from the incoming request) - so the feed
+        1. ``MEDIAMTX_PUBLIC_URL`` static override (full base, ignores port).
+        2. ``public_host`` (e.g. derived from the incoming request) - so the feed
            is served on the same IP/host the browser used to reach the API.
-        2. ``MEDIAMTX_PUBLIC_URL`` static override (full base, ignores port).
         3. ``MEDIAMTX_HOST`` + the relevant port.
         """
-        if public_host:
-            return f"{scheme}://{public_host}:{port}"
         base = (self.settings.MEDIAMTX_PUBLIC_URL or "").rstrip("/")
         if base:
+            # If the user put e.g. "feed-retaileye.bluecloudsoftech.com", add public scheme
+            if "://" not in base:
+                return f"{scheme}://{base}"
             return base
+
+        if public_host:
+            return f"{scheme}://{public_host}:{port}"
         return f"{scheme}://{self._host}:{port}"
 
 

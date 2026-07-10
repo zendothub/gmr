@@ -15,36 +15,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.storage import service as storage_svc
-from app.modules.storage.minio_client import get_client, BUCKET_PREFIX
+from app.modules.storage.minio_client import get_public_client, BUCKET_PREFIX
 
 router = APIRouter(prefix="/api/storage", tags=["Storage"])
 
 
 @router.get("/presigned-url")
 async def get_presigned_url(
-    path: str = Query(..., description="MinIO object path (e.g., retail/crops/crop_xxx.jpg)"),
+    path: str = Query(..., description="MinIO object path (e.g., crops/crop_xxx.jpg or retaileye/crops/crop_xxx.jpg)"),
     expires: int = Query(3600, ge=60, le=86400, description="Expiry in seconds (default 1h)"),
     current_user: User = Depends(get_current_user),
 ):
     """Return a presigned GET URL for a MinIO object.
 
     The browser uses the returned URL to display images directly from MinIO.
-    Path format: {bucket}/{object_name} (e.g., retail/crops/crop_abc.jpg).
+    Path format: {bucket}/{object_name} or {object_name}.
     """
+    bucket = BUCKET_PREFIX
+    clean_path = path.lstrip("/")
+    if clean_path.startswith(f"{bucket}/"):
+        object_name = clean_path[len(bucket) + 1:]
+    else:
+        object_name = clean_path
+
     try:
-        client = get_client()
-        # path includes bucket prefix, split it out
-        if "/" in path:
-            bucket, object_name = path.split("/", 1)
-        else:
-            bucket = BUCKET_PREFIX
-            object_name = path
+        client = get_public_client()
+        
+        # Add debug-safe logging
+        logger.info(
+            f"Generating presigned GET URL: bucket={bucket}, object_name={object_name}, expires={expires}"
+        )
 
         url = client.presigned_get_object(
             bucket_name=bucket,
             object_name=object_name,
             expires=timedelta(seconds=expires),
         )
+        
         return {"url": url, "expires_in": expires}
     except Exception as exc:
         logger.warning(f"presigned-url failed: bucket={bucket} object={object_name} error={exc}")

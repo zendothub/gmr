@@ -81,6 +81,10 @@ MIN_BODIES_PER_SIDE = 2
 # same-person cross-angle face can drop to ~0.28, so 0.25 avoids false
 # rejection while still blocking genuinely-different faces (<0.25).
 NON_CONTRADICTION_THRESHOLD = 0.25
+# Face-path median check: when face best-pair is in grey zone [0.35, 0.40),
+# require median of ALL cross-pairs >= this. Same-person min median=0.401,
+# diff-person p50=0.200. Only checked when >= 3 total cross-pairs.
+FACE_MATCH_MEDIAN_THRESHOLD = 0.30
 
 
 def _parse_embedding(raw):
@@ -269,8 +273,24 @@ async def run(apply_fix: bool, ids_filter: list[str] | None):
                 merge = False
                 reason = ""
                 if face_max is not None and face_max >= FACE_MATCH_THRESHOLD_RECENT:
-                    merge = True
-                    reason = f"face_max={face_max:.3f} ≥ {FACE_MATCH_THRESHOLD_RECENT}"
+                    # Grey-zone face match [0.35, 0.40): validate with median
+                    # of ALL cross-pairs. A single lucky crop can hit 0.35+ for
+                    # different people; median catches this.
+                    # Only check when >= 3 total cross-pairs (meaningful median).
+                    n_cross = len(ca["faces"]) * len(cb["faces"])
+                    if n_cross >= 3:
+                        face_median = _median_cross_sim(ca["faces"], cb["faces"])
+                        if face_median is not None and face_median < FACE_MATCH_MEDIAN_THRESHOLD:
+                            merge = False
+                            reason = (f"REJECTED: face_max={face_max:.3f} ≥ {FACE_MATCH_THRESHOLD_RECENT} "
+                                      f"but face_median={face_median:.3f} < {FACE_MATCH_MEDIAN_THRESHOLD} "
+                                      f"(cross-pairs={n_cross}) — single lucky pair, different person")
+                        else:
+                            merge = True
+                            reason = f"face_max={face_max:.3f} ≥ {FACE_MATCH_THRESHOLD_RECENT} (median={face_median:.3f} ✓)"
+                    else:
+                        merge = True
+                        reason = f"face_max={face_max:.3f} ≥ {FACE_MATCH_THRESHOLD_RECENT} (cross-pairs={n_cross} < 3, median skipped)"
                 elif (
                     body_median is not None
                     and body_median >= RECENT_BODY_SINGLE_MATCH_THRESHOLD

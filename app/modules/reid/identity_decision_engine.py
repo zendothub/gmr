@@ -124,8 +124,33 @@ class IdentityDecisionEngine:
                             self.settings.ENABLE_RECENT_WINDOW_MATCHING
                             and face_sim >= self.settings.FACE_MATCH_THRESHOLD_RECENT
                             and face_sim > best_similarity
-                            and self._is_recent(face_candidate.get("first_seen_at"))
+                            and self._is_recent(face_candidate.get("last_seen_at"))
                         ):
+                            # Grey-zone face match [0.35, 0.40): validate with
+                            # median of ALL cross-pairs. A single lucky crop can
+                            # hit 0.35+ for different people; median catches this.
+                            # Same-person min median=0.401, diff-person p50=0.200.
+                            # Only check when >= 3 total cross-pairs (meaningful median).
+                            cand_id = face_candidate["person_identity_id"]
+                            track_face_list = [f for f in search_faces if f is not None]
+                            n_track = len(track_face_list)
+                            r = await db.execute(text(
+                                "SELECT COUNT(*) FROM person_face_embeddings"
+                                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                            ), {"pid": str(cand_id)})
+                            n_cand = int(r.scalar() or 0)
+                            n_cross = n_track * n_cand
+
+                            if n_cross >= 3:
+                                face_median = await self._person_face_median_sim(db, cand_id, track_face_list)
+                                if face_median is not None and face_median < self.settings.FACE_MATCH_MEDIAN_THRESHOLD:
+                                    logger.info(
+                                        f"[Face Match RECENT REJECTED] Score: {face_sim:.3f} but median={face_median:.3f} "
+                                        f"< {self.settings.FACE_MATCH_MEDIAN_THRESHOLD} (cross-pairs={n_cross}), "
+                                        f"Person: {str(cand_id)[:8]} — single lucky pair, different person"
+                                    )
+                                    continue
+
                             best_candidate = face_candidate
                             best_similarity = face_sim
                             used_face = True
@@ -153,7 +178,7 @@ class IdentityDecisionEngine:
                 body_best_by_id: dict = {}
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
-                    is_recent_candidate = self._is_recent(candidate.get("first_seen_at"))
+                    is_recent_candidate = self._is_recent(candidate.get("last_seen_at"))
 
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
@@ -224,7 +249,7 @@ class IdentityDecisionEngine:
                     self.settings.ENABLE_RECENT_WINDOW_MATCHING
                     and consensus_id is None
                     and best_candidate is not None
-                    and self._is_recent(best_candidate.get("first_seen_at"))
+                    and self._is_recent(best_candidate.get("last_seen_at"))
                 ):
                     cand_id = best_candidate["person_identity_id"]
                     body_median = await self._person_body_median_sim(db, cand_id, mean_embedding)
@@ -560,15 +585,21 @@ class IdentityDecisionEngine:
             return []
 
     # ── Recent-window matching helpers (plan 2026-07-09) ────────────────────
-    def _is_recent(self, first_seen_at) -> bool:
-        """True if a candidate's first_seen_at is within RECENT_WINDOW_MINUTES."""
-        if first_seen_at is None:
+    def _is_recent(self, last_seen_at) -> bool:
+        """True if a candidate's last_seen_at is within RECENT_WINDOW_MINUTES.
+
+        Uses last_seen_at (not first_seen_at) because the question is 'is this
+        person currently in the store?' — a staff member who arrived 6 hours
+        ago but was tracked 30 seconds ago IS recent.  first_seen_at would
+        incorrectly mark them as non-recent.
+        """
+        if last_seen_at is None:
             return False
         try:
-            if isinstance(first_seen_at, str):
-                fs = datetime.fromisoformat(first_seen_at.replace("Z", "+00:00"))
+            if isinstance(last_seen_at, str):
+                fs = datetime.fromisoformat(last_seen_at.replace("Z", "+00:00"))
             else:
-                fs = first_seen_at
+                fs = last_seen_at
             if fs.tzinfo is None:
                 fs = fs.replace(tzinfo=utc_now().tzinfo)
             return (utc_now() - fs) <= timedelta(minutes=self.settings.RECENT_WINDOW_MINUTES)
@@ -615,6 +646,45 @@ class IdentityDecisionEngine:
             return float(np.median(sims))
         except Exception as e:
             logger.debug(f"body median sim failed for {person_id}: {e}")
+            return None
+
+    async def _person_face_median_sim(self, db: AsyncSession, person_id, track_faces: list) -> Optional[float]:
+        """Median cosine similarity of ALL track faces vs ALL stored candidate
+        faces. Used to validate grey-zone recent face matches (best-pair in
+        [0.35, 0.40)) — a single lucky cross-pair can hit 0.35+ while the rest
+        are low (different person). The median catches this: same-person
+        medians start at 0.40, diff-person p50 is 0.20.
+
+        track_faces: list of face embeddings (np.ndarray) accumulated for the
+        current track (face_embedding_list from decide_identity).
+        Returns median of all cross-pair sims, or None if insufficient data.
+        """
+        try:
+            r = await db.execute(text(
+                "SELECT embedding FROM person_face_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+            ), {"pid": str(person_id)})
+            candidate_faces = []
+            for row in r.fetchall():
+                raw = row[0]
+                if isinstance(raw, str):
+                    e = np.array(eval(raw), dtype=np.float32)
+                else:
+                    e = np.array(raw, dtype=np.float32)
+                candidate_faces.append(e)
+
+            if not candidate_faces or not track_faces:
+                return None
+
+            sims = []
+            for tf in track_faces:
+                for cf in candidate_faces:
+                    sims.append(self._face_sim(tf, cf))
+            if not sims:
+                return None
+            return float(np.median(sims))
+        except Exception as e:
+            logger.debug(f"face median sim failed for {person_id}: {e}")
             return None
 
     async def _update_person(self, db: AsyncSession, person_id: uuid.UUID):

@@ -31,6 +31,18 @@ _client: Optional[Minio] = (
     else None
 )
 
+_public_client: Optional[Minio] = (
+    Minio(
+        _settings.MINIO_PUBLIC_ENDPOINT,
+        access_key=_settings.MINIO_ACCESS_KEY,
+        secret_key=_settings.MINIO_SECRET_KEY,
+        secure=_settings.MINIO_PUBLIC_SECURE,
+        region=_settings.MINIO_REGION,
+    )
+    if _settings.MINIO_PUBLIC_ENDPOINT
+    else None
+)
+
 BUCKET_PREFIX = _settings.MINIO_BUCKET_PREFIX
 
 
@@ -40,6 +52,15 @@ def get_client() -> Minio:
         raise RuntimeError("MinIO is not configured (MINIO_ENDPOINT is empty)")
     _ensure_bucket()
     return _client
+
+
+def get_public_client() -> Minio:
+    """Return the MinIO client configured with public/external endpoint,
+    falling back to internal helper if not configured.
+    """
+    if _public_client is not None:
+        return _public_client
+    return get_client()
 
 
 def _ensure_bucket() -> None:
