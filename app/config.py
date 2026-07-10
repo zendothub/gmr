@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
     MINIO_BUCKET_PREFIX: str = "retail"
+    # Public base URL the browser uses to reach MinIO (e.g. https://assets-retaileye.bluecloudsoftech.com).
+    # When set, presigned URLs returned by the storage API are rewritten to use this domain.
+    MINIO_PUBLIC_BASE_URL: str = ""
     # Object-name prefixes for categorising blobs inside the bucket.
     SNAPSHOT_DIR: str = "snapshots"
     CROP_DIR: str = "crops"
@@ -189,7 +192,8 @@ class Settings(BaseSettings):
         "http://10.8.0.2:5173,"
         "http://10.8.0.2:8080,"
         "http://retaileye.bluecloudsoftech.com,"
-        "https://retaileye.bluecloudsoftech.com"
+        "https://retaileye.bluecloudsoftech.com,"
+        "https://gmr-retaileye.bluecloudsoftech.com"
     )
 
     @property
