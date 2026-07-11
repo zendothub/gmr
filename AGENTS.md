@@ -9,7 +9,7 @@
 **Before ANY code change, debugging, or analysis, read `/gmr/CONTEXT.md`.** This file contains:
 
 - The complete project architecture and AI pipeline
-- All model choices and why they were made (SigLIP2 for gender, MiVOLO for age, etc.)
+- All model choices and why they were made (SigLIP2 face+margin for gender, InsightFace genderage median for age, etc.)
 - Every critical threshold and the empirical analysis behind each value
 - The identity decision flow
 - Staff detection and purchase counting logic
@@ -51,8 +51,8 @@
 
 | When working on... | Start here |
 |---|---|
-| Gender classification | `app/modules/reid/siglip2_analyzer.py` |
-| Age prediction | `app/modules/reid/mivolo_analyzer.py` |
+| Gender classification | `app/modules/reid/siglip2_analyzer.py` (margin δ, face-only) |
+| Age prediction | `app/modules/reid/insightface_analyzer.py` (genderage head + median) |
 | Face detection | `app/modules/reid/insightface_analyzer.py` |
 | Identity matching (incl. recent-window) | `app/modules/reid/identity_decision_engine.py` |
 | Camera pipeline | `app/modules/ai_runtime/camera_worker.py` |

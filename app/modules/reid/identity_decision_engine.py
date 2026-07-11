@@ -275,6 +275,32 @@ class IdentityDecisionEngine:
                             f"n_bodies={n_bodies} — below recent body bar, rejected"
                         )
 
+            # Step 2b: Staff reattach — last resort before create-new.
+            # Staff-only, recent window, strong body median. Soft face floor only
+            # (hard different-face veto). Blurry/side faces that pass the floor still
+            # go through store contamination gate (may drop face without rejecting attach).
+            staff_drop_face = False
+            if (
+                self.settings.ENABLE_STAFF_REATTACH
+                and not used_face
+                and mean_embedding is not None
+            ):
+                provisional_threshold = (
+                    self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
+                )
+                needs_staff = (
+                    best_candidate is None
+                    or best_similarity < provisional_threshold
+                )
+                if needs_staff:
+                    staff_hit = await self._try_staff_reattach(
+                        db, mean_embedding, face_embedding, face_score
+                    )
+                    if staff_hit is not None:
+                        best_candidate = staff_hit
+                        best_similarity = staff_hit["similarity"]
+                        staff_drop_face = bool(staff_hit.get("drop_face", False))
+
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
             required_threshold = self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
 
@@ -292,10 +318,19 @@ class IdentityDecisionEngine:
                     await self._store_embedding(
                         db, person_id, mean_embedding, camera_id, crop_quality_score, crop_path
                     )
-                    if face_embedding is not None and face_score > 0:
+                    if face_embedding is not None and face_score > 0 and not staff_drop_face:
                         await self._store_face_embedding(db, person_id, face_embedding, camera_id, face_score, face_crop_path)
-                    
-                    logger.info(f"[Initial ReID] Matched track to existing person ID {person_id} with score {best_similarity:.3f} (used_face={used_face})")
+                    elif staff_drop_face and face_embedding is not None:
+                        logger.info(
+                            f"[Staff REATTACH] face DROPPED (low sim vs staff gallery) "
+                            f"person={str(person_id)[:8]}"
+                        )
+
+                    logger.info(
+                        f"[Initial ReID] Matched track to existing person ID {person_id} "
+                        f"with score {best_similarity:.3f} (used_face={used_face}, "
+                        f"staff_reattach_drop_face={staff_drop_face})"
+                    )
                     return person_id, best_similarity, is_confident, False, None
                 else:
                     # Create new anonymous person
@@ -326,7 +361,7 @@ class IdentityDecisionEngine:
                         await self._store_embedding(
                             db, matched_id, mean_embedding, camera_id, crop_quality_score, crop_path
                         )
-                        if face_embedding is not None and face_score > 0:
+                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
                             await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
                         logger.info(f"[ReID Refined] Identity switched due to contradiction: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, used_face={used_face})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
@@ -363,8 +398,13 @@ class IdentityDecisionEngine:
                     matched_id = best_candidate["person_identity_id"]
                     
                     if matched_id != current_person_id:
-                        # Gating on crop quality should only apply for body ReID, not face matches
-                        if not used_face and crop_quality_score < self.settings.REID_MIN_QUALITY_FOR_SWITCH:
+                        # Gating on crop quality should only apply for body ReID, not face matches.
+                        # Staff reattach already required median body gate — allow switch.
+                        if (
+                            not used_face
+                            and not best_candidate.get("staff_reattach")
+                            and crop_quality_score < self.settings.REID_MIN_QUALITY_FOR_SWITCH
+                        ):
                             logger.debug(
                                 f"[ReID Refined] Skipping identity switch for track (quality={crop_quality_score:.2f} < {self.settings.REID_MIN_QUALITY_FOR_SWITCH})"
                             )
@@ -397,7 +437,7 @@ class IdentityDecisionEngine:
                         await self._store_embedding(
                             db, matched_id, mean_embedding, camera_id, crop_quality_score, crop_path
                         )
-                        if face_embedding is not None and face_score > 0:
+                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
                             await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
                         logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, quality={crop_quality_score:.2f}, used_face={used_face})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
@@ -408,7 +448,7 @@ class IdentityDecisionEngine:
                         await self._store_embedding(
                             db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
                         )
-                        if face_embedding is not None and face_score > 0:
+                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
                             await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
                         new_score = max(previous_score, best_similarity)
                         if new_score > previous_score:
@@ -605,6 +645,158 @@ class IdentityDecisionEngine:
             return (utc_now() - fs) <= timedelta(minutes=self.settings.RECENT_WINDOW_MINUTES)
         except Exception:
             return False
+
+    async def _try_staff_reattach(
+        self,
+        db: AsyncSession,
+        body_embedding: np.ndarray,
+        face_embedding: Optional[np.ndarray],
+        face_score: float = 0.0,
+    ) -> Optional[dict]:
+        """Reattach track to a recent is_staff identity via strong body match.
+
+        Used when normal face/body paths fail (blur/side face staff fragments).
+        Returns a candidate dict with person_identity_id, similarity (body median),
+        drop_face flag, or None.
+
+        Gates (tightened after uniform body FPs, 2026-07-10):
+          - body_median >= STAFF_REATTACH_BODY_MEDIAN (0.70)
+          - staff bodies >= STAFF_REATTACH_MIN_BODIES
+          - STAFF_REATTACH_REQUIRE_FACE: faceless track rejected
+          - face_sim < STAFF_REATTACH_FACE_MIN (0.30) → reject
+          - face_sim >= FACE_CONTAMINATION_THRESHOLD → may store face later
+          - otherwise → reattach but drop_face=True (avoid gallery pollution)
+
+        FUTURE face-quality-aware veto (disabled until quality calc is calibrated):
+          # high_q = face_score >= settings.STAFF_REATTACH_FACE_QUALITY_HIGH  # e.g. 0.75
+          # if face_sim < STAFF_REATTACH_FACE_MIN:
+          #     if high_q:
+          #         return None  # sharp face that is clearly not this staff
+          #     else:
+          #         drop_face = True  # low-quality face: body merge, discard face
+        """
+        try:
+            if self.settings.STAFF_REATTACH_REQUIRE_FACE and face_embedding is None:
+                logger.debug("[Staff REATTACH REJECT] faceless track (REQUIRE_FACE=True)")
+                return None
+
+            candidates = await self._search_similar_staff(db, body_embedding, top_k=5)
+            if not candidates:
+                return None
+
+            scored: list[tuple] = []  # (body_median, cand)
+            for cand in candidates:
+                if not self._is_recent(cand.get("last_seen_at")):
+                    continue
+                pid = cand["person_identity_id"]
+                n_bodies = await self._person_body_count(db, pid)
+                if n_bodies < self.settings.STAFF_REATTACH_MIN_BODIES:
+                    continue
+                body_median = await self._person_body_median_sim(db, pid, body_embedding)
+                if body_median is None or body_median < self.settings.STAFF_REATTACH_BODY_MEDIAN:
+                    continue
+                scored.append((body_median, cand))
+
+            if not scored:
+                return None
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_median, top_cand = scored[0]
+            if len(scored) >= 2:
+                second_median = scored[1][0]
+                if (top_median - second_median) < self.settings.STAFF_REATTACH_AMBIGUITY:
+                    logger.info(
+                        f"[Staff REATTACH REJECT] ambiguous staff bodies "
+                        f"top={top_median:.3f} second={second_median:.3f} gap<{self.settings.STAFF_REATTACH_AMBIGUITY}"
+                    )
+                    return None
+
+            drop_face = False
+            face_sim = None
+            staff_faces = await self._get_person_face_embeddings(
+                db, top_cand["person_identity_id"]
+            )
+            if self.settings.STAFF_REATTACH_REQUIRE_FACE and not staff_faces:
+                logger.info(
+                    f"[Staff REATTACH REJECT] staff has no faces "
+                    f"person={str(top_cand['person_identity_id'])[:8]}"
+                )
+                return None
+            if face_embedding is not None and staff_faces:
+                face_sim = max(self._face_sim(face_embedding, f) for f in staff_faces)
+                # See method docstring for FUTURE quality-aware branch.
+                if face_sim < self.settings.STAFF_REATTACH_FACE_MIN:
+                    logger.info(
+                        f"[Staff REATTACH REJECT] face_sim={face_sim:.3f} < "
+                        f"{self.settings.STAFF_REATTACH_FACE_MIN} "
+                        f"(face_score={face_score:.2f}) "
+                        f"person={str(top_cand['person_identity_id'])[:8]}"
+                    )
+                    return None
+                if face_sim < self.settings.FACE_CONTAMINATION_THRESHOLD:
+                    drop_face = True
+            elif face_embedding is None and self.settings.STAFF_REATTACH_REQUIRE_FACE:
+                return None
+
+            top_cand = dict(top_cand)
+            top_cand["similarity"] = top_median
+            top_cand["distance"] = 1.0 - top_median
+            top_cand["drop_face"] = drop_face
+            top_cand["staff_reattach"] = True
+            logger.info(
+                f"[Staff REATTACH] person={str(top_cand['person_identity_id'])[:8]} "
+                f"body_median={top_median:.3f} face_sim={face_sim if face_sim is not None else 'n/a'} "
+                f"drop_face={drop_face} face_score={face_score:.2f}"
+            )
+            return top_cand
+        except Exception as e:
+            logger.error(f"Staff reattach failed: {e}")
+            return None
+
+    async def _search_similar_staff(
+        self, db: AsyncSession, embedding: np.ndarray, top_k: int = 5
+    ) -> list:
+        """Body pgvector search restricted to is_staff=True identities."""
+        try:
+            embedding_list = embedding.tolist()
+            await db.execute(text("SET LOCAL ivfflat.probes = 10"))
+            fetch_limit = max(top_k * 5, 25)
+            query = text("""
+                SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
+                       pe.captured_at,
+                       pi.last_seen_at, pi.first_seen_at,
+                       pe.embedding <=> :embedding AS distance
+                FROM person_embeddings pe
+                JOIN person_identities pi ON pe.person_identity_id = pi.id
+                WHERE pi.is_staff = TRUE
+                  AND pe.captured_at > NOW() - INTERVAL '48 hours'
+                ORDER BY pe.embedding <=> :embedding
+                LIMIT :fetch_limit
+            """)
+            result = await db.execute(
+                query, {"embedding": str(embedding_list), "fetch_limit": fetch_limit}
+            )
+            rows = result.fetchall()
+            best_by_person: dict = {}
+            for row in rows:
+                pid = row[0]
+                dist = float(row[6])
+                sim = 1.0 - dist
+                if pid not in best_by_person or sim > best_by_person[pid]["similarity"]:
+                    best_by_person[pid] = {
+                        "person_identity_id": pid,
+                        "camera_id": row[1],
+                        "crop_quality": row[2],
+                        "captured_at": row[3],
+                        "last_seen_at": row[4],
+                        "first_seen_at": row[5],
+                        "distance": dist,
+                        "similarity": sim,
+                    }
+            return sorted(best_by_person.values(), key=lambda c: c["distance"])[:top_k]
+        except Exception as e:
+            logger.error(f"Staff body search failed: {e}")
+            return []
 
     async def _person_body_count(self, db: AsyncSession, person_id) -> int:
         try:

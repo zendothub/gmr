@@ -22,8 +22,6 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from app.config import get_settings
-
 try:
     import timm
 except ImportError:
@@ -33,10 +31,16 @@ _shared_analyzers: Dict[str, "MiVOLOAnalyzer"] = {}
 _shared_lock = threading.Lock()
 
 
+# Offline-only default — production no longer loads MiVOLO (age = InsightFace genderage).
+_DEFAULT_MIVOLO_PATH = "models/mivolo/mivolo_fairface.pth.tar"
+
+
 def get_shared_mivolo(model_path: Optional[str] = None) -> "MiVOLOAnalyzer":
-    """Get (or lazily create) a process-wide shared MiVOLO analyzer."""
-    settings = get_settings()
-    key = model_path or settings.MIVOLO_MODEL_PATH
+    """Get (or lazily create) a process-wide shared MiVOLO analyzer.
+
+    Not used by the live pipeline; retained for danger/* offline scripts.
+    """
+    key = model_path or _DEFAULT_MIVOLO_PATH
     with _shared_lock:
         if key not in _shared_analyzers:
             _shared_analyzers[key] = MiVOLOAnalyzer(model_path=key)
@@ -74,8 +78,7 @@ class MiVOLOAnalyzer:
     """Gender + age estimator using a MiVOLO-D1 checkpoint."""
 
     def __init__(self, model_path: Optional[str] = None):
-        settings = get_settings()
-        self.model_path = model_path or settings.MIVOLO_MODEL_PATH
+        self.model_path = model_path or _DEFAULT_MIVOLO_PATH
         self._min_age: float = 0.0
         self._max_age: float = 122.0
         self._avg_age: float = 61.0

@@ -28,9 +28,9 @@ def get_shared_analyzer(model_name: Optional[str] = None) -> "InsightFaceAnalyze
 @dataclass
 class InsightFaceResult:
     """Demographics and recognition result for a face."""
-    age: int
-    gender: str        # "M" or "F"
-    age_group: str     # "child", "young_adult", "adult", "senior"
+    age: Optional[int]
+    gender: Optional[str]        # "M" or "F" (product gender uses SigLIP2)
+    age_group: Optional[str]     # "child", "young_adult", "adult", "senior"
     face_score: float  # InsightFace raw detection confidence
     face_bbox: dict    # {"x1", "y1", "x2", "y2"}
     embedding: Optional[np.ndarray] = None
@@ -74,13 +74,17 @@ class InsightFaceAnalyzer:
             #   CUDA  → CUDAExecutionProvider
             #   MPS   → CoreMLExecutionProvider  (Apple Neural Engine)
             #   CPU   → CPUExecutionProvider
+            # genderage supplies age (product gender still uses SigLIP2 face+margin)
             self.app = FaceAnalysis(
                 name=self.model_name,
-                allowed_modules=['detection', 'recognition'],  # gender/age now handled by MiVOLO
+                allowed_modules=["detection", "recognition", "genderage"],
                 providers=providers,
             )
             self.app.prepare(ctx_id=ctx_id, det_size=self.det_size)
-            logger.info(f"InsightFace FaceAnalysis prepared successfully (model={self.model_name})")
+            logger.info(
+                f"InsightFace FaceAnalysis prepared successfully "
+                f"(model={self.model_name}, modules={list(self.app.models.keys())})"
+            )
         except Exception as e:
             logger.error(f"Failed to initialize InsightFace analyzer: {e}")
             self.app = None
@@ -119,11 +123,19 @@ class InsightFaceAnalyzer:
                 if f_x1 < 0 or f_y1 < 0 or f_x2 > w or f_y2 > h:
                     continue
 
+                age_val = getattr(f, "age", None)
+                if age_val is not None:
+                    try:
+                        age_val = int(round(float(age_val)))
+                    except (TypeError, ValueError):
+                        age_val = None
+
                 detections.append({
                     "bbox": {"x1": f_x1, "y1": f_y1, "x2": f_x2, "y2": f_y2},
                     "embedding": getattr(f, "embedding", None),
                     "kps": getattr(f, "kps", None),
                     "det_score": float(f.det_score),
+                    "age": age_val,
                 })
             return detections
         except Exception as e:
@@ -224,8 +236,14 @@ class InsightFaceAnalyzer:
                 "y2": float(bbox[3]),
             }
 
-            # Gender/age handled by MiVOLO — InsightFace only does detection + embedding
+            # Age from genderage head (product gender uses SigLIP2)
             age = None
+            raw_age = getattr(best_face, "age", None)
+            if raw_age is not None:
+                try:
+                    age = int(round(float(raw_age)))
+                except (TypeError, ValueError):
+                    age = None
             gender = None
 
             # Extract face crop with 30% padding for better face recognition
@@ -289,8 +307,10 @@ class InsightFaceAnalyzer:
             logger.error(f"InsightFace demographic analysis failed: {e}")
             return None
 
-    def _age_to_group(self, age: int) -> str:
+    def _age_to_group(self, age: Optional[int]) -> Optional[str]:
         """Map age integer to demographic age group category."""
+        if age is None:
+            return None
         if age < 12:
             return "child"
         elif age < 25:
@@ -299,3 +319,28 @@ class InsightFaceAnalyzer:
             return "adult"
         else:
             return "senior"
+
+    def estimate_age_from_crop(self, face_crop: np.ndarray) -> Optional[int]:
+        """Run genderage on a face (or near-face) crop; return age years or None.
+
+        Used by offline backfill scripts when only MinIO face crops are available.
+        """
+        if self.app is None or face_crop is None or face_crop.size == 0:
+            return None
+        try:
+            bgr = face_crop
+            if len(bgr.shape) == 2:
+                bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+            faces = self.app.get(bgr)
+            if not faces:
+                h, w = bgr.shape[:2]
+                ph, pw = int(h * 0.35), int(w * 0.35)
+                padded = cv2.copyMakeBorder(bgr, ph, ph, pw, pw, cv2.BORDER_REPLICATE)
+                faces = self.app.get(padded)
+            if not faces:
+                return None
+            best = max(faces, key=lambda x: float(x.det_score))
+            return int(round(float(best.age)))
+        except Exception as e:
+            logger.error(f"InsightFace age-from-crop failed: {e}")
+            return None

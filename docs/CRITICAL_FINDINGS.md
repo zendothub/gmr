@@ -561,9 +561,13 @@ Runtime: encode face/body crop → compute cosine sim to cached text embs → be
 - Female: "a photo of a woman", "a woman", "a female person, woman", "a woman shopping", "a woman's face", "a female customer", "a woman, female, lady"
 - Male: parallel set
 
-**Body crop integration:** Body crops carry clothing context (saree, kurta, uniform) that face crops miss. `analyze_with_body()` combines face + body votes with body weighted 3×. A woman in a saree that face-only missed was correctly identified at 79% confidence via body crop.
+**Body crop integration (DISABLED Jul 2026):** Early experiments used face+body with body×3. On this retail CCTV that **increased female→male** errors. Flag `SIGLIP2_USE_BODY_FOR_GENDER=False`.
 
-**Performance:** 18 ms/image, 1.4 GB GPU, 55 images/sec throughput. MiVOLO kept for age prediction only.
+**Performance:** 18 ms/image, 1.4 GB GPU, 55 images/sec throughput.
+
+**Update Jul 2026 — face-only + margin δ=0.5:** Production rule: face-only SigLIP2; predict `M` only if `(male_best − female_best) > SIGLIP2_GENDER_MARGIN_DELTA` (default 0.5); track aggregates **mean margin** (`gender_margins`). Sweep: `danger/sweep_siglip2_gender_margin.py` (~98% on labeled set). Hair/beard prompt rewrites mass-flipped males to F — not used.
+
+**Age (Jul 2026):** MiVOLO FairFace removed from live (collapsed ~74% under-18). Age now InsightFace buffalo_l **genderage** on full-frame faces + track **median** (`age_samples`). Backfill: `danger/fix_demographics_oneshot.py`. Known limitation: IF ages real young children upward (often 22–28).
 
 ---
 
@@ -580,7 +584,7 @@ InsightFace now runs **once per frame** on the full 2880×1620 frame — single 
 
 Face crops are extracted from the **full frame** at native resolution (100-400px). `resize_pad_square()` preserves aspect ratio with edge-replicate padding — no stretching or distortion.
 
-**Result:** Face crops 3-7× higher resolution for MiVOLO/SigLIP2 input. Single GPU kernel launch instead of N×. Matched-face exclusivity prevents double-assignment.
+**Result:** Face crops 3-7× higher resolution for SigLIP2 + genderage input. Single GPU kernel launch instead of N×. Matched-face exclusivity prevents double-assignment.
 
 ---
 
@@ -707,12 +711,20 @@ PYTHONPATH=. venv/bin/python danger/clean_contaminated_embeddings.py [--apply]
 ```
 Detects and removes face embeddings from different people stored under the same identity (negative pairwise cosine similarity).
 
-### Test gender models
+### Fix demographics oneshot (age all + known gender FPs)
 ```bash
 cd /gmr/gmr
-PYTHONPATH=. venv/bin/python danger/test_mivolo.py [person_id ...]
-PYTHONPATH=. venv/bin/python danger/test_siglip2.py [person_id ...]
-PYTHONPATH=. venv/bin/python danger/test_siglip2_body.py [person_id ...]
+PYTHONPATH=. venv/bin/python danger/fix_demographics_oneshot.py        # dry-run
+PYTHONPATH=. venv/bin/python danger/fix_demographics_oneshot.py --apply
+```
+Re-ages all persons via InsightFace genderage median; sets known female→male FP ids to F.
+
+### Gender margin sweep / age offline tests
+```bash
+cd /gmr/gmr
+PYTHONPATH=. venv/bin/python danger/sweep_siglip2_gender_margin.py
+PYTHONPATH=. venv/bin/python danger/test_insightface_age.py
+PYTHONPATH=. venv/bin/python danger/compare_gender_models.py
 ```
 
 ---
@@ -733,7 +745,9 @@ PYTHONPATH=. venv/bin/python danger/test_siglip2_body.py [person_id ...]
 | `REID_MATCH_THRESHOLD` | `0.50` | Body ReID match threshold (MSMT17 OSNet, same-person median=0.680, diff-person median=0.386, best F1=0.49. Previously 0.85 — calibrated against broken ImageNet-backbone weights) |
 | `BODY_CONTAMINATION_THRESHOLD` | `0.50` | Body contamination gate (store-time + dedup cleanup). Was 0.60, lowered to 0.50 with MSMT17 weights — same-person p25=0.537, diff-person p75=0.444. |
 | `SIGLIP2_MODEL_ID` | `google/siglip2-base-patch16-224` | Gender model (100% on clean CCTV) |
-| `MIVOLO_MODEL_PATH` | `models/mivolo/mivolo_fairface.pth.tar` | Age model (MiVOLO kept for age only) |
+| `SIGLIP2_GENDER_MARGIN_DELTA` | `0.5` | Female-biased gender margin (M only if male−female > δ) |
+| `SIGLIP2_USE_BODY_FOR_GENDER` | `False` | Body path disabled (raised F→M errors) |
+| ~~`MIVOLO_MODEL_PATH`~~ | ~~models/mivolo/...~~ | **Removed from live** Jul 2026; age = InsightFace genderage + median |
 | `STAFF_DURATION_THRESHOLD_SECONDS` | `1800` | Staff detection: total visible time >30 min |
 | `STAFF_DISTINCT_DAYS_THRESHOLD` | `3` | Staff detection: appeared on 3+ days |
 | Stale track timeout | `5.0s` | `track_manager.py` |

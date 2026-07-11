@@ -41,7 +41,9 @@ class ActiveTrack:
     # Demographics and Face crop tracking
     face_analysis_count: int = 0
     best_demographics: Optional[dict] = None
-    gender_votes: dict = field(default_factory=lambda: {"M": 0, "F": 0})  # majority voting across frontal faces
+    gender_votes: dict = field(default_factory=lambda: {"M": 0, "F": 0})  # per-frame M/F after margin rule
+    gender_margins: list = field(default_factory=list)  # SigLIP2 male−female margins for mean decide
+    age_samples: list = field(default_factory=list)  # InsightFace ages for median
     current_face_crop_path: Optional[str] = None
     current_face_score: float = 0.0
     current_face_bbox: Optional[dict] = None
@@ -50,6 +52,11 @@ class ActiveTrack:
     # full-frame coordinates. Used by the global assignment to give a
     # continuity bonus to faces near the previous frame's position.
     last_face_center: Optional[tuple] = None
+
+    # Set each frame when this track's body bbox IoU with another active
+    # track exceeds OCCLUSION_IOU_THRESHOLD. Used to harden face assignment
+    # and skip contaminated body ReID.
+    is_occluded: bool = False
 
     # Track's best crop (body)
     best_crop_quality: float = 0.0

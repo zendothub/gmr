@@ -151,19 +151,26 @@ class SigLIP2Analyzer:
             # Best match per gender
             best_fem = float(fem_sims.max().item())
             best_mal = float(mal_sims.max().item())
+            margin = best_mal - best_fem  # >0 leans male
 
             # Softmax over the two best scores for a probability
             raw = np.array([best_fem, best_mal])
             probs = np.exp(raw - raw.max()) / np.exp(raw - raw.max()).sum()
             fem_prob = float(probs[0])
 
-            gender = "F" if best_fem > best_mal else "M"
+            # Female-biased boundary: require male score lead > δ (config).
+            settings = get_settings()
+            delta = float(getattr(settings, "SIGLIP2_GENDER_MARGIN_DELTA", 0.5))
+            gender = "M" if margin > delta else "F"
             gender_confidence = max(fem_prob, 1.0 - fem_prob)
 
             return {
                 "gender": gender,
                 "gender_prob": fem_prob,
                 "gender_confidence": gender_confidence,
+                "female_score": best_fem,
+                "male_score": best_mal,
+                "margin": margin,
             }
         except Exception as e:
             logger.error(f"SigLIP2 inference failed: {e}")
@@ -172,35 +179,39 @@ class SigLIP2Analyzer:
     def analyze_with_body(
         self, face_crop: np.ndarray, body_crop: np.ndarray
     ) -> Optional[Dict[str, object]]:
-        """Predict gender from BOTH face and body crops, combining votes.
+        """Gender from face (default) or face+body if SIGLIP2_USE_BODY_FOR_GENDER.
 
-        Body crop carries full clothing context (saree, kurta, uniform etc.)
-        which dramatically improves gender classification for persons wearing
-        culturally distinctive attire.  Body votes are weighted 3× per crop
-        vs 1× per face crop since they carry more signal.
+        Body×3 was found to increase female→male errors on this retail CCTV
+        and is disabled by default.
         """
+        settings = get_settings()
+        if not getattr(settings, "SIGLIP2_USE_BODY_FOR_GENDER", False):
+            return self.analyze(face_crop)
+
         face_result = self.analyze(face_crop)
         body_result = self.analyze(body_crop)
 
         if face_result is None and body_result is None:
             return None
 
-        # Count weighted votes
-        f_g = face_result["gender"] if face_result else None
-        b_g = body_result["gender"] if body_result else None
+        # Prefer mean margin over weighted hard votes
+        margins = []
+        if face_result is not None and "margin" in face_result:
+            margins.append(float(face_result["margin"]))
+        if body_result is not None and "margin" in body_result:
+            margins.append(float(body_result["margin"]))
+        if not margins:
+            return face_result or body_result
 
-        votes = {"M": 0, "F": 0}
-        if f_g:
-            votes[f_g] += 1
-        if b_g:
-            votes[b_g] += 3  # body provides clothing context → higher weight
-
-        gender = "F" if votes["F"] > votes["M"] else "M"
-        total = max(votes["M"] + votes["F"], 1)
-        prob = votes["F"] / total
-
+        mean_margin = float(sum(margins) / len(margins))
+        delta = float(getattr(settings, "SIGLIP2_GENDER_MARGIN_DELTA", 0.5))
+        gender = "M" if mean_margin > delta else "F"
+        base = face_result or body_result
         return {
             "gender": gender,
-            "gender_prob": prob,
-            "gender_confidence": max(prob, 1.0 - prob),
+            "gender_prob": base.get("gender_prob", 0.5),
+            "gender_confidence": base.get("gender_confidence", 0.5),
+            "female_score": base.get("female_score"),
+            "male_score": base.get("male_score"),
+            "margin": mean_margin,
         }

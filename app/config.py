@@ -107,6 +107,19 @@ class Settings(BaseSettings):
                                                  # 0% same-person rejected, 97.5% diff-person rejected.
                                                  # Only checked when >= 3 total cross-pairs.
 
+    # ── Phase 1: Occlusion-aware face assignment + tight body crops (2026-07-10) ──
+    # Side-by-side / occlusion is the remaining contamination source (CONTEXT #24).
+    # Detect overlapping tracks, harden immature face geometry, Hungarian assign,
+    # skip OSNet on occluded frames, and use tight YOLO boxes for body ReID.
+    OCCLUSION_IOU_THRESHOLD: float = 0.10       # Pairwise body IoU ≥ this → both tracks occluded
+    FACE_ASSIGN_UPPER_BODY_FRAC: float = 0.45   # Immature tracks: face centre must be in top 45% of body height
+    FACE_ASSIGN_MIN_OVERLAP: float = 0.70       # Immature: fraction of face area inside body bbox
+    FACE_ASSIGN_MIN_SCORE_IMMATURE: float = 0.35  # Immature track minimum composite face score
+    FACE_ASSIGN_AMBIGUITY_RATIO: float = 0.85   # If 2nd-best track score / best ≥ this for same face → assign to neither
+    ENABLE_HUNGARIAN_FACE_ASSIGN: bool = True   # False → greedy sort (legacy)
+    SKIP_BODY_REID_WHEN_OCCLUDED: bool = True   # Do not extract OSNet body embeddings on occluded frames
+    BODY_CROP_PADDING_PCT: float = 0.0          # Body crop padding for ReID (0.0 = tight YOLO box; raise via env if needed)
+
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase
     # analytics exclude employees (who generate hundreds of billing events
@@ -115,16 +128,31 @@ class Settings(BaseSettings):
     STAFF_DURATION_THRESHOLD_SECONDS: int = 1800   # total visible time across all sessions (default 30 min)
     STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
 
+    # ── Staff reattach (2026-07-10) ─────────────────────────────────────
+    # When face match fails (blur/side face) but body strongly matches an is_staff
+    # identity within RECENT_WINDOW_MINUTES, reattach instead of creating a new person.
+    # Face quality veto is stubbed in code (commented) until quality metric is calibrated.
+    ENABLE_STAFF_REATTACH: bool = True
+    STAFF_REATTACH_BODY_MEDIAN: float = 0.70      # median body vs staff (was 0.55 — uniform FPs at 0.55–0.65)
+    STAFF_REATTACH_MIN_BODIES: int = 2            # staff must have ≥2 stored body embeddings
+    STAFF_REATTACH_FACE_MIN: float = 0.30         # face_sim below this → reject (was 0.20 — too loose)
+    STAFF_REATTACH_REQUIRE_FACE: bool = True      # faceless tracks never reattach via body alone
+    STAFF_REATTACH_AMBIGUITY: float = 0.03        # reject if top-2 staff body medians within this gap
+    # STAFF_REATTACH_FACE_QUALITY_HIGH: float = 0.75  # FUTURE — high-quality face + low sim = hard veto
+
     # ------------------------------------------------------------------
     # SigLIP2 — zero-shot gender classifier (pre-computed text embeddings)
     # ------------------------------------------------------------------
     SIGLIP2_MODEL_ID: str = "google/siglip2-base-patch16-224"  # zero-shot gender (~18ms/img, ~1.4GB GPU)
+    # Female-biased decision boundary: predict M only if (male_best − female_best) > δ.
+    # Empirically δ=0.5 → ~98% on stored faces, fixes most F→M, body path disabled.
+    SIGLIP2_GENDER_MARGIN_DELTA: float = 0.5
+    # Body crops bias toward male on this CCTV — keep face-only for gender.
+    SIGLIP2_USE_BODY_FOR_GENDER: bool = False
 
-    # ------------------------------------------------------------------
-    # MiVOLO — gender + age (replaces InsightFace demographics)
-    # ------------------------------------------------------------------
-    MIVOLO_MODEL_PATH: str = "models/mivolo/mivolo_fairface.pth.tar"  # MiVOLO-D1 IMDB (ViT-Small, 3-class, ~103 MB, best of 4)
-    
+    # Age: InsightFace buffalo_l genderage head (median over track face samples).
+    # MiVOLO weights may remain on disk under models/mivolo/ but are not loaded.
+
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
     YOLO_POSE_CONFIDENCE: float = 0.3  # Keypoint confidence threshold

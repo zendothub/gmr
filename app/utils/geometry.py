@@ -138,3 +138,33 @@ def bbox_height(bbox: dict) -> float:
 def bbox_area(bbox: dict) -> float:
     """Calculate the area of a bounding box."""
     return abs(bbox["x2"] - bbox["x1"]) * abs(bbox["y2"] - bbox["y1"])
+
+
+def bbox_intersection_area(a: dict, b: dict) -> float:
+    """Area of axis-aligned intersection between two boxes (x1,y1,x2,y2)."""
+    ix1 = max(a["x1"], b["x1"])
+    iy1 = max(a["y1"], b["y1"])
+    ix2 = min(a["x2"], b["x2"])
+    iy2 = min(a["y2"], b["y2"])
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    return iw * ih
+
+
+def bbox_iou(a: dict, b: dict) -> float:
+    """Intersection-over-union of two axis-aligned boxes."""
+    inter = bbox_intersection_area(a, b)
+    if inter <= 0.0:
+        return 0.0
+    union = bbox_area(a) + bbox_area(b) - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def face_area_in_body_frac(face_bbox: dict, body_bbox: dict) -> float:
+    """Fraction of face box area that lies inside the body box (0–1)."""
+    fa = bbox_area(face_bbox)
+    if fa <= 0.0:
+        return 0.0
+    return bbox_intersection_area(face_bbox, body_bbox) / fa

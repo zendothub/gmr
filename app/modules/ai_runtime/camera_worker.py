@@ -27,7 +27,6 @@ from app.modules.tracking.track_manager import TrackManager, ActiveTrack
 from app.modules.reid.crop_quality import assess_crop_quality
 from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.insightface_analyzer import get_shared_analyzer
-from app.modules.reid.mivolo_analyzer import get_shared_mivolo
 from app.modules.reid.siglip2_analyzer import get_shared_siglip2
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
@@ -35,7 +34,7 @@ from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneE
 from app.utils.image_utils import extract_crop, save_image, save_image_async, resize_pad_square
 
 from app.utils.time_utils import utc_now
-from app.utils.geometry import polygon_from_json
+from app.utils.geometry import polygon_from_json, bbox_iou, face_area_in_body_frac
 
 # How often to sample a track_observation row per track
 OBS_SAMPLE_SECONDS = 2.0
@@ -70,7 +69,6 @@ class CameraWorker:
         self.yolo_pose = get_shared_pose_model() if self.reid_enabled else None
         self.identity_engine = IdentityDecisionEngine() if self.reid_enabled else None
         self.insightface_analyzer = get_shared_analyzer(self.settings.INSIGHTFACE_MODEL) if self.demographic_enabled else None
-        self.mivolo_analyzer = get_shared_mivolo() if self.demographic_enabled else None
         self.siglip2_analyzer = get_shared_siglip2() if self.demographic_enabled else None
 
         # Runtime config (zones/rules). Cameras are static -> no ROI/views.
@@ -168,7 +166,13 @@ class CameraWorker:
             self._start_broadcaster()
             logger.info(f"Stream burn-in enabled for camera {self.camera_id}")
 
-        logger.info(f"Camera worker started: {self.camera_id} (fps_target={self.fps_target}, rotation={self.camera_config.get('frame_rotation')})")
+        logger.info(
+            f"Camera worker started: {self.camera_id} "
+            f"(fps_target={self.fps_target}, rotation={self.camera_config.get('frame_rotation')}, "
+            f"body_crop_padding={self.settings.BODY_CROP_PADDING_PCT}, "
+            f"hungarian_face={self.settings.ENABLE_HUNGARIAN_FACE_ASSIGN}, "
+            f"skip_body_when_occluded={self.settings.SKIP_BODY_REID_WHEN_OCCLUDED})"
+        )
 
     async def stop(self):
         """Stop the processing loop and release resources."""
@@ -296,18 +300,17 @@ class CameraWorker:
             sleep_for = max(0.001, interval - elapsed)
             await asyncio.sleep(sleep_for)
 
-    @staticmethod
-    def _score_face_for_track(face: dict, body_bbox: dict, track: "ActiveTrack") -> Optional[float]:
+    def _score_face_for_track(self, face: dict, body_bbox: dict, track: "ActiveTrack") -> Optional[float]:
         """Score a face candidate for a body track.
 
-        Returns the composite score if the face centre falls inside the
-        ORIGINAL body bbox (no expansion), or None if the face is outside.
-        Uses temporal continuity — faces near the last frame's matched face
-        position get a bonus to prevent frame-to-frame assignment flips.
+        Returns the composite score if the face qualifies under geometry gates,
+        or None if rejected.  Immature tracks (good_face_count < 2) require the
+        face centre in the upper body and ≥ FACE_ASSIGN_MIN_OVERLAP of the face
+        box inside the body.  Continuity bonus is disabled while occluded.
 
         Scoring weights:
-          - Without last_face_center: 0.50 × size + 0.50 × centre
-          - With last_face_center:    0.35 × size + 0.30 × centre + 0.35 × continuity
+          - Without continuity: 0.50 × size + 0.50 × centre
+          - With continuity:    0.35 × size + 0.30 × centre + 0.35 × continuity
         """
         fb = face["bbox"]
         fx_cx = (fb["x1"] + fb["x2"]) / 2.0
@@ -328,6 +331,18 @@ class CameraWorker:
 
         bw = bx2 - bx
         bh = by2 - by
+        if bw <= 0 or bh <= 0:
+            return None
+
+        immature = track.good_face_count < 2
+        if immature:
+            fy_rel = (fy_cy - by) / bh
+            if fy_rel > self.settings.FACE_ASSIGN_UPPER_BODY_FRAC:
+                return None
+            overlap = face_area_in_body_frac(fb, body_bbox)
+            if overlap < self.settings.FACE_ASSIGN_MIN_OVERLAP:
+                return None
+
         body_cx = (bx + bx2) / 2.0
         fw = fb["x2"] - fb["x1"]
         fh = fb["y2"] - fb["y1"]
@@ -338,7 +353,11 @@ class CameraWorker:
         centre_dev = abs(fx_cx - body_cx) / max(bw / 2.0, 1.0)
         centre_score = max(0.0, 1.0 - centre_dev)
 
-        if track.last_face_center is not None:
+        use_continuity = (
+            track.last_face_center is not None
+            and not track.is_occluded
+        )
+        if use_continuity:
             _prev_cx, _prev_cy = track.last_face_center
             _dist = ((fx_cx - _prev_cx) ** 2 + (fy_cy - _prev_cy) ** 2) ** 0.5
             continuity_score = max(0.0, 1.0 - _dist / 300.0)
@@ -346,7 +365,135 @@ class CameraWorker:
         else:
             geo = 0.50 * size_score + 0.50 * centre_score
 
-        return float(face["det_score"]) * geo
+        score = float(face["det_score"]) * geo
+        if immature and score < self.settings.FACE_ASSIGN_MIN_SCORE_IMMATURE:
+            return None
+        return score
+
+    def _mark_occluded_tracks(self, active_tracks: List[ActiveTrack]) -> None:
+        """Mark tracks whose body bboxes overlap above OCCLUSION_IOU_THRESHOLD."""
+        for t in active_tracks:
+            t.is_occluded = False
+        n = len(active_tracks)
+        if n < 2:
+            return
+        thr = self.settings.OCCLUSION_IOU_THRESHOLD
+        occluded_ids: List[int] = []
+        for i in range(n):
+            bi = active_tracks[i].bbox
+            if bi is None:
+                continue
+            for j in range(i + 1, n):
+                bj = active_tracks[j].bbox
+                if bj is None:
+                    continue
+                if bbox_iou(bi, bj) >= thr:
+                    active_tracks[i].is_occluded = True
+                    active_tracks[j].is_occluded = True
+        for t in active_tracks:
+            if t.is_occluded:
+                occluded_ids.append(t.local_track_id)
+        if occluded_ids:
+            logger.debug(
+                f"FaceAssign: occluded tracks={occluded_ids} "
+                f"cam={self.camera_id} iou_thr={thr}"
+            )
+
+    def _assign_faces_to_tracks(self, all_faces: list, active_tracks: List[ActiveTrack]) -> None:
+        """Global face→track assignment with harden gates + Hungarian / greedy."""
+        for track in active_tracks:
+            track._matched_face = None
+
+        if not all_faces or not active_tracks:
+            return
+
+        candidates: List[tuple] = []  # (score, track, face_idx)
+        for track in active_tracks:
+            if track.bbox is None:
+                continue
+            for fi, f in enumerate(all_faces):
+                score = self._score_face_for_track(f, track.bbox, track)
+                if score is not None:
+                    candidates.append((score, track, fi))
+
+        if not candidates:
+            return
+
+        # Ambiguous reject: if two tracks compete for the same face within ratio, drop face entirely
+        face_scores: Dict[int, List[tuple]] = {}
+        for score, track, fi in candidates:
+            face_scores.setdefault(fi, []).append((score, track))
+        ambiguous_faces: Set[int] = set()
+        ratio_thr = self.settings.FACE_ASSIGN_AMBIGUITY_RATIO
+        for fi, pairs in face_scores.items():
+            if len(pairs) < 2:
+                continue
+            pairs.sort(key=lambda x: x[0], reverse=True)
+            best_s, second_s = pairs[0][0], pairs[1][0]
+            if best_s > 0 and (second_s / best_s) >= ratio_thr:
+                ambiguous_faces.add(fi)
+                logger.info(
+                    f"FaceAssign: rejected face (ambiguous) cam={self.camera_id} "
+                    f"face_idx={fi} scores={[round(p[0], 3) for p in pairs[:3]]} "
+                    f"tracks={[p[1].local_track_id for p in pairs[:3]]}"
+                )
+
+        candidates = [c for c in candidates if c[2] not in ambiguous_faces]
+        if not candidates:
+            return
+
+        assigned: Dict[int, tuple] = {}  # track_local_id -> (score, face_idx)
+
+        if self.settings.ENABLE_HUNGARIAN_FACE_ASSIGN:
+            track_ids = sorted({t.local_track_id for _, t, _ in candidates})
+            face_ids = sorted({fi for _, _, fi in candidates})
+            t_index = {tid: i for i, tid in enumerate(track_ids)}
+            f_index = {fi: j for j, fi in enumerate(face_ids)}
+            n_t, n_f = len(track_ids), len(face_ids)
+            cost = np.full((n_t, n_f), 1e6, dtype=np.float64)
+            score_lookup: Dict[tuple, float] = {}
+            track_by_id = {t.local_track_id: t for t in active_tracks}
+            for score, track, fi in candidates:
+                i, j = t_index[track.local_track_id], f_index[fi]
+                cost[i, j] = -score
+                score_lookup[(track.local_track_id, fi)] = score
+            try:
+                from scipy.optimize import linear_sum_assignment
+                row_ind, col_ind = linear_sum_assignment(cost)
+                for r, c in zip(row_ind, col_ind):
+                    if cost[r, c] >= 1e5:
+                        continue
+                    tid = track_ids[r]
+                    fi = face_ids[c]
+                    assigned[tid] = (score_lookup[(tid, fi)], fi)
+            except Exception as e:
+                logger.warning(f"FaceAssign: Hungarian failed ({e}), falling back to greedy")
+                assigned = {}
+
+        if not assigned:
+            # Greedy fallback (also used when Hungarian disabled)
+            all_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
+            claimed_faces: Set[int] = set()
+            assigned_tracks: Set[int] = set()
+            for score, track, fi in all_candidates:
+                if fi in claimed_faces or track.local_track_id in assigned_tracks:
+                    continue
+                assigned[track.local_track_id] = (score, fi)
+                claimed_faces.add(fi)
+                assigned_tracks.add(track.local_track_id)
+
+        for track in active_tracks:
+            hit = assigned.get(track.local_track_id)
+            if hit is None:
+                continue
+            _score, fi = hit
+            track._matched_face = all_faces[fi]
+            if not track.is_occluded:
+                fb = all_faces[fi]["bbox"]
+                track.last_face_center = (
+                    (fb["x1"] + fb["x2"]) / 2.0,
+                    (fb["y1"] + fb["y2"]) / 2.0,
+                )
 
     async def _process_frame(self, frame):
         """Run the full pipeline on a single frame."""
@@ -399,44 +546,12 @@ class CameraWorker:
                         }
                     )
 
-        # ── Global face-to-track assignment ───────────────────────────────
-        # Instead of greedily assigning faces per-track in output order (which
-        # lets the first track steal the best face from the track it belongs to),
-        # collect ALL (track, face, score) candidates, sort by score descending,
-        # and assign greedily — each face and each track used at most once.
-        # Uses original body bbox (no expansion) for membership check and
-        # temporal continuity (last_face_center) for scoring.
-        if all_faces and active_tracks:
-            all_candidates = []
-            for track in active_tracks:
-                if track.bbox is None:
-                    continue
-                for fi, f in enumerate(all_faces):
-                    score = self._score_face_for_track(f, track.bbox, track)
-                    if score is not None:
-                        all_candidates.append((score, track, fi))
-
-            all_candidates.sort(key=lambda x: x[0], reverse=True)
-            claimed_faces: set[int] = set()
-            assigned_tracks: set[int] = set()
-            for score, track, fi in all_candidates:
-                if fi in claimed_faces or track.local_track_id in assigned_tracks:
-                    continue
-                track._matched_face = all_faces[fi]
-                claimed_faces.add(fi)
-                assigned_tracks.add(track.local_track_id)
-
-            # Update last_face_center for temporal continuity in next frame
-            for track in active_tracks:
-                if getattr(track, '_matched_face', None) is not None:
-                    fb = track._matched_face["bbox"]
-                    track.last_face_center = (
-                        (fb["x1"] + fb["x2"]) / 2.0,
-                        (fb["y1"] + fb["y2"]) / 2.0
-                    )
-        else:
-            for track in active_tracks:
-                track._matched_face = None
+        # ── Occlusion flags + global face-to-track assignment ─────────────
+        # Overlapping bodies are marked is_occluded; immature tracks use
+        # upper-body + face-overlap gates; ambiguous faces are rejected for
+        # the frame; Hungarian (or greedy) picks the jointly best mapping.
+        self._mark_occluded_tracks(active_tracks)
+        self._assign_faces_to_tracks(all_faces, active_tracks)
 
         # 4) Automatic zone event detection
         zone_events = self.zone_event_detector.detect(active_tracks)
@@ -576,9 +691,12 @@ class CameraWorker:
         """Persist a new track_session row when a new local_track_id appears."""
         from app.core.db.models.tracking import TrackSession
 
-        # Extract initial crop
+        # Extract initial crop (tight YOLO box; padding configurable)
         crop_path = None
-        crop = await asyncio.to_thread(extract_crop, frame, track.bbox)
+        crop = await asyncio.to_thread(
+            extract_crop, frame, track.bbox,
+            padding_pct=self.settings.BODY_CROP_PADDING_PCT,
+        )
         if crop is not None and crop.size > 0:
             crop_path = await save_image_async(crop, self.settings.CROP_DIR, prefix=f"crop_{self.camera_id}")
             track.best_crop_path = crop_path
@@ -836,7 +954,10 @@ class CameraWorker:
                 if _prev_body_crop not in _accum_body_paths and _prev_body_crop != track.best_crop_path:
                     self._minio_cleanup(_prev_body_crop)
 
-            crop = await asyncio.to_thread(extract_crop, frame, track.bbox)
+            crop = await asyncio.to_thread(
+                extract_crop, frame, track.bbox,
+                padding_pct=self.settings.BODY_CROP_PADDING_PCT,
+            )
             if crop is None or crop.size == 0:
                 logger.warning(f"Track {track.local_track_id}: Failed to extract crop from bounding box.")
                 return
@@ -910,7 +1031,7 @@ class CameraWorker:
             # face was pre-detected on the full frame in _process_frame and
             # matched to this track.  Extract the face crop at NATIVE resolution
             # from the full frame (not the body crop), pad-resize to 224² for
-            # MiVOLO, and build an InsightFaceResult for the downstream pipeline.
+            # SigLIP2, and build an InsightFaceResult for the downstream pipeline.
             _face_info = getattr(track, '_matched_face', None)
             if _face_info:
                 face_bbox = _face_info["bbox"]
@@ -929,10 +1050,15 @@ class CameraWorker:
                     if _prev_curr_face and _prev_curr_face != current_face_path:
                         self._minio_cleanup(_prev_curr_face)
 
-                    # Build result — age/gender come from MiVOLO below
+                    # Age from full-frame genderage (if present on matched detection)
+                    _age = _face_info.get("age")
+                    _age_group = None
+                    if _age is not None and self.insightface_analyzer:
+                        _age_group = self.insightface_analyzer._age_to_group(int(_age))
+
                     from app.modules.reid.insightface_analyzer import InsightFaceResult
                     face_result = InsightFaceResult(
-                        age=None, gender=None, age_group=None,
+                        age=_age, gender=None, age_group=_age_group,
                         face_score=float(_face_info.get("det_score", 0.0)),
                         face_bbox=face_bbox,
                         embedding=_face_info.get("embedding"),
@@ -964,36 +1090,32 @@ class CameraWorker:
                     else:
                         face_result.frontality_score = 0.5
 
-                    # ── SigLIP2 gender (face + body combined) ─────────────
+                    # ── SigLIP2 gender (face-only + margin δ) ─────────────
+                    _sig = None
                     if self.siglip2_analyzer:
-                        # Body crop padded to 224² for clothing context
-                        body_crop_sq = resize_pad_square(crop, 224) if crop is not None and crop.size > 0 else None
                         _sig = await run_inference(
-                            self.siglip2_analyzer.analyze_with_body,
-                            face_crop_sq, body_crop_sq
-                        ) if body_crop_sq is not None else await run_inference(
                             self.siglip2_analyzer.analyze, face_crop_sq
                         )
                         if _sig:
                             face_result.gender = _sig["gender"]
+                            if "margin" in _sig:
+                                track.gender_margins.append(float(_sig["margin"]))
 
-                    # ── MiVOLO age (kept for age prediction) ─────────────
-                    if self.mivolo_analyzer:
-                        _mivolo = await run_inference(
-                            self.mivolo_analyzer.analyze, face_crop_sq
+                    # ── Age samples from InsightFace genderage ────────────
+                    if face_result.age is not None:
+                        track.age_samples.append(int(face_result.age))
+                        _med = int(round(float(np.median(track.age_samples))))
+                        face_result.age = _med
+                        if self.insightface_analyzer:
+                            face_result.age_group = self.insightface_analyzer._age_to_group(_med)
+
+                    if _sig:
+                        logger.debug(
+                            f"Track {track.local_track_id}: SigLIP2={_sig['gender']} "
+                            f"margin={_sig.get('margin', 0):+.2f} "
+                            f"age_med={face_result.age}"
                         )
-                        if _mivolo:
-                            face_result.age       = _mivolo["age"]
-                            face_result.age_group = self.mivolo_analyzer._age_to_group(_mivolo["age"])
-                            logger.debug(
-                                f"Track {track.local_track_id}: SigLIP2={_sig['gender'] if _sig else '?'} "
-                                f"MiVOLO_age={_mivolo['age']}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Track {track.local_track_id}: MiVOLO returned None"
-                            )
-                    elif not self.siglip2_analyzer:
+                    elif not self.siglip2_analyzer and not self.insightface_analyzer:
                         logger.warning(
                             f"Track {track.local_track_id}: No gender/age model available"
                         )
@@ -1075,29 +1197,36 @@ class CameraWorker:
                             f"(frontality={face_result.frontality_score:.2f})"
                         )
 
-                    # ── Gender voting (runs for EVERY detected face, not just frontal) ──
-                    # InsightFace returns reliable gender even from non-frontal faces.
-                    # Counting votes across all frames gives a robust majority instead
-                    # of relying on the handful of perfectly frontal shots.
+                    # ── Gender: mean SigLIP2 margin, female-biased δ ─────
+                    # Per-frame gender still recorded for debug; decision uses
+                    # mean(male_best − female_best) > SIGLIP2_GENDER_MARGIN_DELTA.
                     if face_result.gender in ("M", "F"):
                         track.gender_votes[face_result.gender] += 1
-                    _m_votes = track.gender_votes.get("M", 0)
-                    _f_votes = track.gender_votes.get("F", 0)
-                    if _m_votes == 0 and _f_votes == 0:
-                        _majority_gender = None  # no votes yet → unknown
-                    else:
-                        _majority_gender = "M" if _m_votes >= _f_votes else "F"
+                    _majority_gender = None
+                    if track.gender_margins:
+                        _mean_margin = float(np.mean(track.gender_margins))
+                        _delta = float(self.settings.SIGLIP2_GENDER_MARGIN_DELTA)
+                        _majority_gender = "M" if _mean_margin > _delta else "F"
+                    elif face_result.gender in ("M", "F"):
+                        _majority_gender = face_result.gender
 
-                    # Keep best_demographics gender in sync even for non-frontal frames
+                    # Keep best_demographics gender/age in sync from running aggregates
                     if track.best_demographics is not None:
                         _prev_gender = track.best_demographics.get("gender")
-                        if _prev_gender != _majority_gender:
+                        if _majority_gender and _prev_gender != _majority_gender:
                             track.best_demographics["gender"] = _majority_gender
                             logger.debug(
-                                f"Gender vote flipped for track {track.local_track_id}: "
+                                f"Gender flipped for track {track.local_track_id}: "
                                 f"{_prev_gender} → {_majority_gender} "
-                                f"(votes: M={track.gender_votes.get('M',0)} F={track.gender_votes.get('F',0)})"
+                                f"(mean_margin={float(np.mean(track.gender_margins)) if track.gender_margins else 0:+.2f})"
                             )
+                        if track.age_samples:
+                            _med_age = int(round(float(np.median(track.age_samples))))
+                            track.best_demographics["age"] = _med_age
+                            if self.insightface_analyzer:
+                                track.best_demographics["age_group"] = (
+                                    self.insightface_analyzer._age_to_group(_med_age)
+                                )
 
                     if face_frontal:
                         face_embedding = face_result.embedding
@@ -1152,10 +1281,16 @@ class CameraWorker:
 
                             if (track.best_demographics is None or
                                     face_score > track.best_demographics.get("face_score", 0.0)):
+                                _demo_age = face_result.age
+                                _demo_group = face_result.age_group
+                                if track.age_samples:
+                                    _demo_age = int(round(float(np.median(track.age_samples))))
+                                    if self.insightface_analyzer:
+                                        _demo_group = self.insightface_analyzer._age_to_group(_demo_age)
                                 track.best_demographics = {
-                                    "age":           face_result.age,
+                                    "age":           _demo_age,
                                     "gender":        _majority_gender,
-                                    "age_group":     face_result.age_group,
+                                    "age_group":     _demo_group,
                                     "face_score":    face_score,
                                     "frontality":    face_result.frontality_score,
                                     "face_crop_path": face_crop_path,
@@ -1186,7 +1321,17 @@ class CameraWorker:
             body_embedding = None
             should_accumulate = False
             
-            if quality_passed:
+            skip_body = (
+                self.settings.SKIP_BODY_REID_WHEN_OCCLUDED
+                and track.is_occluded
+            )
+            if skip_body:
+                logger.info(
+                    f"BodyReID skipped (occluded) track={track.local_track_id} "
+                    f"cam={self.camera_id}"
+                )
+
+            if quality_passed and not skip_body:
                 # Standard path: extract OSNet body embedding
                 body_embedding = await run_inference(self.reid_extractor.extract, crop)
                 if body_embedding is not None:
@@ -1194,8 +1339,14 @@ class CameraWorker:
                 else:
                     logger.warning("OSNet embedding extraction returned None.")
             elif face_frontal and face_embedding is not None:
-                # Fallback path: body quality is low, but high-quality face is present
-                logger.info(f"Track {track.local_track_id}: body quality rejected ({quality:.2f}), falling back to face-only identification.")
+                # Fallback path: body quality is low / occluded, but high-quality face is present
+                if skip_body:
+                    logger.info(
+                        f"Track {track.local_track_id}: occluded body skipped, "
+                        f"falling back to face-only identification."
+                    )
+                else:
+                    logger.info(f"Track {track.local_track_id}: body quality rejected ({quality:.2f}), falling back to face-only identification.")
                 should_accumulate = True
 
             if not should_accumulate:

@@ -25,13 +25,14 @@ interactions, dwell time, staff detection).
 │  retail-ai.service  (API Server, ~3.4 GB GPU)                                │
 │                                                                              │
 │  RTSP → LatestFrameBuffer → YOLOv8+ByteTrack → InsightFace (full frame)     │
-│      → Global face-to-track assignment → SigLIP2 gender + MiVOLO age         │
-│      → OSNet body ReID → IdentityDecisionEngine (face+body matching)        │
+│      → Occlusion IoU flag → Hungarian face-to-track (harden + ambig reject) │
+│      → SigLIP2 gender (face-only, margin δ=0.5) + InsightFace age (median)  │
+│      → OSNet body ReID (0% pad; skip if occluded) → IdentityDecisionEngine  │
 │      → Zone event detection → Rule evaluation → Persist to DB + MinIO        │
 │      → StreamBroadcaster (FFmpeg NVENC → MediaMTX → WebRTC)                  │
 │                                                                              │
-│  Models: YOLOv8n, InsightFace buffalo_l, OSNet (MSMT17), SigLIP2, MiVOLO    │
-│  State:  ByteTrack tracks, face accumulation, gender voting (in-memory)      │
+│  Models: YOLOv8n, InsightFace buffalo_l (+genderage), OSNet MSMT17, SigLIP2 │
+│  State:  ByteTrack tracks, face/gender-margin/age-sample accumulation        │
 └──────────────────────────┬───────────────────────────────────────────────────┘
                            │
               ┌────────────┴────────────┐
@@ -132,6 +133,13 @@ Frame N+5 (ReID window fires):
 | Setting | Value | Purpose |
 |---|---|---|
 | `FACE_MATCH_THRESHOLD` | 0.40 | Strict face match (any time) |
+| `BODY_CROP_PADDING_PCT` | 0.0 | Body crop padding for OSNet (env-overridable) |
+| `OCCLUSION_IOU_THRESHOLD` | 0.10 | Pairwise IoU → mark tracks occluded |
+| `ENABLE_HUNGARIAN_FACE_ASSIGN` | True | Hungarian face↔track assignment |
+| `ENABLE_STAFF_REATTACH` | True | Staff-only recent body reattach (blur/side face fragments) |
+| `STAFF_REATTACH_BODY_MEDIAN` | 0.70 | Min median body sim for staff reattach |
+| `STAFF_REATTACH_FACE_MIN` | 0.30 | Face floor; below → reject staff reattach |
+| `STAFF_REATTACH_REQUIRE_FACE` | True | Reject faceless body-only staff reattach |
 | `FACE_MATCH_THRESHOLD_RECENT` | 0.35 | Relaxed face match within 5-min window |
 | `FACE_MATCH_MEDIAN_THRESHOLD` | 0.30 | Median of all cross-pairs must pass (grey-zone validation) |
 | `REID_MATCH_THRESHOLD` | 0.50 | Body ReID consensus threshold |
@@ -244,11 +252,10 @@ LatestFrameBuffer (background thread, always keeps latest frame)
 │      → Insert "person_entered_view" event                        │
 │                                                                  │
 │  6b. Run ReID (every 5 accumulated frames):                      │
-│      → extract_crop(frame, bbox) → body crop                     │
-│      → OSNet.extract(crop) → 512-dim body embedding             │
-│      → InsightFace.analyze(full frame) → face embedding         │
-│      → Global face-to-track assignment                           │
-│      → SigLIP2 gender + MiVOLO age                               │
+│      → extract_crop(padding=BODY_CROP_PADDING_PCT=0.0)          │
+│      → OSNet.extract (skip if track.is_occluded)                 │
+│      → Face from pre-assigned full-frame match                   │
+│      → SigLIP2 gender (face+margin δ=0.5) + IF genderage age     │
 │      → Face contamination gate (track + store level)            │
 │      → Body contamination gate (median to cluster)               │
 │      → IdentityDecisionEngine.decide_identity()                  │
@@ -360,12 +367,12 @@ DB references (protected from deletion):
 | Task | Model | Why |
 |---|---|---|
 | Person detection + tracking | YOLOv8n + ByteTrack | Lightweight, fast on GPU. Per-camera instance (NOT shared). |
-| Face detection + embedding | InsightFace buffalo_l (SCRFD + ArcFace) | Best face detector. Full-frame detection (1 call, not per-track). |
+| Face detection + embedding + age | InsightFace buffalo_l (SCRFD + ArcFace + genderage) | Full-frame detection (1 call). Age years from genderage head. |
 | Body ReID | OSNet 512-dim (MSMT17 checkpoint) | ReID-finetuned. Same-person median=0.69, diff-person median=0.38. |
-| Gender | SigLIP2 (google/siglip2-base-patch16-224) | 100% on clean CCTV. 7+7 text prompts pre-computed. |
-| Age | MiVOLO (ViT-Small, FairFace 3-class) | Age prediction only (SigLIP2 doesn't provide age). |
+| Gender | SigLIP2 face-only + margin δ=0.5 | 7+7 prompts. M only if `(male−female)>0.5`. Body path off (F→M bias). |
+| Age | InsightFace genderage + multi-face **median** | Replaced MiVOLO FairFace (young collapse). Product gender remains SigLIP2. |
 
-**GPU memory:** ~4.5 GB total (InsightFace 1.5GB + YOLO 300MB + OSNet 100MB + MiVOLO 100MB + SigLIP2 1.4GB + overhead)
+**GPU memory:** ~4.3–4.5 GB (InsightFace+genderage ~1.5GB + YOLO 300MB + OSNet 100MB + SigLIP2 1.4GB + overhead; MiVOLO not loaded)
 
 ---
 
@@ -376,8 +383,8 @@ DB references (protected from deletion):
 | AI Pipeline (per-camera) | `app/modules/ai_runtime/camera_worker.py` |
 | Identity decisions | `app/modules/reid/identity_decision_engine.py` |
 | Face detection | `app/modules/reid/insightface_analyzer.py` |
-| Gender classification | `app/modules/reid/siglip2_analyzer.py` |
-| Age prediction | `app/modules/reid/mivolo_analyzer.py` |
+| Gender classification | `app/modules/reid/siglip2_analyzer.py` (`SIGLIP2_GENDER_MARGIN_DELTA`) |
+| Age prediction | `app/modules/reid/insightface_analyzer.py` (genderage head + median) |
 | Body ReID (OSNet) | `app/modules/reid/osnet_extractor.py` |
 | Track management | `app/modules/tracking/track_manager.py` |
 | Rule engine | `app/modules/rule_engine/rule_evaluator.py` |
