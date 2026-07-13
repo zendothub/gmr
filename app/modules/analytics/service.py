@@ -1523,22 +1523,20 @@ class AnalyticsService:
 
         # ── GENDER ─────────────────────────────────────────────────────
         if metric == "gender":
-            # Distinct persons in range
-            person_subq = (
-                select(TrackSession.person_identity_id)
-                .where(
-                    TrackSession.started_at >= start,
-                    TrackSession.started_at <= end,
-                    TrackSession.person_identity_id.isnot(None),
-                ).distinct()
+            # Distinct persons in range — mirrors footfall: use PersonIdentity.last_seen_at
+            # so that total_male + total_female + total_unidentified == footfall total_visitors.
+            demo_q = select(PersonIdentity.id, PersonIdentity.gender).where(
+                PersonIdentity.last_seen_at >= start,
+                PersonIdentity.last_seen_at <= end,
             )
             if cam_ids:
-                person_subq = person_subq.where(TrackSession.camera_id.in_(cam_ids))
-            person_subq = person_subq.subquery()
-            demo = (await db.execute(
-                select(PersonIdentity.id, PersonIdentity.gender)
-                .where(PersonIdentity.id.in_(select(person_subq.c.person_identity_id)))
-            )).all()
+                demo_q = demo_q.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
+            demo = (await db.execute(demo_q)).all()
 
             gcnt: dict = {"male": 0, "female": 0, "unidentified": 0}
             seen2: set = set()
