@@ -1,6 +1,5 @@
 """Stores service - retail outlet management."""
 
-from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -10,8 +9,6 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.models.camera import Camera
-from app.core.db.models.person import PersonIdentity, PersonEmbedding
-from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.store import Store, StoreStatus
 from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone, StoreTerminal
 from app.modules.stores.schemas import (
@@ -22,29 +19,28 @@ from app.modules.stores.schemas import (
     StoreTerminalCreate, StoreTerminalUpdate,
 )
 
-# IST timezone (UTC+5:30)
-_IST = timezone(timedelta(hours=5, minutes=30))
-
-# Staff identities to exclude from purchase counts
-_STAFF_IDS = select(PersonIdentity.id).where(PersonIdentity.is_staff.is_(True))
-
 
 async def _build_store_counts(db: AsyncSession, store_ids: List[UUID]) -> dict:
     """
-    For a list of store IDs, compute three live aggregations in parallel:
-      - camera_count   : number of cameras linked to the store
-      - footfall_count : distinct persons seen today (IST) via this store's cameras
-      - purchase_count : distinct buyers today (IST) via this store's cameras (excl. staff)
+    For a list of store IDs, compute three live counts that exactly match
+    what the analytics page shows:
+
+      - camera_count   : number of cameras linked to the store (direct SQL)
+      - footfall_count : total_visitors from AnalyticsService (metric=footfall, today)
+      - purchase_count : total_purchases from AnalyticsService (metric=purchase, today)
+
+    By delegating footfall and purchase to AnalyticsService.get_analytics_metrics()
+    we guarantee the store list shows the SAME numbers as the analytics page.
 
     Returns a dict keyed by store_id (UUID) → {"camera_count": N, "footfall_count": N, "purchase_count": N}
     """
     if not store_ids:
         return {}
 
-    now_ist = datetime.now(_IST)
-    today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Lazy import to avoid circular dependency
+    from app.modules.analytics.service import AnalyticsService
 
-    # ── camera_count per store ───────────────────────────────────────────
+    # ── camera_count per store (simple direct count) ─────────────────────
     cam_q = (
         select(Camera.store_id, func.count(Camera.id).label("cnt"))
         .where(Camera.store_id.in_(store_ids))
@@ -53,45 +49,37 @@ async def _build_store_counts(db: AsyncSession, store_ids: List[UUID]) -> dict:
     cam_rows = (await db.execute(cam_q)).all()
     cam_map: dict = {row.store_id: row.cnt for row in cam_rows}
 
-    # ── footfall_count per store: distinct persons (last_seen_at today) ──
-    # Join cameras → person_embeddings → person_identities
-    ff_q = (
-        select(Camera.store_id, func.count(func.distinct(PersonEmbedding.person_identity_id)).label("cnt"))
-        .join(PersonEmbedding, PersonEmbedding.camera_id == Camera.id)
-        .join(PersonIdentity, PersonIdentity.id == PersonEmbedding.person_identity_id)
-        .where(
-            Camera.store_id.in_(store_ids),
-            PersonIdentity.last_seen_at >= today_start,
-            PersonIdentity.last_seen_at <= now_ist,
-        )
-        .group_by(Camera.store_id)
-    )
-    ff_rows = (await db.execute(ff_q)).all()
-    ff_map: dict = {row.store_id: row.cnt for row in ff_rows}
-
-    # ── purchase_count per store: distinct buyers today (excl. staff) ───
-    pur_q = (
-        select(Camera.store_id, func.count(func.distinct(BillingInteraction.person_identity_id)).label("cnt"))
-        .join(BillingInteraction, BillingInteraction.camera_id == Camera.id)
-        .where(
-            Camera.store_id.in_(store_ids),
-            BillingInteraction.entered_at >= today_start,
-            BillingInteraction.entered_at <= now_ist,
-            BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
-        )
-        .group_by(Camera.store_id)
-    )
-    pur_rows = (await db.execute(pur_q)).all()
-    pur_map: dict = {row.store_id: row.cnt for row in pur_rows}
-
-    # Merge into a per-store dict (default 0 for missing)
+    # ── footfall_count + purchase_count via AnalyticsService ─────────────
+    # Calls the same service function the analytics page uses so the numbers
+    # are guaranteed to match.  Sequential per-store to keep the shared
+    # AsyncSession safe (no concurrent coroutines on one session).
     result: dict = {}
     for sid in store_ids:
+        ff_count = 0
+        pur_count = 0
+
+        try:
+            ff_resp = await AnalyticsService.get_analytics_metrics(
+                db, metric="footfall", store_id=sid, time_range="today"
+            )
+            ff_count = ff_resp.footfall_data.total_visitors if ff_resp.footfall_data else 0
+        except Exception as exc:
+            logger.warning(f"Store footfall count failed for {sid}: {exc}")
+
+        try:
+            pur_resp = await AnalyticsService.get_analytics_metrics(
+                db, metric="purchase", store_id=sid, time_range="today"
+            )
+            pur_count = pur_resp.purchase_data.total_purchases if pur_resp.purchase_data else 0
+        except Exception as exc:
+            logger.warning(f"Store purchase count failed for {sid}: {exc}")
+
         result[sid] = {
             "camera_count": cam_map.get(sid, 0),
-            "footfall_count": ff_map.get(sid, 0),
-            "purchase_count": pur_map.get(sid, 0),
+            "footfall_count": ff_count,
+            "purchase_count": pur_count,
         }
+
     return result
 
 

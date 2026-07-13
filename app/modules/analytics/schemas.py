@@ -334,7 +334,7 @@ class DashboardV2Response(BaseModel):
     # Filter context echoed back
     store_id: Optional[UUID] = None
     store_name: str = "All Stores"
-    time_range: str                # "today" | "this_week" | "custom"
+    time_range: str                # "today" | "weekly" | "custom"
     start_time: datetime
     end_time: datetime
 

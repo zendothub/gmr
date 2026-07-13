@@ -196,11 +196,11 @@ async def dashboard_v2(
     ),
     time_range: str = Query(
         "today",
-        pattern="^(today|this_week|custom)$",
+        pattern="^(today|weekly|custom)$",
         description=(
-            "'today'     → from 00:00 today to now (hourly slots). "
-            "'this_week' → from Monday 00:00 to now (hourly slots). "
-            "'custom'    → use start_time / end_time; granularity auto-selected."
+            "'today'  → from 00:00 today to now (hourly slots). "
+            "'weekly' → last 7 days from 00:00 seven days ago to now (daily slots). "
+            "'custom' → use start_time / end_time; granularity auto-selected."
         ),
     ),
     start_time: Optional[datetime] = Query(
@@ -217,7 +217,7 @@ async def dashboard_v2(
 
     **Filters**
     - `store_id`   → omit for All Stores, pass a UUID to scope to one store
-    - `time_range` → `today` | `this_week` | `custom`
+    - `time_range` → `today` | `weekly` | `custom`
 
     **Response highlights**
     - `total_cameras` / `active_cameras` — camera badge ("6 / 8 Cameras")
@@ -264,8 +264,8 @@ async def analytics_metrics(
     ),
     time_range: str = Query(
         "today",
-        pattern="^(today|this_week|custom)$",
-        description="'today' | 'this_week' | 'custom' (requires start_time + end_time)",
+        pattern="^(today|weekly|custom)$",
+        description="'today' | 'weekly' | 'custom' (requires start_time + end_time)",
     ),
     start_time: Optional[datetime] = Query(
         None, description="Range start — only used when time_range='custom'."
@@ -283,7 +283,7 @@ async def analytics_metrics(
     | Param        | Values                                    |
     |---|---|
     | `store_id`   | omit = All Stores, UUID = specific store  |
-    | `time_range` | `today` \\| `this_week` \\| `custom`      |
+    | `time_range` | `today` \\| `weekly` \\| `custom`          |
     | `metric`     | `footfall` \\| `gender` \\| `age_groups` \\| `purchase` |
 
     **Common charts in every metric:**
