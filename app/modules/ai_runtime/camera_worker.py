@@ -787,6 +787,8 @@ class CameraWorker:
                     face_crop_path=track.best_face_crop_path_for_id,
                     good_face_count=track.good_face_count,
                     face_embedding_list=track.face_embedding_list,
+                    track_started_at=track.started_at,
+                    track_session_id=track.track_session_id,
                 )
                 if person_id is not None:
                     track.person_identity_id = person_id
@@ -1486,6 +1488,8 @@ class CameraWorker:
                     face_crop_path=track.best_face_crop_path_for_id,
                     good_face_count=track.good_face_count,
                     face_embedding_list=track.face_embedding_list,
+                    track_started_at=track.started_at,
+                    track_session_id=track.track_session_id,
                 )
 
                 if is_new:

@@ -106,6 +106,14 @@ class Settings(BaseSettings):
                                                  # min median=0.401, diff-person p50=0.200. At 0.30:
                                                  # 0% same-person rejected, 97.5% diff-person rejected.
                                                  # Only checked when >= 3 total cross-pairs.
+    # Require median face sim to candidate's full gallery when gallery size ≥ 2
+    # (blocks lucky best-pair into mixed / multi-person face galleries).
+    # Aligns with FACE_CONTAMINATION_THRESHOLD (0.35).
+    FACE_MATCH_CLUSTER_MEDIAN_THRESHOLD: float = 0.35
+    ENABLE_FACE_MATCH_CLUSTER_MEDIAN: bool = True
+    # On face contradiction, never rematch the same person_id (force new person
+    # or a different identity). Fixes c7bdce30-style self-rematch loops.
+    ENABLE_CONTRADICTION_SAME_ID_BLOCK: bool = True
 
     # ── Phase 1: Occlusion-aware face assignment + tight body crops (2026-07-10) ──
     # Side-by-side / occlusion is the remaining contamination source (CONTEXT #24).
@@ -118,7 +126,15 @@ class Settings(BaseSettings):
     FACE_ASSIGN_AMBIGUITY_RATIO: float = 0.85   # If 2nd-best track score / best ≥ this for same face → assign to neither
     ENABLE_HUNGARIAN_FACE_ASSIGN: bool = True   # False → greedy sort (legacy)
     SKIP_BODY_REID_WHEN_OCCLUDED: bool = True   # Do not extract OSNet body embeddings on occluded frames
-    BODY_CROP_PADDING_PCT: float = 0.0          # Body crop padding for ReID (0.0 = tight YOLO box; raise via env if needed)
+    BODY_CROP_PADDING_PCT: float = 0.0          # Body crop padding for OSNet (0.0 = tight YOLO box; raise via env if needed)
+
+    # ── Same-camera temporal overlap gate (2026-07-13) ─────────────────
+    # Two track sessions on the SAME camera that overlap in time cannot be the
+    # same physical person. Cross-camera overlap (entry + counter) is allowed.
+    # Applied in live decide_identity (face/body/staff reattach) and periodic
+    # dedup before merging. ε ignores 1-frame ByteTrack glitches.
+    ENABLE_SAME_CAMERA_OVERLAP_GATE: bool = True
+    SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 1.0
 
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase

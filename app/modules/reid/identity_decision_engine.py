@@ -54,6 +54,8 @@ class IdentityDecisionEngine:
         face_crop_path: Optional[str] = None,
         good_face_count: int = 0,
         face_embedding_list: Optional[list] = None,
+        track_started_at: Optional[datetime] = None,
+        track_session_id: Optional[uuid.UUID] = None,
     ) -> Tuple[uuid.UUID, float, bool, bool, Optional[uuid.UUID]]:
         """
         Decide identity with face contradiction gate and disassociation logic.
@@ -65,6 +67,8 @@ class IdentityDecisionEngine:
         3. Body ReID Matching: With face contradiction gate (exclude contradicting candidates).
         4. Refinement Disassociation: If assigned ID face contradicts -> disassociate -> re-search.
         5. Body-only matches are demoted in confidence (BODY_ONLY_CONFIDENCE_LIMIT).
+        6. Same-camera temporal overlap: reject candidates who already have a concurrent
+           track on this camera (cannot be the same physical person).
         """
         try:
             # === RACE CONDITION PREVENTION ===
@@ -74,6 +78,8 @@ class IdentityDecisionEngine:
             best_candidate = None
             best_similarity = -1.0
             used_face = False
+            probe_start = track_started_at or utc_now()
+            probe_end = utc_now()
             
             # === FACE CONTRADICTION GATE ===
             # Check if current_person_id face embeddings contradict track face.
@@ -105,60 +111,63 @@ class IdentityDecisionEngine:
                             search_faces.append(item[0])
                 if not search_faces and face_embedding is not None:
                     search_faces.append(face_embedding)
+                track_face_list = [f for f in search_faces if f is not None]
 
                 for search_emb in search_faces:
                     face_candidate = await self._search_similar_face(db, search_emb)
-                    if face_candidate:
-                        face_sim = 1.0 - face_candidate["distance"]
-                        # Strict face match (unchanged, works for any age of candidate)
-                        if face_sim >= self.settings.FACE_MATCH_THRESHOLD and face_sim > best_similarity:
-                            best_candidate = face_candidate
-                            best_similarity = face_sim
-                            used_face = True
-                            logger.info(f"[Face Match] Score: {face_sim:.3f}, Person: {str(face_candidate['person_identity_id'])[:8]}")
-                        # Recent-window relaxed face match: same-visit cross-angle handoff
-                        # whose best face pair falls in [0.35, 0.40) — would be missed by the
-                        # strict threshold and create a duplicate. Only for candidates whose
-                        # first_seen_at is within RECENT_WINDOW_MINUTES (same visit, small pool).
-                        elif (
-                            self.settings.ENABLE_RECENT_WINDOW_MATCHING
-                            and face_sim >= self.settings.FACE_MATCH_THRESHOLD_RECENT
-                            and face_sim > best_similarity
-                            and self._is_recent(face_candidate.get("last_seen_at"))
-                        ):
-                            # Grey-zone face match [0.35, 0.40): validate with
-                            # median of ALL cross-pairs. A single lucky crop can
-                            # hit 0.35+ for different people; median catches this.
-                            # Same-person min median=0.401, diff-person p50=0.200.
-                            # Only check when >= 3 total cross-pairs (meaningful median).
-                            cand_id = face_candidate["person_identity_id"]
-                            track_face_list = [f for f in search_faces if f is not None]
-                            n_track = len(track_face_list)
-                            r = await db.execute(text(
-                                "SELECT COUNT(*) FROM person_face_embeddings"
-                                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
-                            ), {"pid": str(cand_id)})
-                            n_cand = int(r.scalar() or 0)
-                            n_cross = n_track * n_cand
+                    if not face_candidate:
+                        continue
+                    cand_id = face_candidate["person_identity_id"]
 
-                            if n_cross >= 3:
-                                face_median = await self._person_face_median_sim(db, cand_id, track_face_list)
-                                if face_median is not None and face_median < self.settings.FACE_MATCH_MEDIAN_THRESHOLD:
-                                    logger.info(
-                                        f"[Face Match RECENT REJECTED] Score: {face_sim:.3f} but median={face_median:.3f} "
-                                        f"< {self.settings.FACE_MATCH_MEDIAN_THRESHOLD} (cross-pairs={n_cross}), "
-                                        f"Person: {str(cand_id)[:8]} — single lucky pair, different person"
-                                    )
-                                    continue
+                    # Contradiction: never rematch the same person (mixed gallery
+                    # can still produce a lucky best-pair to itself).
+                    if (
+                        self.settings.ENABLE_CONTRADICTION_SAME_ID_BLOCK
+                        and current_id_contradicted
+                        and current_person_id is not None
+                        and cand_id == current_person_id
+                    ):
+                        logger.info(
+                            f"[CONTRADICTION] skip rematch to same person={str(cand_id)[:8]}"
+                        )
+                        continue
 
-                            best_candidate = face_candidate
-                            best_similarity = face_sim
-                            used_face = True
-                            logger.info(
-                                f"[Face Match RECENT] Score: {face_sim:.3f} (≥{self.settings.FACE_MATCH_THRESHOLD_RECENT}, "
-                                f"relaxed from {self.settings.FACE_MATCH_THRESHOLD}), Person: "
-                                f"{str(face_candidate['person_identity_id'])[:8]}"
-                            )
+                    face_sim = 1.0 - face_candidate["distance"]
+
+                    # Strict face match
+                    if face_sim >= self.settings.FACE_MATCH_THRESHOLD and face_sim > best_similarity:
+                        ok = await self._face_match_passes_cluster_median(
+                            db, cand_id, track_face_list, face_sim, recent_grey=False
+                        )
+                        if not ok:
+                            continue
+                        best_candidate = face_candidate
+                        best_similarity = face_sim
+                        used_face = True
+                        logger.info(
+                            f"[Face Match] Score: {face_sim:.3f}, Person: {str(cand_id)[:8]}"
+                        )
+                    # Recent-window relaxed face match
+                    elif (
+                        self.settings.ENABLE_RECENT_WINDOW_MATCHING
+                        and face_sim >= self.settings.FACE_MATCH_THRESHOLD_RECENT
+                        and face_sim > best_similarity
+                        and self._is_recent(face_candidate.get("last_seen_at"))
+                    ):
+                        ok = await self._face_match_passes_cluster_median(
+                            db, cand_id, track_face_list, face_sim, recent_grey=True
+                        )
+                        if not ok:
+                            continue
+                        best_candidate = face_candidate
+                        best_similarity = face_sim
+                        used_face = True
+                        logger.info(
+                            f"[Face Match RECENT] Score: {face_sim:.3f} "
+                            f"(≥{self.settings.FACE_MATCH_THRESHOLD_RECENT}, "
+                            f"relaxed from {self.settings.FACE_MATCH_THRESHOLD}), "
+                            f"Person: {str(cand_id)[:8]}"
+                        )
 
             # Step 2: Fallback to Body ReID matching (with face contradiction gate).
             # skip_body_reid logic intentionally removed — high-quality face that misses
@@ -301,6 +310,33 @@ class IdentityDecisionEngine:
                         best_similarity = staff_hit["similarity"]
                         staff_drop_face = bool(staff_hit.get("drop_face", False))
 
+            # ── Same-camera temporal overlap gate ────────────────────────
+            # Reject match if candidate already has another concurrent track
+            # on THIS camera (exclude our own track_session_id so self-refine works).
+            if (
+                best_candidate is not None
+                and self.settings.ENABLE_SAME_CAMERA_OVERLAP_GATE
+            ):
+                cand_pid = best_candidate["person_identity_id"]
+                if await self._has_same_camera_overlap(
+                    db,
+                    cand_pid,
+                    camera_id,
+                    probe_start,
+                    probe_end,
+                    exclude_track_session_id=track_session_id,
+                ):
+                    logger.info(
+                        f"[SAME_CAM OVERLAP REJECT] person={str(cand_pid)[:8]} "
+                        f"cam={str(camera_id)[:8]} probe={probe_start}→{probe_end} "
+                        f"sim={best_similarity:.3f} used_face={used_face} — "
+                        f"candidate already has concurrent track on this camera"
+                    )
+                    best_candidate = None
+                    best_similarity = -1.0
+                    used_face = False
+                    staff_drop_face = False
+
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
             required_threshold = self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
 
@@ -349,9 +385,24 @@ class IdentityDecisionEngine:
             else:
                 # If current ID contradicts track face, it MUST be disassociated
                 if current_id_contradicted:
-                    if best_candidate and best_similarity >= required_threshold:
-                        matched_id = best_candidate["person_identity_id"]
-                        
+                    matched_id = best_candidate["person_identity_id"] if best_candidate else None
+                    # Never rematch the contradicted same person (best-pair trap
+                    # into a mixed face gallery). Force a different identity or new.
+                    if (
+                        self.settings.ENABLE_CONTRADICTION_SAME_ID_BLOCK
+                        and matched_id is not None
+                        and matched_id == current_person_id
+                    ):
+                        logger.info(
+                            f"[CONTRADICTION] refuse rematch to same person="
+                            f"{str(current_person_id)[:8]} (best_sim={best_similarity:.3f})"
+                        )
+                        matched_id = None
+                        best_candidate = None
+                        best_similarity = -1.0
+                        used_face = False
+
+                    if best_candidate and matched_id is not None and best_similarity >= required_threshold:
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
                             await self._delete_person(db, prune_old_id, matched_id)
@@ -646,6 +697,57 @@ class IdentityDecisionEngine:
         except Exception:
             return False
 
+    async def _has_same_camera_overlap(
+        self,
+        db: AsyncSession,
+        person_id,
+        camera_id: uuid.UUID,
+        probe_start: datetime,
+        probe_end: datetime,
+        exclude_track_session_id: Optional[uuid.UUID] = None,
+    ) -> bool:
+        """True if person already has a track on this camera overlapping [probe_start, probe_end].
+
+        Cross-camera concurrent tracks are allowed (same person on entry + counter).
+        Excludes the track being decided so self-refinement is not false-positive.
+        """
+        if not self.settings.ENABLE_SAME_CAMERA_OVERLAP_GATE:
+            return False
+        if person_id is None or camera_id is None or probe_start is None or probe_end is None:
+            return False
+        min_sec = float(self.settings.SAME_CAMERA_OVERLAP_MIN_SECONDS)
+        params = {
+            "pid": str(person_id),
+            "cam": str(camera_id),
+            "probe_start": probe_start,
+            "probe_end": probe_end,
+            "min_sec": min_sec,
+        }
+        exclude_sql = ""
+        if exclude_track_session_id is not None:
+            exclude_sql = "AND id::text <> :exclude_tid"
+            params["exclude_tid"] = str(exclude_track_session_id)
+        r = await db.execute(
+            text(
+                f"""
+                SELECT 1
+                FROM track_sessions
+                WHERE person_identity_id::text = :pid
+                  AND camera_id::text = :cam
+                  {exclude_sql}
+                  AND started_at < :probe_end
+                  AND COALESCE(ended_at, last_seen_at) > :probe_start
+                  AND EXTRACT(epoch FROM (
+                        LEAST(COALESCE(ended_at, last_seen_at), :probe_end)
+                      - GREATEST(started_at, :probe_start)
+                      )) >= :min_sec
+                LIMIT 1
+                """
+            ),
+            params,
+        )
+        return r.first() is not None
+
     async def _try_staff_reattach(
         self,
         db: AsyncSession,
@@ -878,6 +980,66 @@ class IdentityDecisionEngine:
         except Exception as e:
             logger.debug(f"face median sim failed for {person_id}: {e}")
             return None
+
+    async def _face_match_passes_cluster_median(
+        self,
+        db: AsyncSession,
+        cand_id,
+        track_faces: list,
+        best_pair_sim: float,
+        recent_grey: bool = False,
+    ) -> bool:
+        """Reject face matches whose best pair fits but the gallery median does not.
+
+        recent_grey: best-pair is in [FACE_MATCH_THRESHOLD_RECENT, FACE_MATCH_THRESHOLD)
+        and uses FACE_MATCH_MEDIAN_THRESHOLD (0.30) when n_cross ≥ 3.
+
+        non-grey / strict match: when ENABLE_FACE_MATCH_CLUSTER_MEDIAN and
+        candidate has ≥2 faces and n_cross ≥ 3, require
+        FACE_MATCH_CLUSTER_MEDIAN_THRESHOLD (0.35).
+        """
+        if not track_faces:
+            return True
+        try:
+            r = await db.execute(text(
+                "SELECT COUNT(*) FROM person_face_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+            ), {"pid": str(cand_id)})
+            n_cand = int(r.scalar() or 0)
+        except Exception:
+            n_cand = 0
+        n_track = len(track_faces)
+        n_cross = n_track * n_cand
+        if n_cross < 3:
+            return True
+
+        face_median = await self._person_face_median_sim(db, cand_id, track_faces)
+        if face_median is None:
+            return True
+
+        if recent_grey:
+            thr = self.settings.FACE_MATCH_MEDIAN_THRESHOLD
+            if face_median < thr:
+                logger.info(
+                    f"[Face Match RECENT REJECTED] Score: {best_pair_sim:.3f} but "
+                    f"median={face_median:.3f} < {thr} (cross-pairs={n_cross}), "
+                    f"Person: {str(cand_id)[:8]} — single lucky pair, different person"
+                )
+                return False
+            return True
+
+        if (
+            self.settings.ENABLE_FACE_MATCH_CLUSTER_MEDIAN
+            and n_cand >= 2
+        ):
+            thr = self.settings.FACE_MATCH_CLUSTER_MEDIAN_THRESHOLD
+            if face_median < thr:
+                logger.info(
+                    f"[Face Match REJECT] best={best_pair_sim:.3f} median={face_median:.3f} "
+                    f"< {thr} (gallery={n_cand}, cross={n_cross}) person={str(cand_id)[:8]}"
+                )
+                return False
+        return True
 
     async def _update_person(self, db: AsyncSession, person_id: uuid.UUID):
         """Update existing person's last_seen and visit count."""

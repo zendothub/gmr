@@ -225,169 +225,220 @@ async def deduplicate_persons():
 
             logger.info(f"Dedup job: found {len(pairs)} duplicate pair(s) — merging...")
 
-            # ── Step 2: resolve winners per connected component ─────────────
-            # Build union-find so A=B and B=C → all three merge into one winner.
-            parent: dict[str, str] = {}
+            # ── Same-camera temporal overlap gate ──────────────────────────
+            # Drop face-similar pairs whose tracks already overlap on the same
+            # camera — those cannot be the same physical person.
+            if settings.ENABLE_SAME_CAMERA_OVERLAP_GATE and pairs:
+                min_sec = float(settings.SAME_CAMERA_OVERLAP_MIN_SECONDS)
+                pair_list = [(str(r[0]), str(r[1]), float(r[2])) for r in pairs]
+                all_pair_ids = list({p for a, b, _ in pair_list for p in (a, b)})
+                win_result = await db.execute(text("""
+                    SELECT person_identity_id::text, camera_id::text,
+                           started_at, COALESCE(ended_at, last_seen_at) AS ended
+                    FROM track_sessions
+                    WHERE person_identity_id::text = ANY(:ids)
+                      AND started_at IS NOT NULL
+                      AND COALESCE(ended_at, last_seen_at) IS NOT NULL
+                """), {"ids": all_pair_ids})
+                by_pid: dict[str, list] = {}
+                for pid, cam, start, end in win_result.fetchall():
+                    by_pid.setdefault(pid, []).append((cam, start, end))
 
-            def find(x: str) -> str:
-                p = parent.get(x, x)
-                if p != x:
-                    parent[x] = find(p)
-                return parent.get(x, x)
+                def _same_cam_overlap(wa, wb) -> bool:
+                    for a_cam, a0, a1 in wa:
+                        for b_cam, b0, b1 in wb:
+                            if a_cam != b_cam:
+                                continue
+                            start = max(a0, b0)
+                            end = min(a1, b1)
+                            if (end - start).total_seconds() >= min_sec:
+                                return True
+                    return False
 
-            def union(x: str, y: str):
-                parent[find(x)] = find(y)
-
-            for row in pairs:
-                union(str(row[0]), str(row[1]))
-
-            # Collect all unique IDs involved
-            all_ids = set()
-            for row in pairs:
-                all_ids.add(str(row[0]))
-                all_ids.add(str(row[1]))
-
-            # Fetch identity metadata to pick the best winner per component
-            id_list = list(all_ids)
-            meta_result = await db.execute(text("""
-                SELECT id::text, best_face_score, first_seen_at, visit_count
-                FROM   person_identities
-                WHERE  id::text = ANY(:ids)
-            """), {"ids": id_list})
-            meta = {r[0]: {"score": r[1] or 0.0, "first_seen": r[2], "visits": r[3]}
-                    for r in meta_result.fetchall()}
-
-            # Group IDs by their representative (root of union-find tree)
-            components: dict[str, list[str]] = {}
-            for pid in all_ids:
-                root = find(pid)
-                components.setdefault(root, []).append(pid)
-
-            # For each component pick the winner = highest face score, tie-break by earliest first_seen
-            merges: list[tuple[str, str]] = []  # (winner_id, loser_id)
-            for root, members in components.items():
-                if len(members) < 2:
-                    continue
-                winner = max(
-                    members,
-                    key=lambda pid: (
-                        meta.get(pid, {}).get("score", 0.0),
-                        -(meta.get(pid, {}).get("first_seen") or utc_now()).timestamp(),
+                kept = []
+                dropped = 0
+                for a, b, sim in pair_list:
+                    if _same_cam_overlap(by_pid.get(a, []), by_pid.get(b, [])):
+                        dropped += 1
+                        logger.info(
+                            f"Dedup: drop pair {a[:8]}↔{b[:8]} sim={sim:.3f} "
+                            f"(same-camera track overlap)"
+                        )
+                        continue
+                    kept.append((a, b, sim))
+                if dropped:
+                    logger.info(
+                        f"Dedup: dropped {dropped}/{len(pair_list)} pair(s) "
+                        f"due to same-camera track overlap; {len(kept)} remain"
                     )
-                )
-                for loser in members:
-                    if loser != winner:
-                        merges.append((winner, loser))
+                pairs = kept  # list of (a,b,sim) tuples
+                if not pairs:
+                    logger.debug("Dedup job: all pairs blocked by same-camera overlap.")
+                    # Still run contamination/staff steps below — fall through but
+                    # skip merge section when pairs empty.
+            else:
+                # Normalize row access to (a,b,sim) triples when gate off
+                pairs = [(str(r[0]), str(r[1]), float(r[2])) for r in pairs]
 
-            if not merges:
-                logger.debug("Dedup job: all pairs already resolved.")
-                return
+            if not pairs:
+                logger.debug("Dedup job: no mergeable pairs after overlap filter.")
+            else:
+                logger.info(f"Dedup job: merging {len(pairs)} pair(s) after overlap filter...")
 
-            # ── Step 3: merge each loser into its winner ────────────────────
-            # Each merge runs in its own SAVEPOINT (begin_nested). A single bad
-            # pair rolls back ONLY that merge and the batch continues — previously
-            # one failure did `rollback() + return`, aborting ALL remaining merges
-            # and skipping the downstream cleanup/sweep/staff steps for the whole
-            # 10-min cycle (a "poison pill" that could block dedup indefinitely).
+            # ── Step 2–3: merge only when pairs remain after filter ─────────
             merged_count = 0
             failed_count = 0
-            deferred_minio_paths: list[str] = []  # delete after commit (safe)
-            for winner_id, loser_id in merges:
-                try:
-                    extra_visits = meta.get(loser_id, {}).get("visits", 0)
-                    async with db.begin_nested():
-                        # Reassign FK references
-                        for tbl, col in [
-                            ("track_sessions",      "person_identity_id"),
-                            ("events",              "person_identity_id"),
-                            ("billing_interactions","person_identity_id"),
-                            ("storage_objects",     "person_identity_id"),
-                        ]:
-                            await db.execute(text(
-                                f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
-                            ), {"winner": winner_id, "loser": loser_id})
+            deferred_minio_paths: list[str] = []
+            if pairs:
+                # Build union-find so A=B and B=C → all three merge into one winner.
+                parent: dict[str, str] = {}
 
-                        # Absorb visit_count and first_seen_at into winner
-                        loser_meta  = meta.get(loser_id, {})
-                        winner_meta = meta.get(winner_id, {})
-                        loser_first  = loser_meta.get("first_seen")
-                        winner_first = winner_meta.get("first_seen")
+                def find(x: str) -> str:
+                    p = parent.get(x, x)
+                    if p != x:
+                        parent[x] = find(p)
+                    return parent.get(x, x)
 
-                        update_parts = ["visit_count = visit_count + :extra_visits"]
-                        params: dict = {"extra_visits": extra_visits, "winner": winner_id}
+                def union(x: str, y: str):
+                    parent[find(x)] = find(y)
 
-                        if loser_first and winner_first and loser_first < winner_first:
-                            update_parts.append("first_seen_at = :loser_first")
-                            params["loser_first"] = loser_first
+                for row in pairs:
+                    union(str(row[0]), str(row[1]))
 
-                        await db.execute(text(
-                            f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
-                        ), params)
+                all_ids = set()
+                for row in pairs:
+                    all_ids.add(str(row[0]))
+                    all_ids.add(str(row[1]))
 
-                        # ── Absorb face/body embeddings (FIXED, contamination-gated) ──
-                        max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
-                        await _absorb_face_embeddings(db, winner_id, loser_id, max_faces)
-                        max_bodies = 10  # MAX_EMBEDDINGS_PER_PERSON
-                        await _absorb_body_embeddings(db, winner_id, loser_id, max_bodies)
+                # Fetch identity metadata to pick the best winner per component
+                id_list = list(all_ids)
+                meta_result = await db.execute(text("""
+                    SELECT id::text, best_face_score, first_seen_at, visit_count
+                    FROM   person_identities
+                    WHERE  id::text = ANY(:ids)
+                """), {"ids": id_list})
+                meta = {r[0]: {"score": r[1] or 0.0, "first_seen": r[2], "visits": r[3]}
+                        for r in meta_result.fetchall()}
 
-                        # ── Re-vote gender from ALL tracks ──────────────────────
-                        await _revote_person_gender(db, winner_id)
+                # Group IDs by their representative (root of union-find tree)
+                components: dict[str, list[str]] = {}
+                for pid in all_ids:
+                    root = find(pid)
+                    components.setdefault(root, []).append(pid)
 
-                        # ── Collect loser's crop paths for deferred MinIO cleanup ─
-                        # (deferred to after commit so a savepoint rollback never
-                        # leaves MinIO files deleted while their DB references survive)
-                        paths_result = await db.execute(text("""
-                            SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
-                            UNION ALL
-                            SELECT face_crop_path   FROM person_face_embeddings WHERE person_identity_id::text = :loser
-                            UNION ALL
-                            SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
-                        """), {"loser": loser_id})
-                        deferred_minio_paths.extend(r[0] for r in paths_result.fetchall() if r[0])
-
-                        # Delete loser (embeddings already absorbed → no cascade)
-                        await db.execute(
-                            text("DELETE FROM person_identities WHERE id::text = :loser"),
-                            {"loser": loser_id}
+                # For each component pick the winner = highest face score, tie-break by earliest first_seen
+                merges: list[tuple[str, str]] = []  # (winner_id, loser_id)
+                for root, members in components.items():
+                    if len(members) < 2:
+                        continue
+                    winner = max(
+                        members,
+                        key=lambda pid: (
+                            meta.get(pid, {}).get("score", 0.0),
+                            -(meta.get(pid, {}).get("first_seen") or utc_now()).timestamp(),
                         )
-
-                    merged_count += 1
-                    logger.info(
-                        f"Dedup: merged {loser_id[:8]} → {winner_id[:8]} "
-                        f"(sim>{threshold:.2f}, +{extra_visits} visits, "
-                        f"faces+body absorbed, gender re-voted)"
                     )
+                    for loser in members:
+                        if loser != winner:
+                            merges.append((winner, loser))
 
-                except Exception as e:
-                    # Savepoint rolled back automatically; outer transaction intact.
-                    # Continue with the remaining merges so one bad pair can't
-                    # block the whole dedup cycle.
-                    failed_count += 1
-                    logger.error(f"Dedup: failed to merge {loser_id[:8]} → {winner_id[:8]}: {e} — skipping (batch continues)")
+                if not merges:
+                    logger.debug("Dedup job: all pairs already resolved.")
+                else:
+                    # ── Step 3: merge each loser into its winner ────────────────
+                    # Each merge runs in its own SAVEPOINT (begin_nested). A single bad
+                    # pair rolls back ONLY that merge and the batch continues.
+                    for winner_id, loser_id in merges:
+                        try:
+                            extra_visits = meta.get(loser_id, {}).get("visits", 0)
+                            async with db.begin_nested():
+                                # Reassign FK references
+                                for tbl, col in [
+                                    ("track_sessions",      "person_identity_id"),
+                                    ("events",              "person_identity_id"),
+                                    ("billing_interactions","person_identity_id"),
+                                    ("storage_objects",     "person_identity_id"),
+                                ]:
+                                    await db.execute(text(
+                                        f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
+                                    ), {"winner": winner_id, "loser": loser_id})
 
-            await db.commit()
+                                # Absorb visit_count and first_seen_at into winner
+                                loser_meta  = meta.get(loser_id, {})
+                                winner_meta = meta.get(winner_id, {})
+                                loser_first  = loser_meta.get("first_seen")
+                                winner_first = winner_meta.get("first_seen")
 
-            # ── Deferred MinIO cleanup for merged losers ──────────────────────
-            # Done AFTER the commit so a savepoint rollback can never delete a
-            # MinIO object whose DB reference survived the rollback. Failures are
-            # non-fatal — the periodic sweep cross-references DB and cleans up
-            # any leftover unreferenced files.
-            if deferred_minio_paths:
-                from app.modules.storage.minio_client import delete_object as minio_del
-                for path in set(deferred_minio_paths):
-                    try:
-                        key = path.split("/", 1)[1] if "/" in path else path
-                        minio_del(key)
-                    except Exception as e:
-                        logger.warning(f"Dedup: MinIO delete failed for {path}: {e}")
+                                update_parts = ["visit_count = visit_count + :extra_visits"]
+                                params: dict = {"extra_visits": extra_visits, "winner": winner_id}
 
-            logger.info(
-                f"Dedup job: merged {merged_count} duplicate identit(ies)"
-                f"{f', {failed_count} failed (skipped)' if failed_count else ''}."
-            )
+                                if loser_first and winner_first and loser_first < winner_first:
+                                    update_parts.append("first_seen_at = :loser_first")
+                                    params["loser_first"] = loser_first
+
+                                await db.execute(text(
+                                    f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
+                                ), params)
+
+                                # ── Absorb face/body embeddings (FIXED, contamination-gated) ──
+                                max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
+                                await _absorb_face_embeddings(db, winner_id, loser_id, max_faces)
+                                max_bodies = 10  # MAX_EMBEDDINGS_PER_PERSON
+                                await _absorb_body_embeddings(db, winner_id, loser_id, max_bodies)
+
+                                # ── Re-vote gender from ALL tracks ──────────────────────
+                                await _revote_person_gender(db, winner_id)
+
+                                # ── Collect loser's crop paths for deferred MinIO cleanup ─
+                                paths_result = await db.execute(text("""
+                                    SELECT crop_path        FROM person_embeddings      WHERE person_identity_id::text = :loser
+                                    UNION ALL
+                                    SELECT face_crop_path   FROM person_face_embeddings WHERE person_identity_id::text = :loser
+                                    UNION ALL
+                                    SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
+                                """), {"loser": loser_id})
+                                deferred_minio_paths.extend(r[0] for r in paths_result.fetchall() if r[0])
+
+                                # Delete loser (embeddings already absorbed → no cascade)
+                                await db.execute(
+                                    text("DELETE FROM person_identities WHERE id::text = :loser"),
+                                    {"loser": loser_id}
+                                )
+
+                            merged_count += 1
+                            logger.info(
+                                f"Dedup: merged {loser_id[:8]} → {winner_id[:8]} "
+                                f"(sim>{threshold:.2f}, +{extra_visits} visits, "
+                                f"faces+body absorbed, gender re-voted)"
+                            )
+
+                        except Exception as e:
+                            failed_count += 1
+                            logger.error(
+                                f"Dedup: failed to merge {loser_id[:8]} → {winner_id[:8]}: {e} "
+                                f"— skipping (batch continues)"
+                            )
+
+                    await db.commit()
+
+                    # ── Deferred MinIO cleanup for merged losers ──────────────
+                    if deferred_minio_paths:
+                        from app.modules.storage.minio_client import delete_object as minio_del
+                        for path in set(deferred_minio_paths):
+                            try:
+                                key = path.split("/", 1)[1] if "/" in path else path
+                                minio_del(key)
+                            except Exception as e:
+                                logger.warning(f"Dedup: MinIO delete failed for {path}: {e}")
+
+                    logger.info(
+                        f"Dedup job: merged {merged_count} duplicate identit(ies)"
+                        f"{f', {failed_count} failed (skipped)' if failed_count else ''}."
+                    )
 
             # ── Step 4: clean contaminated face embeddings ──────────────────
             face_removed = await _clean_contaminated_face_embeddings(db, settings)
+
             if face_removed > 0:
                 await db.commit()
                 logger.info(f"Face contamination cleanup: removed {face_removed} face embedding(s).")
