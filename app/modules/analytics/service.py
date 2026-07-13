@@ -789,13 +789,13 @@ class AnalyticsService:
             duration = end - start
             return start, end, start - duration, start
         
-        if time_range == "this_week":
-            # Monday 00:00 in IST of current week
-            monday = (now - timedelta(days=now.weekday())).replace(
+        if time_range == "weekly":
+            # Last 7 days: 00:00 IST exactly 7 days ago → now
+            start = (now - timedelta(days=7)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
             end = now
-            return monday, end, monday - timedelta(weeks=1), monday
+            return start, end, start - timedelta(days=7), start
         
         # custom range: treat naive datetimes as IST
         if end_time is None:
@@ -1020,11 +1020,11 @@ class AnalyticsService:
         footfall_over_time: List[DashboardV2FootfallPoint] = []
         slot = cls._truncate_slot(start, resolved)
         
-        # For "today" and "this_week", extend to end of period for complete charts
+        # For "today" and "weekly", extend to end of period for complete charts
         # For hourly: extend to end of current day (23:59 in same timezone)
         # For daily: use the actual end
         display_end = end
-        if resolved == "hour" and time_range in ("today", "this_week"):
+        if resolved == "hour" and time_range in ("today", "weekly"):
             # Extend to end of current day (23:59:59 in same timezone as end)
             display_end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
         
