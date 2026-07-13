@@ -15,7 +15,7 @@ from app.modules.stores.schemas import (
     StoreZoneCreate, StoreZoneUpdate, StoreZoneResponse,
     StoreTerminalCreate, StoreTerminalUpdate, StoreTerminalResponse,
 )
-from app.modules.stores.service import StoreService
+from app.modules.stores.service import StoreService, _build_store_counts, _store_to_dict
 
 router = APIRouter(prefix="/api/stores", tags=["Stores"])
 
@@ -285,7 +285,8 @@ async def search_stores(
     - `GET /api/stores/search?status=active&name=Apo` → active stores starting with "Apo"
     """
     stores = await StoreService.search_stores(db, status_filter=status, name_prefix=name)
-    return [StoreResponse.model_validate(s) for s in stores]
+    counts = await _build_store_counts(db, [s.id for s in stores])
+    return [StoreResponse.model_validate(_store_to_dict(s, counts.get(s.id, {}))) for s in stores]
 
 
 # ===========================================================================
@@ -300,7 +301,8 @@ async def create_store(
 ):
     """Create a new retail store."""
     store = await StoreService.create_store(db, data)
-    return StoreResponse.model_validate(store)
+    counts = await _build_store_counts(db, [store.id])
+    return StoreResponse.model_validate(_store_to_dict(store, counts.get(store.id, {})))
 
 
 @router.get("", response_model=List[StoreResponse])
@@ -312,7 +314,8 @@ async def list_stores(
 ):
     """List all stores. Optionally filter by status or search by name."""
     stores = await StoreService.get_stores(db, status_filter=status, search=search)
-    return [StoreResponse.model_validate(s) for s in stores]
+    counts = await _build_store_counts(db, [s.id for s in stores])
+    return [StoreResponse.model_validate(_store_to_dict(s, counts.get(s.id, {}))) for s in stores]
 
 
 @router.patch("/{store_id}/status", response_model=StoreResponse)
@@ -324,7 +327,8 @@ async def update_store_status(
 ):
     """Activate or deactivate a store.  Body: `{ \"status\": \"active\" | \"inactive\" }`"""
     store = await StoreService.update_store_status(db, store_id, data)
-    return StoreResponse.model_validate(store)
+    counts = await _build_store_counts(db, [store.id])
+    return StoreResponse.model_validate(_store_to_dict(store, counts.get(store.id, {})))
 
 
 @router.get("/{store_id}", response_model=StoreResponse)
@@ -335,7 +339,8 @@ async def get_store(
 ):
     """Get a store by ID."""
     store = await StoreService.get_store(db, store_id)
-    return StoreResponse.model_validate(store)
+    counts = await _build_store_counts(db, [store.id])
+    return StoreResponse.model_validate(_store_to_dict(store, counts.get(store.id, {})))
 
 
 @router.put("/{store_id}", response_model=StoreResponse)
@@ -347,7 +352,8 @@ async def update_store(
 ):
     """Update a store's details."""
     store = await StoreService.update_store(db, store_id, data)
-    return StoreResponse.model_validate(store)
+    counts = await _build_store_counts(db, [store.id])
+    return StoreResponse.model_validate(_store_to_dict(store, counts.get(store.id, {})))
 
 
 @router.delete("/{store_id}")
