@@ -586,20 +586,14 @@ class AnalyticsService:
         Resolve 'auto' to a concrete granularity based on range length.
 
         Auto rules:
-          ≤ 2 days   → hour   (24–48 points)
-          ≤ 30 days  → day    (up to 30 points)
-          ≤ 180 days → week   (up to ~26 points)
-          > 180 days → month  (monthly aggregation)
+          ≤ 1 day  → hour  (24 data points for "today")
+          > 1 day  → day   (one data point per calendar day)
         """
         if group_by != "auto":
             return group_by
-        if range_days <= 2:
+        if range_days <= 1:
             return "hour"
-        if range_days <= 30:
-            return "day"
-        if range_days <= 180:
-            return "week"
-        return "month"
+        return "day"
 
     @staticmethod
     def _truncate_slot(dt: datetime, resolved: str) -> datetime:
@@ -631,11 +625,29 @@ class AnalyticsService:
 
     @staticmethod
     def _slot_label(dt: datetime, resolved: str) -> str:
-        """Format the display label for a slot."""
+        """Format the display label for a slot.
+
+        hour → "2 PM", "12 AM", "12 PM"   (12-hour clock + AM/PM, no leading zero)
+        day  → "14th Jul", "1st Aug"       (ordinal day + abbreviated month)
+        """
         if resolved == "hour":
-            return dt.strftime("%H:%M")
+            h = dt.hour
+            if h == 0:
+                return "12 AM"
+            if h < 12:
+                return f"{h} AM"
+            if h == 12:
+                return "12 PM"
+            return f"{h - 12} PM"
         if resolved == "day":
-            return dt.strftime("%Y-%m-%d")
+            day = dt.day
+            # Ordinal suffix — 11th/12th/13th are special cases
+            if 11 <= day <= 13:
+                suffix = "th"
+            else:
+                suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+            month_abbr = dt.strftime("%b")  # "Jan", "Feb", …, "Dec"
+            return f"{day}{suffix} {month_abbr}"
         if resolved == "week":
             return dt.strftime("%Y-W%W")   # e.g. "2026-W25"
         return dt.strftime("%Y-%m")        # e.g. "2026-06"
