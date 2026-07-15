@@ -249,6 +249,8 @@ class FootfallMetricData(BaseModel):
     total_visitors: int = 0
     peak_hour: Optional[PeakHourInfo] = None
     avg_daily: int = 0
+    # Set when range is hourly (today / custom ≤1 day): total // hours_so_far (empty hours included).
+    avg_hourly: Optional[int] = None
     busiest_day: Optional[BusiestDayInfo] = None
     # Charts
     footfall_over_time: List[DashboardV2FootfallPoint] = []
@@ -291,6 +293,9 @@ class PurchaseMetricData(BaseModel):
     total_purchases: int = 0
     conversion_pct: float = 0.0
     avg_daily: int = 0
+    # Set when range is hourly (today / custom ≤1 day): total // hours_so_far (empty hours included).
+    avg_hourly: Optional[int] = None
+    peak_hour: Optional[PeakHourInfo] = None
     busiest_day: Optional[BusiestDayInfo] = None
     # Charts
     purchases_over_time: List[DashboardV2FootfallPoint] = []

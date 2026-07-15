@@ -291,7 +291,8 @@ async def analytics_metrics(
     - `per_camera_breakdown[]`  → Horizontal bar chart sorted by count descending
 
     **Footfall tab fields** (`footfall_data`):
-    - `total_visitors`, `peak_hour` `{ count, time }`, `avg_daily`, `busiest_day` `{ count, date }`
+    - `total_visitors`, `peak_hour` `{ count, time }`, `avg_daily`, `avg_hourly` (today/hourly only),
+      `busiest_day` `{ count, date }`
     - `footfall_over_time[]`, `peak_hours_label` (e.g. "12 PM – 2 PM and 6 PM – 8 PM")
 
     **Gender tab fields** (`gender_data`):
@@ -303,7 +304,8 @@ async def analytics_metrics(
     - `age_group_distribution[]` (horizontal bar chart)
 
     **Purchase tab fields** (`purchase_data`):
-    - `total_purchases`, `conversion_pct`, `avg_daily`, `busiest_day`
+    - `total_purchases`, `conversion_pct`, `avg_daily`, `avg_hourly` (today/hourly only),
+      `peak_hour` `{ count, time }`, `busiest_day`
     - `purchases_over_time[]`, `peak_hours_label`
     """
     return await AnalyticsService.get_analytics_metrics(

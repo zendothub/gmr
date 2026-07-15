@@ -1403,6 +1403,11 @@ class AnalyticsService:
             peak_h_dt = max(hourly_cnt, key=lambda k: hourly_cnt[k]) if hourly_cnt else None
             busiest_day_dt = max(daily_cnt, key=lambda k: daily_cnt[k]) if daily_cnt else None
             avg_daily = (total_visitors // max(len(daily_cnt), 1)) if daily_cnt else 0
+            # Today / single-day: total ÷ hours elapsed (empty hours included)
+            avg_hourly = None
+            if resolved == "hour":
+                hours_so_far = max(1, int((end - start).total_seconds() // 3600) + 1)
+                avg_hourly = total_visitors // hours_so_far
 
             # footfall_over_time (resolved granularity) - use PersonIdentity.last_seen_at
             slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
@@ -1522,6 +1527,7 @@ class AnalyticsService:
                         time=peak_h_dt.strftime("%H:%M"),
                     ) if peak_h_dt else None,
                     avg_daily=avg_daily,
+                    avg_hourly=avg_hourly,
                     busiest_day=BusiestDayInfo(
                         count=daily_cnt[busiest_day_dt],
                         date=busiest_day_dt.strftime("%m-%d"),
@@ -1890,8 +1896,12 @@ class AnalyticsService:
 
             busiest2 = max(daily2, key=lambda k: daily2[k]) if daily2 else None
             avg_daily2 = (total_purchases // max(len(daily2), 1)) if daily2 else 0
+            avg_hourly2 = None
+            if resolved == "hour":
+                hours_so_far2 = max(1, int((end - start).total_seconds() // 3600) + 1)
+                avg_hourly2 = total_purchases // hours_so_far2
 
-            # Hourly map for peak_hours_label - use IST timezone
+            # Hourly map for peak hour + peak_hours_label - use IST timezone
             h_bexpr2 = func.date_trunc("hour", func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
             hq2 = (
                 select(h_bexpr2.label("b"), func.count(func.distinct(BillingInteraction.person_identity_id)).label("c"))
@@ -1903,17 +1913,85 @@ class AnalyticsService:
                 hq2 = hq2.where(BillingInteraction.camera_id.in_(cam_ids))
             h_rows2 = (await db.execute(hq2)).all()
             # Convert timezone-naive buckets to IST timezone-aware for hour extraction
+            hourly_cnt2 = {}
             hourly_int2 = {}
             for r in h_rows2:
                 if r.b is not None:
                     bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                    hourly_cnt2[bucket_ist] = r.c
                     hourly_int2[bucket_ist.hour] = r.c
+            peak_h2_dt = max(hourly_cnt2, key=lambda k: hourly_cnt2[k]) if hourly_cnt2 else None
 
-            # purchases_over_time
-            pur_map = await _slot_map(BillingInteraction.entered_at, start, end)
+            # Slot maps must match cards: distinct non-staff persons (not raw row counts)
+            async def _purchase_slot_map(s, e) -> dict:
+                bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', BillingInteraction.entered_at))
+                q = (
+                    select(
+                        bexpr.label("b"),
+                        func.count(func.distinct(BillingInteraction.person_identity_id)).label("c"),
+                    )
+                    .where(
+                        BillingInteraction.entered_at >= s,
+                        BillingInteraction.entered_at <= e,
+                        BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
+                    )
+                    .group_by("b")
+                    .order_by("b")
+                )
+                if cam_ids:
+                    q = q.where(BillingInteraction.camera_id.in_(cam_ids))
+                rows = (await db.execute(q)).all()
+                result = {}
+                for r in rows:
+                    if r.b is not None:
+                        bucket_ist = r.b.replace(tzinfo=IST) if r.b.tzinfo is None else r.b
+                        result[bucket_ist] = r.c
+                return result
+
+            async def _purchase_period_comparison() -> List[PeriodComparisonPoint]:
+                curr_map = await _purchase_slot_map(start, end)
+                prev_map = await _purchase_slot_map(prev_start, prev_end)
+                points: List[PeriodComparisonPoint] = []
+                slot = cls._truncate_slot(start, resolved)
+                prev_slot = cls._truncate_slot(prev_start, resolved)
+                while slot <= end:
+                    nxt = cls._next_slot(slot, resolved)
+                    points.append(PeriodComparisonPoint(
+                        label=cls._slot_label(slot, resolved),
+                        slot_start=slot, slot_end=nxt,
+                        current=curr_map.get(slot, 0),
+                        previous=prev_map.get(prev_slot, 0),
+                    ))
+                    slot = nxt
+                    prev_slot = cls._next_slot(prev_slot, resolved)
+                return points
+
+            # Per-camera: distinct non-staff purchasers
+            cam_q2 = (
+                select(
+                    Camera.id,
+                    Camera.name,
+                    func.count(func.distinct(BillingInteraction.person_identity_id)).label("cnt"),
+                )
+                .join(Camera, Camera.id == BillingInteraction.camera_id)
+                .where(
+                    BillingInteraction.entered_at >= start,
+                    BillingInteraction.entered_at <= end,
+                    BillingInteraction.person_identity_id.notin_(_STAFF_IDS),
+                )
+                .group_by(Camera.id, Camera.name)
+                .order_by(func.count(func.distinct(BillingInteraction.person_identity_id)).desc())
+            )
+            if cam_ids:
+                cam_q2 = cam_q2.where(BillingInteraction.camera_id.in_(cam_ids))
+            cam_rows2 = (await db.execute(cam_q2)).all()
+            cam_breakdown2 = [
+                CameraBreakdownPoint(camera_id=r[0], camera_name=r[1], count=r[2]) for r in cam_rows2
+            ]
+
+            pur_map = await _purchase_slot_map(start, end)
             purchases_ot = cls._build_ff_slots(start, end, resolved, pur_map)
-            period_comp = await _period_comparison(BillingInteraction.entered_at)
-            cam_breakdown2 = await _per_camera(BillingInteraction, BillingInteraction.entered_at)
+            period_comp = await _purchase_period_comparison()
 
             return AnalyticsMetricsResponse(
                 **base_resp,
@@ -1921,6 +1999,11 @@ class AnalyticsService:
                     total_purchases=total_purchases,
                     conversion_pct=conv_pct,
                     avg_daily=avg_daily2,
+                    avg_hourly=avg_hourly2,
+                    peak_hour=PeakHourInfo(
+                        count=hourly_cnt2[peak_h2_dt],
+                        time=peak_h2_dt.strftime("%H:%M"),
+                    ) if peak_h2_dt else None,
                     busiest_day=BusiestDayInfo(
                         count=daily2[busiest2],
                         date=busiest2.strftime("%m-%d"),
