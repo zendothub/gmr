@@ -1,0 +1,14 @@
+[Unit]
+Description=Network recovery watchdog (gateway / internet)
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/net-watchdog.sh
+Nice=10
+# Root needed for nmcli system-wide NM restart + reboot
+User=root
+
+[Install]
+WantedBy=multi-user.target

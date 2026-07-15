@@ -1,0 +1,12 @@
+[Unit]
+Description=Run network recovery watchdog every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=net-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
