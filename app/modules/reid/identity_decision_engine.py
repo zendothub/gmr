@@ -7,11 +7,19 @@ from datetime import datetime, timedelta
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError, IntegrityError, InvalidRequestError
 from loguru import logger
 
 from app.config import get_settings
 from app.core.db.models.person import PersonIdentity, PersonEmbedding
 from app.utils.time_utils import utc_now, time_score
+
+# Shared with reextract / faceless delete so delete never races mid-store.
+IDENTITY_ADVISORY_LOCK_KEY = 1001
+
+
+class IdentityStoreError(Exception):
+    """Persistence failed (FK / flush). Session must be recovered via SAVEPOINT outer handler."""
 
 
 class IdentityDecisionEngine:
@@ -73,11 +81,16 @@ class IdentityDecisionEngine:
         try:
             # === RACE CONDITION PREVENTION ===
             # Acquire transaction-level exclusive lock to serialize ReID decisions across all camera workers
-            await db.execute(text("SELECT pg_advisory_xact_lock(1001)"))
+            await db.execute(text(f"SELECT pg_advisory_xact_lock({IDENTITY_ADVISORY_LOCK_KEY})"))
 
             best_candidate = None
             best_similarity = -1.0
             used_face = False
+            # Provenance for acceptance threshold (P0/P1 fix):
+            # face_strict | face_recent | body | body_recent | staff_reattach | None
+            match_tier: Optional[str] = None
+            same_cam_blocked = False
+            match_stale_blocked = False
             probe_start = track_started_at or utc_now()
             probe_end = utc_now()
             
@@ -144,6 +157,7 @@ class IdentityDecisionEngine:
                         best_candidate = face_candidate
                         best_similarity = face_sim
                         used_face = True
+                        match_tier = "face_strict"
                         logger.info(
                             f"[Face Match] Score: {face_sim:.3f}, Person: {str(cand_id)[:8]}"
                         )
@@ -162,6 +176,7 @@ class IdentityDecisionEngine:
                         best_candidate = face_candidate
                         best_similarity = face_sim
                         used_face = True
+                        match_tier = "face_recent"
                         logger.info(
                             f"[Face Match RECENT] Score: {face_sim:.3f} "
                             f"(≥{self.settings.FACE_MATCH_THRESHOLD_RECENT}, "
@@ -169,120 +184,97 @@ class IdentityDecisionEngine:
                             f"Person: {str(cand_id)[:8]}"
                         )
 
-            # Step 2: Fallback to Body ReID matching (with face contradiction gate).
-            # skip_body_reid logic intentionally removed — high-quality face that misses
-            # in face search (cross-angle, same person) should still fall through to body
-            # ReID rather than creating a duplicate identity.
+            # Step 2: Fallback to Body ReID matching (face non-contradiction + median).
+            # Candidates from _search_similar are already UNIQUE persons — the old
+            # "2-of-3 person_id votes" gate was structurally impossible. Match on
+            # median body sim to the full gallery, with ambiguity / recent tiers.
             if not used_face and mean_embedding is not None:
-                # Search for similar embeddings using pgvector cosine distance.
-                # Candidates are now per-unique-person (deduplicated in _search_similar).
                 candidates = await self._search_similar(db, mean_embedding, top_k=5)
 
-                # ── Body consensus gate ──────────────────────────────────
-                # A single body match can be a false positive (OSNet same-person
-                # median=0.680, diff-person p90=0.534 — overlap at 0.50–0.55).
-                # Require at least 2 of the top-3 unique-identity candidates to
-                # agree AND exceed REID_MATCH_THRESHOLD before accepting.
-                body_votes: dict = {}
-                body_best_by_id: dict = {}
+                # (body_median, n_bodies, candidate_dict) for face-compatible persons
+                scored_bodies: list = []
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
                     is_recent_candidate = self._is_recent(candidate.get("last_seen_at"))
 
                     if face_embedding is not None:
-                        candidate_faces = await self._get_person_face_embeddings(db, candidate_id)
+                        candidate_faces = await self._get_person_face_embeddings(
+                            db, candidate_id
+                        )
                         if candidate_faces:
-                            best_f_sim = max(self._face_sim(f, face_embedding) for f in candidate_faces)
-                            # Face-contradiction gate. Use the stricter 0.30 (FACE_BODY_EXCLUSION_THRESHOLD)
-                            # for older candidates; relax to 0.25 (FACE_CONTRADICTION_THRESHOLD) for
-                            # recent candidates so same-visit cross-angle faces in [0.25, 0.30) don't
-                            # block the body-only recent-window path.
+                            best_f_sim = max(
+                                self._face_sim(f, face_embedding)
+                                for f in candidate_faces
+                            )
+                            # Stricter exclusion for older candidates; relax to
+                            # FACE_CONTRADICTION for recent same-visit cross-angle.
                             exclusion_bar = (
                                 self.settings.FACE_CONTRADICTION_THRESHOLD
                                 if is_recent_candidate
                                 else self.settings.FACE_BODY_EXCLUSION_THRESHOLD
                             )
                             if best_f_sim < exclusion_bar:
-                                continue  # face contradicts → skip
+                                continue
 
-                    similarity = 1.0 - candidate["distance"]
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_candidate = candidate
+                    n_bodies = await self._person_body_count(db, candidate_id)
+                    if n_bodies < 2:
+                        continue
+                    body_median = await self._person_body_median_sim(
+                        db, candidate_id, mean_embedding
+                    )
+                    if body_median is None:
+                        continue
+                    scored_bodies.append((body_median, n_bodies, candidate))
 
-                    # Collect consensus votes from top-3 unique candidates
-                    if similarity >= self.settings.REID_MATCH_THRESHOLD:
-                        body_votes[candidate_id] = body_votes.get(candidate_id, 0) + 1
-                        if candidate_id not in body_best_by_id or similarity > body_best_by_id[candidate_id]["similarity"]:
-                            body_best_by_id[candidate_id] = candidate
+                scored_bodies.sort(key=lambda x: x[0], reverse=True)
 
-                    # Stop after evaluating 3 unique candidates
-                    if len(body_votes) >= 3 or (len(body_votes) >= 2 and max(body_votes.values()) >= 2):
-                        break
+                if scored_bodies:
+                    top_med, top_n, top_cand = scored_bodies[0]
+                    ambiguous = False
+                    if len(scored_bodies) >= 2:
+                        second_med = scored_bodies[1][0]
+                        if (top_med - second_med) < self.settings.BODY_MATCH_AMBIGUITY:
+                            ambiguous = True
+                            logger.info(
+                                f"[Body Match REJECT] ambiguous medians "
+                                f"top={top_med:.3f} second={second_med:.3f} "
+                                f"gap<{self.settings.BODY_MATCH_AMBIGUITY}"
+                            )
 
-                # Apply consensus: only accept if 2+ of top-3 agree
-                consensus_id = None
-                if body_votes:
-                    max_votes = max(body_votes.values())
-                    if max_votes >= 2:
-                        # Find the ID with the most votes (and best similarity as tiebreaker)
-                        consensus_id = max(
-                            [k for k, v in body_votes.items() if v == max_votes],
-                            key=lambda k: body_best_by_id[k]["similarity"]
-                        )
-                        best_candidate = body_best_by_id[consensus_id]
-                        best_similarity = body_best_by_id[consensus_id]["similarity"]
-                        logger.info(
-                            f"[Body Consensus] {max_votes}/{min(3, len(candidates))} candidates "
-                            f"agree on ID {str(consensus_id)[:8]} (sim={best_similarity:.3f})"
-                        )
-                    else:
-                        best_candidate = None
-                        best_similarity = -1.0
-                        logger.debug(
-                            f"[Body Consensus] No consensus: top votes={body_votes}"
-                        )
-
-                # ── Recent-window single-candidate body override ────────────
-                # When the store is quiet (1-2 people in frame), the 2-of-3
-                # consensus is structurally impossible — only 1 candidate exists.
-                # Within a same-visit window the candidate pool is small AND body
-                # ReID is reliable (same clothing). Accept a single body candidate
-                # whose median body sim ≥ 0.60, candidate is recent, has ≥2 body
-                # embeddings, and whose face does NOT contradict the track's face
-                # (face exclusion already applied above, so candidates reaching
-                # here are face-compatible or faceless). This catches the
-                # cross-camera handoff / brief re-appearance cases that otherwise
-                # create duplicates. Outside the window: strict consensus only.
-                if (
-                    self.settings.ENABLE_RECENT_WINDOW_MATCHING
-                    and consensus_id is None
-                    and best_candidate is not None
-                    and self._is_recent(best_candidate.get("last_seen_at"))
-                ):
-                    cand_id = best_candidate["person_identity_id"]
-                    body_median = await self._person_body_median_sim(db, cand_id, mean_embedding)
-                    n_bodies = await self._person_body_count(db, cand_id)
-                    if (
-                        body_median is not None
-                        and body_median >= self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD
-                        and n_bodies >= 2
-                    ):
-                        best_similarity = body_median  # report the median we actually gated on
-                        logger.info(
-                            f"[Body RECENT single] ID {str(cand_id)[:8]} body_median={body_median:.3f} "
-                            f"≥{self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD} (n_bodies={n_bodies}, "
-                            f"window={self.settings.RECENT_WINDOW_MINUTES}min) — accepting without consensus"
-                        )
-                        # used_face stays False — body-only match, demoted to non-confident downstream
-                    else:
-                        # Recent candidate but body evidence insufficient → reject
-                        best_candidate = None
-                        best_similarity = -1.0
-                        logger.debug(
-                            f"[Body RECENT] candidate {str(cand_id)[:8]} body_median={body_median} "
-                            f"n_bodies={n_bodies} — below recent body bar, rejected"
-                        )
+                    if not ambiguous:
+                        is_recent_top = self._is_recent(top_cand.get("last_seen_at"))
+                        # Strict (any age): median ≥ REID_MATCH_THRESHOLD
+                        if top_med >= self.settings.REID_MATCH_THRESHOLD:
+                            best_candidate = top_cand
+                            best_similarity = top_med
+                            match_tier = "body"
+                            logger.info(
+                                f"[Body Match] ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"body_median={top_med:.3f} ≥{self.settings.REID_MATCH_THRESHOLD} "
+                                f"(n_bodies={top_n})"
+                            )
+                        # Recent-window relaxed: slightly lower bar, same clothing
+                        elif (
+                            self.settings.ENABLE_RECENT_WINDOW_MATCHING
+                            and is_recent_top
+                            and top_med >= self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD
+                        ):
+                            best_candidate = top_cand
+                            best_similarity = top_med
+                            match_tier = "body_recent"
+                            logger.info(
+                                f"[Body RECENT single] ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"body_median={top_med:.3f} "
+                                f"≥{self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD} "
+                                f"(n_bodies={top_n}, "
+                                f"window={self.settings.RECENT_WINDOW_MINUTES}min)"
+                            )
+                        else:
+                            logger.debug(
+                                f"[Body Match] top ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"median={top_med:.3f} n_bodies={top_n} recent={is_recent_top} "
+                                f"— below body bars"
+                            )
 
             # Step 2b: Staff reattach — last resort before create-new.
             # Staff-only, recent window, strong body median. Soft face floor only
@@ -294,9 +286,7 @@ class IdentityDecisionEngine:
                 and not used_face
                 and mean_embedding is not None
             ):
-                provisional_threshold = (
-                    self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
-                )
+                provisional_threshold = self._accept_threshold(match_tier, used_face)
                 needs_staff = (
                     best_candidate is None
                     or best_similarity < provisional_threshold
@@ -309,10 +299,13 @@ class IdentityDecisionEngine:
                         best_candidate = staff_hit
                         best_similarity = staff_hit["similarity"]
                         staff_drop_face = bool(staff_hit.get("drop_face", False))
+                        match_tier = "staff_reattach"
 
             # ── Same-camera temporal overlap gate ────────────────────────
             # Reject match if candidate already has another concurrent track
             # on THIS camera (exclude our own track_session_id so self-refine works).
+            # After reject: do NOT create a new person (clone factory) — leave
+            # unassigned so a later frame / close resolve can re-try.
             if (
                 best_candidate is not None
                 and self.settings.ENABLE_SAME_CAMERA_OVERLAP_GATE
@@ -329,16 +322,36 @@ class IdentityDecisionEngine:
                     logger.info(
                         f"[SAME_CAM OVERLAP REJECT] person={str(cand_pid)[:8]} "
                         f"cam={str(camera_id)[:8]} probe={probe_start}→{probe_end} "
-                        f"sim={best_similarity:.3f} used_face={used_face} — "
-                        f"candidate already has concurrent track on this camera"
+                        f"sim={best_similarity:.3f} used_face={used_face} tier={match_tier} — "
+                        f"candidate already has concurrent track on this camera "
+                        f"(create will be suppressed)"
                     )
                     best_candidate = None
                     best_similarity = -1.0
                     used_face = False
                     staff_drop_face = False
+                    match_tier = None
+                    same_cam_blocked = True
 
             confidence_limit = self.settings.REID_CONFIDENCE_LIMIT  # 0.75
-            required_threshold = self.settings.FACE_MATCH_THRESHOLD if used_face else self.settings.REID_MATCH_THRESHOLD
+            required_threshold = self._accept_threshold(match_tier, used_face)
+
+            # Stale-match gate: concurrent delete (reextract/dedup) can remove a person
+            # between search and store — bail before write (P5).
+            if best_candidate is not None and best_similarity >= required_threshold:
+                cand_pid = best_candidate["person_identity_id"]
+                if not await self._person_exists(db, cand_pid, for_share=True):
+                    logger.info(
+                        f"[MATCH STALE] person={str(cand_pid)[:8]} tier={match_tier} "
+                        f"sim={best_similarity:.3f} — gone before attach"
+                    )
+                    best_candidate = None
+                    best_similarity = -1.0
+                    used_face = False
+                    staff_drop_face = False
+                    match_tier = None
+                    match_stale_blocked = True
+                    required_threshold = self._accept_threshold(match_tier, used_face)
 
             # CASE 1: Initial resolution (no current_person_id assigned yet)
             if current_person_id is None:
@@ -347,16 +360,35 @@ class IdentityDecisionEngine:
                     raw_confident = (best_similarity >= confidence_limit)
                     # Demote body-only matches: only mark confident if face matched
                     is_confident = raw_confident and used_face
-                    
-                    # Update person last seen / visit count
-                    await self._update_person(db, person_id)
-                    # Store this embedding
-                    await self._store_embedding(
-                        db, person_id, mean_embedding, camera_id, crop_quality_score, crop_path
-                    )
-                    if face_embedding is not None and face_score > 0 and not staff_drop_face:
-                        await self._store_face_embedding(db, person_id, face_embedding, camera_id, face_score, face_crop_path)
-                    elif staff_drop_face and face_embedding is not None:
+
+                    try:
+                        ok = await self._attach_embeddings(
+                            db,
+                            person_id,
+                            mean_embedding,
+                            camera_id,
+                            crop_quality_score,
+                            crop_path,
+                            face_embedding if (face_embedding is not None and face_score > 0 and not staff_drop_face) else None,
+                            face_score,
+                            face_crop_path,
+                            bump_visit=True,
+                        )
+                    except IdentityStoreError as e:
+                        logger.error(
+                            f"[Identity FAIL] reason=PERSISTENCE person={str(person_id)[:8]} err={e}"
+                        )
+                        # Leave unassigned — do NOT create a clone after store FK
+                        return None, 0.0, False, False, None
+
+                    if not ok:
+                        logger.info(
+                            f"[MATCH STALE] attach aborted person={str(person_id)[:8]} "
+                            f"tier={match_tier}"
+                        )
+                        return None, 0.0, False, False, None
+
+                    if staff_drop_face and face_embedding is not None:
                         logger.info(
                             f"[Staff REATTACH] face DROPPED (low sim vs staff gallery) "
                             f"person={str(person_id)[:8]}"
@@ -365,20 +397,40 @@ class IdentityDecisionEngine:
                     logger.info(
                         f"[Initial ReID] Matched track to existing person ID {person_id} "
                         f"with score {best_similarity:.3f} (used_face={used_face}, "
+                        f"tier={match_tier}, thr={required_threshold:.3f}, "
                         f"staff_reattach_drop_face={staff_drop_face})"
                     )
                     return person_id, best_similarity, is_confident, False, None
                 else:
+                    # SAME_CAM / STALE match must not spawn clone identities
+                    if same_cam_blocked:
+                        logger.info(
+                            f"[SAME_CAM] create suppressed "
+                            f"(cam={str(camera_id)[:8]} best_sim_was_wiped)"
+                        )
+                        return None, 0.0, False, False, None
+                    if match_stale_blocked:
+                        logger.info(
+                            f"[MATCH STALE] create suppressed "
+                            f"(cam={str(camera_id)[:8]} winner gone before attach)"
+                        )
+                        return None, 0.0, False, False, None
                     # Create new anonymous person
                     person_id = await self._create_new_person(
                         db, mean_embedding, camera_id, crop_quality_score, crop_path,
                         face_embedding, face_score, face_crop_path, good_face_count
                     )
                     if person_id is None:
-                        logger.info("[Initial ReID] Identity creation blocked (face quality gate).")
+                        logger.info(
+                            "[Initial ReID] Identity creation blocked (face quality gate)."
+                        )
                         return None, 0.0, False, False, None
                         
-                    logger.info(f"[Initial ReID] Created new anonymous person ID {person_id} (best score: {best_similarity:.3f} < {required_threshold})")
+                    logger.info(
+                        f"[Initial ReID] Created new anonymous person ID {person_id} "
+                        f"(best score: {best_similarity:.3f} < {required_threshold}, "
+                        f"tier={match_tier})"
+                    )
                     return person_id, 0.0, False, True, None
 
             # CASE 2: Refinement of an existing identity
@@ -401,29 +453,61 @@ class IdentityDecisionEngine:
                         best_candidate = None
                         best_similarity = -1.0
                         used_face = False
+                        match_tier = None
+                        required_threshold = self._accept_threshold(match_tier, used_face)
 
                     if best_candidate and matched_id is not None and best_similarity >= required_threshold:
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
                             await self._delete_person(db, prune_old_id, matched_id)
                         
-                        is_confident = (best_similarity >= confidence_limit)
-                        await self._update_person(db, matched_id)
-                        await self._store_embedding(
-                            db, matched_id, mean_embedding, camera_id, crop_quality_score, crop_path
+                        is_confident = (best_similarity >= confidence_limit) and used_face
+                        try:
+                            ok = await self._attach_embeddings(
+                                db,
+                                matched_id,
+                                mean_embedding,
+                                camera_id,
+                                crop_quality_score,
+                                crop_path,
+                                face_embedding if (face_embedding is not None and face_score > 0 and not staff_drop_face) else None,
+                                face_score,
+                                face_crop_path,
+                                bump_visit=True,
+                            )
+                        except IdentityStoreError as e:
+                            logger.error(
+                                f"[Identity FAIL] reason=PERSISTENCE contradiction-switch "
+                                f"person={str(matched_id)[:8]} err={e}"
+                            )
+                            return current_person_id if not is_temporary else None, previous_score, False, False, None
+                        if not ok:
+                            return current_person_id, previous_score, False, False, None
+                        logger.info(
+                            f"[ReID Refined] Identity switched due to contradiction: "
+                            f"{current_person_id} -> {matched_id} "
+                            f"(score: {best_similarity:.3f}, used_face={used_face}, tier={match_tier})"
                         )
-                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
-                            await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
-                        logger.info(f"[ReID Refined] Identity switched due to contradiction: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, used_face={used_face})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
                     else:
+                        # No other match — suppress create after same-cam wipe
+                        if same_cam_blocked:
+                            logger.info(
+                                f"[SAME_CAM] create suppressed on contradiction path "
+                                f"person={str(current_person_id)[:8]}"
+                            )
+                            prune_old_id = current_person_id if is_temporary else None
+                            return None, 0.0, False, False, prune_old_id
                         # No other match found; create a new person ID entirely
                         new_pid = await self._create_new_person(
                             db, mean_embedding, camera_id, crop_quality_score, crop_path,
                             face_embedding, face_score, face_crop_path, good_face_count
                         )
                         if new_pid is None:
-                            logger.info("[ReID Refined] Contradiction occurred but couldn't create new ID (face quality gate). Returning None.")
+                            logger.info(
+                                "[ReID Refined] Contradiction occurred but couldn't create "
+                                "new ID (face quality gate). Returning None."
+                            )
                             prune_old_id = current_person_id if is_temporary else None
                             return None, 0.0, False, False, prune_old_id
                             
@@ -460,11 +544,15 @@ class IdentityDecisionEngine:
                                 f"[ReID Refined] Skipping identity switch for track (quality={crop_quality_score:.2f} < {self.settings.REID_MIN_QUALITY_FOR_SWITCH})"
                             )
                             # Still store the embedding to refine the current identity's signature
-                            await self._store_embedding(
-                                db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
-                            )
-                            if face_embedding is not None and face_score > 0:
-                                await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
+                            try:
+                                await self._attach_embeddings(
+                                    db, current_person_id, mean_embedding, camera_id,
+                                    crop_quality_score, crop_path,
+                                    face_embedding if (face_embedding is not None and face_score > 0) else None,
+                                    face_score, face_crop_path, bump_visit=False,
+                                )
+                            except IdentityStoreError:
+                                pass
                             return current_person_id, best_similarity, False, False, None
 
                         # We are switching identities!
@@ -484,23 +572,46 @@ class IdentityDecisionEngine:
                             
                         raw_confident = (best_similarity >= confidence_limit)
                         is_confident = raw_confident and used_face
-                        await self._update_person(db, matched_id)
-                        await self._store_embedding(
-                            db, matched_id, mean_embedding, camera_id, crop_quality_score, crop_path
-                        )
-                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
-                            await self._store_face_embedding(db, matched_id, face_embedding, camera_id, face_score, face_crop_path)
+                        try:
+                            ok = await self._attach_embeddings(
+                                db,
+                                matched_id,
+                                mean_embedding,
+                                camera_id,
+                                crop_quality_score,
+                                crop_path,
+                                face_embedding if (face_embedding is not None and face_score > 0 and not staff_drop_face) else None,
+                                face_score,
+                                face_crop_path,
+                                bump_visit=True,
+                            )
+                        except IdentityStoreError as e:
+                            logger.error(
+                                f"[Identity FAIL] reason=PERSISTENCE switch "
+                                f"person={str(matched_id)[:8]} err={e}"
+                            )
+                            return current_person_id, previous_score, False, False, None
+                        if not ok:
+                            return current_person_id, previous_score, False, False, None
                         logger.info(f"[ReID Refined] Identity switched: {current_person_id} -> {matched_id} (score: {best_similarity:.3f}, quality={crop_quality_score:.2f}, used_face={used_face})")
                         return matched_id, best_similarity, is_confident, False, prune_old_id
                     else:
                         # Same ID, but score upgraded
                         raw_confident = (best_similarity >= confidence_limit)
                         is_confident = raw_confident and used_face
-                        await self._store_embedding(
-                            db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
-                        )
-                        if face_embedding is not None and face_score > 0 and not staff_drop_face:
-                            await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
+                        try:
+                            await self._attach_embeddings(
+                                db, current_person_id, mean_embedding, camera_id,
+                                crop_quality_score, crop_path,
+                                face_embedding if (face_embedding is not None and face_score > 0 and not staff_drop_face) else None,
+                                face_score, face_crop_path, bump_visit=False,
+                            )
+                        except IdentityStoreError as e:
+                            logger.error(
+                                f"[Identity FAIL] reason=PERSISTENCE refine "
+                                f"person={str(current_person_id)[:8]} err={e}"
+                            )
+                            return current_person_id, previous_score, False, False, None
                         new_score = max(previous_score, best_similarity)
                         if new_score > previous_score:
                             logger.info(f"[ReID Refined] Score upgraded for ID {current_person_id}: {previous_score:.3f} -> {new_score:.3f}")
@@ -508,26 +619,101 @@ class IdentityDecisionEngine:
                 else:
                     # No better match found. If this is a temporary/unconfident ID, refine its signature
                     if is_temporary:
-                        await self._store_embedding(
-                            db, current_person_id, mean_embedding, camera_id, crop_quality_score, crop_path
-                        )
+                        try:
+                            await self._attach_embeddings(
+                                db, current_person_id, mean_embedding, camera_id,
+                                crop_quality_score, crop_path, None, 0.0, None, bump_visit=False,
+                            )
+                        except IdentityStoreError:
+                            pass
                         logger.debug(f"[ReID Refined] Refined embedding signature for temporary ID {current_person_id}")
                     if face_embedding is not None and face_score > 0:
-                        await self._store_face_embedding(db, current_person_id, face_embedding, camera_id, face_score, face_crop_path)
+                        try:
+                            await self._store_face_embedding(
+                                db, current_person_id, face_embedding, camera_id, face_score, face_crop_path
+                            )
+                        except IdentityStoreError:
+                            pass
                     return current_person_id, previous_score, False, False, None
 
-        except Exception as e:
-            logger.error(f"Identity decision failed: {e}")
+        except IdentityStoreError as e:
+            logger.error(f"[Identity FAIL] reason=PERSISTENCE outer err={e}")
             if current_person_id is not None:
                 return current_person_id, previous_score, False, False, None
-            # Fallback
-            person_id = await self._create_new_person(
-                db, mean_embedding, camera_id, crop_quality_score, crop_path,
-                face_embedding, face_score, face_crop_path, good_face_count
+            return None, 0.0, False, False, None
+        except Exception as e:
+            logger.error(f"Identity decision failed: {e}")
+            # Do NOT create-on-fallback after a poison session — leave unassigned / keep current
+            if current_person_id is not None:
+                return current_person_id, previous_score, False, False, None
+            return None, 0.0, False, False, None
+
+    async def _person_exists(
+        self, db: AsyncSession, person_id, for_share: bool = False
+    ) -> bool:
+        """True if person_identities row exists. Optional FOR SHARE holds until txn end."""
+        if person_id is None:
+            return False
+        lock = " FOR SHARE" if for_share else ""
+        try:
+            r = await db.execute(
+                text(
+                    f"SELECT 1 FROM person_identities "
+                    f"WHERE id = CAST(:pid AS uuid){lock}"
+                ),
+                {"pid": str(person_id)},
             )
-            if person_id is None:
-                return None, 0.0, False, False, None
-            return person_id, 0.0, False, True, None
+            return r.scalar() is not None
+        except Exception as e:
+            logger.debug(f"_person_exists failed for {person_id}: {e}")
+            return False
+
+    async def _attach_embeddings(
+        self,
+        db: AsyncSession,
+        person_id: uuid.UUID,
+        mean_embedding: Optional[np.ndarray],
+        camera_id: uuid.UUID,
+        crop_quality_score: float,
+        crop_path: Optional[str],
+        face_embedding: Optional[np.ndarray],
+        face_score: float,
+        face_crop_path: Optional[str],
+        bump_visit: bool,
+    ) -> bool:
+        """Update person + store body/face under a SAVEPOINT. Returns False if person gone.
+
+        Raises IdentityStoreError only if the outer session is poisoned after
+        nested failure without recovery (should not happen with begin_nested).
+        """
+        try:
+            async with db.begin_nested():
+                if not await self._person_exists(db, person_id, for_share=True):
+                    logger.info(
+                        f"[STORE SKIP] reason=PERSON_GONE person={str(person_id)[:8]}"
+                    )
+                    return False
+                if bump_visit:
+                    ok = await self._update_person(db, person_id)
+                    if not ok:
+                        return False
+                if mean_embedding is not None:
+                    await self._store_embedding(
+                        db, person_id, mean_embedding, camera_id, crop_quality_score, crop_path
+                    )
+                if face_embedding is not None and face_score > 0:
+                    await self._store_face_embedding(
+                        db, person_id, face_embedding, camera_id, face_score, face_crop_path
+                    )
+            return True
+        except IdentityStoreError:
+            raise
+        except (IntegrityError, DBAPIError, InvalidRequestError) as e:
+            logger.error(
+                f"[STORE FAIL] person={str(person_id)[:8]} err={type(e).__name__}: {e}"
+            )
+            # SAVEPOINT rolled back by begin_nested exit — raise typed for callers
+            raise IdentityStoreError(str(e)) from e
 
     async def _search_similar(
         self, db: AsyncSession, embedding: np.ndarray, top_k: int
@@ -676,6 +862,27 @@ class IdentityDecisionEngine:
             return []
 
     # ── Recent-window matching helpers (plan 2026-07-09) ────────────────────
+    def _accept_threshold(self, match_tier: Optional[str], used_face: bool) -> float:
+        """Threshold CASE1/2 must clear for the chosen match tier.
+
+        Recent face (0.35–0.40) was accepted in Step 1 then rejected here when
+        this always used FACE_MATCH_THRESHOLD (0.40). Body/staff tiers use the
+        median gate already applied against their respective bars.
+        """
+        if match_tier == "face_recent":
+            return float(self.settings.FACE_MATCH_THRESHOLD_RECENT)
+        if match_tier == "face_strict":
+            return float(self.settings.FACE_MATCH_THRESHOLD)
+        if match_tier == "body_recent":
+            return float(self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD)
+        if match_tier == "body":
+            return float(self.settings.REID_MATCH_THRESHOLD)
+        if match_tier == "staff_reattach":
+            return float(self.settings.STAFF_REATTACH_BODY_MEDIAN)
+        if used_face:
+            return float(self.settings.FACE_MATCH_THRESHOLD)
+        return float(self.settings.REID_MATCH_THRESHOLD)
+
     def _is_recent(self, last_seen_at) -> bool:
         """True if a candidate's last_seen_at is within RECENT_WINDOW_MINUTES.
 
@@ -1041,8 +1248,8 @@ class IdentityDecisionEngine:
                 return False
         return True
 
-    async def _update_person(self, db: AsyncSession, person_id: uuid.UUID):
-        """Update existing person's last_seen and visit count."""
+    async def _update_person(self, db: AsyncSession, person_id: uuid.UUID) -> bool:
+        """Update last_seen and visit count. Returns False if person row is gone."""
         result = await db.execute(
             select(PersonIdentity).where(PersonIdentity.id == person_id)
         )
@@ -1050,6 +1257,9 @@ class IdentityDecisionEngine:
         if person:
             person.last_seen_at = utc_now()
             person.visit_count += 1
+            return True
+        logger.info(f"[STORE SKIP] reason=PERSON_GONE_UPDATE person={str(person_id)[:8]}")
+        return False
 
     # Maximum stored embeddings per identity; lowest-quality extras are pruned
     MAX_EMBEDDINGS_PER_PERSON = 10
@@ -1062,7 +1272,7 @@ class IdentityDecisionEngine:
         camera_id: uuid.UUID,
         crop_quality_score: float,
         crop_path: Optional[str],
-    ):
+    ) -> bool:
         """Store a new embedding for an existing person (capped per identity).
 
         Body contamination gate: if this person already has >=3 stored body
@@ -1071,12 +1281,17 @@ class IdentityDecisionEngine:
         reject it — it belongs to a different person whose body ReID falsely
         matched. Uses median instead of min to avoid single-edge false positives
         (OSNet chains different-person clusters via weak edges around 0.66-0.75).
+
+        Returns False if person gone / contamination. Raises IdentityStoreError on FK flush fail.
         """
         if embedding is None:
-            return
+            return True
+
+        if not await self._person_exists(db, person_id, for_share=False):
+            logger.info(f"[STORE SKIP] reason=PERSON_GONE body person={str(person_id)[:8]}")
+            return False
 
         # ── Body contamination gate ───────────────────────────────────────
-        import numpy as np
         new_emb = np.array(embedding.tolist(), dtype=np.float32)
         existing_body = await db.execute(text(
             "SELECT embedding FROM person_embeddings"
@@ -1103,7 +1318,7 @@ class IdentityDecisionEngine:
                     f"samples={[f'{s:.3f}' for s in sorted(sims)[:5]]} "
                     f"(different person's body — OSNet false positive)"
                 )
-                return
+                return False
 
         emb = PersonEmbedding(
             person_identity_id=person_id,
@@ -1113,9 +1328,16 @@ class IdentityDecisionEngine:
             crop_path=crop_path,
             captured_at=utc_now(),
         )
-        db.add(emb)
-        await db.flush()
-        await self._prune_embeddings(db, person_id)
+        try:
+            db.add(emb)
+            await db.flush()
+            await self._prune_embeddings(db, person_id)
+            return True
+        except (IntegrityError, DBAPIError) as e:
+            logger.error(
+                f"[STORE FAIL] body emb person={str(person_id)[:8]} err={e}"
+            )
+            raise IdentityStoreError(str(e)) from e
 
     async def _store_face_embedding(
         self,
@@ -1125,7 +1347,7 @@ class IdentityDecisionEngine:
         camera_id: uuid.UUID,
         face_score: float,
         face_crop_path: Optional[str],
-    ):
+    ) -> bool:
         """Store a face embedding. Keeps up to MAX_FACE_EMBEDDINGS_PER_PERSON per identity.
 
         Multiple face embeddings per person capture different angles and lighting
@@ -1135,7 +1357,13 @@ class IdentityDecisionEngine:
         the existing row's score and embedding are updated (upgraded if the new score
         is higher) instead of creating a redundant row.  This prevents the per-window
         accumulation pipeline from inserting the same crop 5+ times.
+
+        Returns False on person gone; raises IdentityStoreError on FK / flush fail.
         """
+        if not await self._person_exists(db, person_id, for_share=False):
+            logger.info(f"[STORE SKIP] reason=PERSON_GONE face person={str(person_id)[:8]}")
+            return False
+
         try:
             from app.core.db.models.person import PersonFaceEmbedding
 
@@ -1151,13 +1379,17 @@ class IdentityDecisionEngine:
                     existing_score = float(existing_row[1]) if existing_row[1] else 0.0
                     if face_score > existing_score:
                         # Upgrade the existing row's score + embedding
+                        _face_emb = face_embedding
+                        _norm = np.linalg.norm(face_embedding)
+                        if _norm > 0:
+                            _face_emb = face_embedding / _norm
                         await db.execute(text(
                             "UPDATE person_face_embeddings"
                             " SET face_score = :score, embedding = :emb, captured_at = NOW()"
                             " WHERE id = :row_id"
                         ), {
                             "score": face_score,
-                            "emb": face_embedding.tolist(),
+                            "emb": _face_emb.tolist(),
                             "row_id": existing_row[0],
                         })
                         logger.debug(
@@ -1169,7 +1401,7 @@ class IdentityDecisionEngine:
                             f"Skipped duplicate face embedding for person {person_id} "
                             f"(path already stored, score {existing_score:.3f} ≥ {face_score:.3f})"
                         )
-                    return
+                    return True
 
             # ── Contamination gate ──────────────────────────────────────────
             # If existing face embeddings for this person form a cluster, the
@@ -1185,7 +1417,6 @@ class IdentityDecisionEngine:
             ), {"pid": str(person_id)})
             existing_faces = existing_result.fetchall()
             if existing_faces:
-                import numpy as np
                 new_emb = np.array(face_embedding.tolist(), dtype=np.float32)
                 min_sim = float('inf')
                 for row in existing_faces:
@@ -1200,24 +1431,19 @@ class IdentityDecisionEngine:
                 if min_sim < self.settings.FACE_CONTAMINATION_THRESHOLD:
                     logger.warning(
                         f"Face embedding CONTAMINATION rejected for person {person_id}: "
-                        f"min_sim_to_existing={min_sim:.3f} < "
-                        f"{self.settings.FACE_CONTAMINATION_THRESHOLD} (different person's face)"
+                        f"min_sim_to_cluster={min_sim:.3f} < "
+                        f"{self.settings.FACE_CONTAMINATION_THRESHOLD}"
                     )
-                    return  # skip — this face doesn't belong to this person
+                    return False
 
-            # Normalize the face embedding before storing so future comparisons
-            # can use raw np.dot() as cosine similarity.  Existing DB rows that
-            # were stored before this fix are handled by the migration script
-            # (danger/normalize_face_embeddings.py) and by _face_sim() which
-            # normalizes at comparison time as a safety net.
-            _face_emb_to_store = face_embedding
+            _face_emb = face_embedding
             _norm = np.linalg.norm(face_embedding)
             if _norm > 0:
-                _face_emb_to_store = face_embedding / _norm
+                _face_emb = face_embedding / _norm
 
             face_emb = PersonFaceEmbedding(
                 person_identity_id=person_id,
-                embedding=_face_emb_to_store.tolist(),
+                embedding=_face_emb.tolist(),
                 camera_id=camera_id,
                 face_score=face_score,
                 face_crop_path=face_crop_path,
@@ -1226,8 +1452,18 @@ class IdentityDecisionEngine:
             db.add(face_emb)
             await db.flush()
             await self._prune_face_embeddings(db, person_id)
+            return True
+        except (IntegrityError, DBAPIError) as e:
+            logger.error(
+                f"[STORE FAIL] face emb person={str(person_id)[:8]} err={e}"
+            )
+            raise IdentityStoreError(str(e)) from e
+        except IdentityStoreError:
+            raise
         except Exception as e:
+            # Non-FK errors (e.g. type errors) — do not swallow into silent poison
             logger.error(f"Failed to store face embedding: {e}")
+            raise IdentityStoreError(str(e)) from e
 
     async def _prune_face_embeddings(self, db: AsyncSession, person_id: uuid.UUID):
         """Keep only the best-quality K face embeddings per identity.
@@ -1349,20 +1585,25 @@ class IdentityDecisionEngine:
         3. At least FACE_IDENTITY_MIN_DETECTIONS good face captures across the track.
         """
         if self.settings.REQUIRE_FACE_FOR_IDENTITY and face_embedding is None:
-            logger.debug(f"[_create_new_person] Blocked: REQUIRE_FACE_FOR_IDENTITY is True, but no face detected on camera {camera_id}.")
+            logger.info(
+                f"[CREATE BLOCKED] reason=NO_FACE camera={str(camera_id)[:8]}"
+            )
             return None
 
         if face_score < self.settings.FACE_IDENTITY_MIN_SCORE:
-            logger.debug(
-                f"[_create_new_person] Blocked: face score {face_score:.3f} < "
-                f"FACE_IDENTITY_MIN_SCORE ({self.settings.FACE_IDENTITY_MIN_SCORE})"
+            logger.info(
+                f"[CREATE BLOCKED] reason=LOW_SCORE score={face_score:.3f} "
+                f"< FACE_IDENTITY_MIN_SCORE={self.settings.FACE_IDENTITY_MIN_SCORE} "
+                f"camera={str(camera_id)[:8]}"
             )
             return None
 
         if good_face_count < self.settings.FACE_IDENTITY_MIN_DETECTIONS:
-            logger.debug(
-                f"[_create_new_person] Blocked: good_face_count {good_face_count} < "
-                f"FACE_IDENTITY_MIN_DETECTIONS ({self.settings.FACE_IDENTITY_MIN_DETECTIONS})"
+            logger.info(
+                f"[CREATE BLOCKED] reason=LOW_GOOD_COUNT "
+                f"good_face_count={good_face_count} "
+                f"< FACE_IDENTITY_MIN_DETECTIONS={self.settings.FACE_IDENTITY_MIN_DETECTIONS} "
+                f"camera={str(camera_id)[:8]}"
             )
             return None
 

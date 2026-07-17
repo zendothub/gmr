@@ -773,23 +773,29 @@ class CameraWorker:
                 and track.good_face_count >= self.settings.FACE_IDENTITY_MIN_DETECTIONS
                 and self.identity_engine):
             try:
-                person_id, score, is_confident, is_new, _ = await self.identity_engine.decide_identity(
-                    db=db,
-                    mean_embedding=track.best_body_embedding,
-                    camera_id=self.camera_id,
-                    crop_quality_score=track.best_crop_quality,
-                    crop_path=track.best_crop_path,
-                    current_person_id=None,
-                    previous_score=0.0,
-                    is_temporary=False,
-                    face_embedding=track.best_face_embedding,
-                    face_score=track.best_face_score_for_id,
-                    face_crop_path=track.best_face_crop_path_for_id,
-                    good_face_count=track.good_face_count,
-                    face_embedding_list=track.face_embedding_list,
-                    track_started_at=track.started_at,
-                    track_session_id=track.track_session_id,
-                )
+                person_id, score, is_confident, is_new, _ = None, 0.0, False, False, None
+                try:
+                    async with db.begin_nested():
+                        person_id, score, is_confident, is_new, _ = await self.identity_engine.decide_identity(
+                            db=db,
+                            mean_embedding=track.best_body_embedding,
+                            camera_id=self.camera_id,
+                            crop_quality_score=track.best_crop_quality,
+                            crop_path=track.best_crop_path,
+                            current_person_id=None,
+                            previous_score=0.0,
+                            is_temporary=False,
+                            face_embedding=track.best_face_embedding,
+                            face_score=track.best_face_score_for_id,
+                            face_crop_path=track.best_face_crop_path_for_id,
+                            good_face_count=track.good_face_count,
+                            face_embedding_list=track.face_embedding_list,
+                            track_started_at=track.started_at,
+                            track_session_id=track.track_session_id,
+                        )
+                except Exception as e:
+                    logger.error(f"Close-track decide_identity savepoint failed: {e}")
+                    person_id = None
                 if person_id is not None:
                     track.person_identity_id = person_id
                     track.reid_score = score
@@ -815,9 +821,10 @@ class CameraWorker:
                             if sim_to_best > 0.95:
                                 continue
                         try:
-                            await self.identity_engine._store_face_embedding(
-                                db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
-                            )
+                            async with db.begin_nested():
+                                await self.identity_engine._store_face_embedding(
+                                    db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
+                                )
                         except Exception as e:
                             logger.warning(f"Failed to store face embedding on close: {e}")
 
@@ -1474,23 +1481,33 @@ class CameraWorker:
                     f"is_temp={is_temp}"
                 )
 
-                person_id, score, is_confident, is_new, prune_old_id = await self.identity_engine.decide_identity(
-                    db=db,
-                    mean_embedding=selected_embedding,
-                    camera_id=self.camera_id,
-                    crop_quality_score=best_quality,
-                    crop_path=best_crop_path,
-                    current_person_id=track.person_identity_id,
-                    previous_score=track.reid_score,
-                    is_temporary=is_temp,
-                    face_embedding=track.best_face_embedding,
-                    face_score=track.best_face_score_for_id,
-                    face_crop_path=track.best_face_crop_path_for_id,
-                    good_face_count=track.good_face_count,
-                    face_embedding_list=track.face_embedding_list,
-                    track_started_at=track.started_at,
-                    track_session_id=track.track_session_id,
-                )
+                # SAVEPOINT: identity persistence FK races must not poison batch txn
+                try:
+                    async with db.begin_nested():
+                        person_id, score, is_confident, is_new, prune_old_id = await self.identity_engine.decide_identity(
+                            db=db,
+                            mean_embedding=selected_embedding,
+                            camera_id=self.camera_id,
+                            crop_quality_score=best_quality,
+                            crop_path=best_crop_path,
+                            current_person_id=track.person_identity_id,
+                            previous_score=track.reid_score,
+                            is_temporary=is_temp,
+                            face_embedding=track.best_face_embedding,
+                            face_score=track.best_face_score_for_id,
+                            face_crop_path=track.best_face_crop_path_for_id,
+                            good_face_count=track.good_face_count,
+                            face_embedding_list=track.face_embedding_list,
+                            track_started_at=track.started_at,
+                            track_session_id=track.track_session_id,
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Track {track.local_track_id}: decide_identity savepoint failed: {e}"
+                    )
+                    person_id, score, is_confident, is_new, prune_old_id = (
+                        track.person_identity_id, track.reid_score, track.reid_confident, False, None
+                    )
 
                 if is_new:
                     self.temporary_person_ids.add(person_id)
@@ -1525,9 +1542,10 @@ class CameraWorker:
                             if sim_to_best > 0.95:
                                 continue
                         try:
-                            await self.identity_engine._store_face_embedding(
-                                db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
-                            )
+                            async with db.begin_nested():
+                                await self.identity_engine._store_face_embedding(
+                                    db, person_id_uuid, face_emb, self.camera_id, face_scr, face_crp
+                                )
                             stored_count += 1
                         except Exception as e:
                             logger.warning(f"Failed to store additional face embedding: {e}")

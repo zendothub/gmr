@@ -141,6 +141,12 @@ async def run():
 
             if not face_found:
                 # ── 3. Delete the faceless person ───────────────────────────
+                # Take the SAME advisory lock as live decide_identity so we never
+                # DELETE a person_id that a camera worker is mid-store attaching to
+                # (FK race → session poison storm). See CONTEXT.md issue #26 / P5.
+                from app.modules.reid.identity_decision_engine import IDENTITY_ADVISORY_LOCK_KEY
+                await db.execute(text(f"SELECT pg_advisory_xact_lock({IDENTITY_ADVISORY_LOCK_KEY})"))
+
                 logger.warning(
                     f"Person {pid[:12]}: no face found in {len(crops)} crop(s) — deleting person"
                 )

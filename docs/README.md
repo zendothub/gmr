@@ -106,6 +106,7 @@ Frame N+5 (ReID window fires):
   ├── Step 2: BODY ReID (fallback, with face contradiction gate)
   │   │
   │   │  search_similar() → top-5 unique-person body candidates
+  │   │  (then median vs that person's FULL body gallery, n_bodies ≥ 2)
   │   │
   │   │  For each candidate:
   │   │    ├── Face exclusion gate:
@@ -113,12 +114,12 @@ Frame N+5 (ReID window fires):
   │   │    │     older candidate:            bar = 0.30 (strict)
   │   │    │     face_sim < bar → SKIP (face contradicts body)
   │   │    │
-  │   │    └── Collect consensus votes (body_sim >= 0.50)
+  │   │    └── Score body_median to gallery
   │   │
-  │   ├── 2-of-3 consensus reached?
-  │   │     → MATCH (strict, non-confident)
+  │   ├── Top body_median ≥ 0.50 AND not ambiguous vs 2nd?
+  │   │     → MATCH (strict body, non-confident)  [Body Match]
   │   │
-  │   └── Recent single-candidate override:
+  │   └── Else recent override:
   │         candidate last_seen within 5 min?
   │         body_median >= 0.55 AND >= 2 body embeddings?
   │           → MATCH (recent body-only, non-confident)
@@ -126,6 +127,7 @@ Frame N+5 (ReID window fires):
   │
   └── No face or body match?
         → CREATE NEW PERSON (requires face: score >= 0.60, >= 2 good faces)
+        (SAME_CAM reject / MATCH STALE → no create; leave unassigned)
 ```
 
 **Key thresholds:**

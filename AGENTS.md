@@ -6,7 +6,7 @@
 
 ## First Action: Read CONTEXT.md
 
-**Before ANY code change, debugging, or analysis, read `/gmr/CONTEXT.md`.** This file contains:
+**Before ANY code change, debugging, or analysis, read `CONTEXT.md` (repo root `/gmr/gmr/CONTEXT.md`, or host `/gmr/CONTEXT.md` if mirrored).** This file contains:
 
 - The complete project architecture and AI pipeline
 - All model choices and why they were made (SigLIP2 face+margin for gender, InsightFace genderage median for age, etc.)
@@ -35,15 +35,17 @@
 
 6. **Keep CONTEXT.md updated** — After any significant change (new model, threshold adjustment, architectural decision), update CONTEXT.md with the rationale, data, and date.
 
-7. **Recent-window matching is feature-flagged** — `ENABLE_RECENT_WINDOW_MATCHING` in `config.py`. Body-only merge (no usable face) is valid ONLY within the 5-min window (`RECENT_WINDOW_MINUTES`). Outside it, strict 0.40 face / 0.50 body + 2-of-3 consensus applies. Body ReID is clothing-dependent — never trust body alone across days.
+7. **Recent-window matching is feature-flagged** — `ENABLE_RECENT_WINDOW_MATCHING` in `config.py`. Body-only merge (no usable face) is valid ONLY within the 5-min window (`RECENT_WINDOW_MINUTES`). Outside it: face **0.40** / body **median ≥0.50** (n_bodies≥2) + top-2 ambiguity gap (`BODY_MATCH_AMBIGUITY=0.03`). Live path no longer uses unique-person 2-of-3 body votes (dead — see CONTEXT #25). Body ReID is clothing-dependent — never trust body alone across days.
 
-8. **Camera-aware overlap** — Cross-camera overlap (entry + counter simultaneously) is expected for the same person. Only same-camera overlap blocks a merge. The backfill script (`danger/merge_recent_window_duplicates.py`) and any future merge logic must distinguish cameras, not use a global overlap check.
+8. **Camera-aware overlap** — Cross-camera overlap (entry + counter simultaneously) is expected for the same person. Only same-camera overlap blocks a merge. After SAME_CAM reject: **do not create** a new person (leave unassigned). The backfill script (`danger/merge_recent_window_duplicates.py`) must distinguish cameras, not use a global overlap check.
 
 9. **Contamination cleanup uses median, not greedy** — `_clean_contaminated_face_embeddings` and `_clean_contaminated_body_embeddings` both use iterative median-outlier removal. Greedy single-linkage chains contamination through bridge embeddings. Never revert to the greedy approach.
 
 10. **Absorb must check cluster fit** — `_absorb_face_embeddings` / `_absorb_body_embeddings` must DROP a loser embedding that doesn't fit the winner's cluster (median sim < 0.35 face / < 0.50 body). Never move embeddings without this check — it was the root cause of staff-identity pollution.
 
 11. **Worker logging uses shared setup** — `app/worker.py` calls `app/logging_config.py::setup_logging()`. Do not add ad-hoc loguru sinks in the worker; use the shared helper so background job activity stays in `logs/ai_processing.log`.
+
+12. **Identity delete lock** — Processes that DELETE `person_identities` while cameras run must take `IDENTITY_ADVISORY_LOCK_KEY` (1001), same as live `decide_identity` (see CONTEXT #26 / `reextract_or_delete_faceless.py`).
 
 ---
 

@@ -45,9 +45,9 @@ class Settings(BaseSettings):
     REID_EMBEDDING_DIM: int = 512
     REID_MATCH_THRESHOLD: float = 0.50   # Body ReID match threshold. With MSMT17-trained OSNet weights, same-person
                                            # cross-camera median=0.680 (p10=0.393), diff-person median=0.386 (p90=0.534).
-                                           # Best F1=0.49. 0.50 + 2-of-3 consensus gate gives clean separation.
-                                           # Previously 0.85 (calibrated against broken ImageNet-backbone weights — see
-                                           # CONTEXT.md issue #16, corrected 2026-07-09).
+                                           # Live path: gallery body MEDIAN ≥0.50 (n_bodies≥2) + BODY_MATCH_AMBIGUITY;
+                                           # not unique-person 2-of-3 votes (structurally dead — CONTEXT #25, 2026-07-17).
+                                           # Previously 0.85 (broken ImageNet-backbone weights — CONTEXT #16).
     REID_CROP_QUALITY_THRESHOLD: float = 0.30
     REID_ACCUMULATION_FRAMES: int = 5
     REID_CONFIDENCE_LIMIT: float = 0.75
@@ -100,7 +100,9 @@ class Settings(BaseSettings):
     ENABLE_RECENT_WINDOW_MATCHING: bool = True
     RECENT_WINDOW_MINUTES: int = 5
     FACE_MATCH_THRESHOLD_RECENT: float = 0.35   # relaxed face match within the window (strict 0.40 outside)
-    RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 bodies each side, non-overlapping tracks on same camera, faces don't contradict at 0.25)
+    RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 bodies, face non-contradiction)
+    # Reject body match if top-2 person medians are within this gap (ambiguous clothing / uniforms).
+    BODY_MATCH_AMBIGUITY: float = 0.03
     FACE_MATCH_MEDIAN_THRESHOLD: float = 0.30  # When recent face best-pair is in grey zone [0.35, 0.40),
                                                  # require median of ALL cross-pairs >= this. Same-person
                                                  # min median=0.401, diff-person p50=0.200. At 0.30:

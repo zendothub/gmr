@@ -618,8 +618,8 @@ Same-person median (0.680) >> diff-person median (0.386). Best F1 threshold=0.49
 **Layer 1: Person-identity deduplication in `_search_similar`**
 Mirrors the face search behavior: fetches 25 raw embeddings, keeps only the best match per unique person_identity_id, returns top-K unique identities. Prevents one person from dominating candidates.
 
-**Layer 2: Body consensus gate (2 of top-3 must agree)**
-A single body match at 0.50 can still be a false positive. Requires at least 2 of the top-3 unique-identity candidates to agree on the same person AND exceed REID_MATCH_THRESHOLD before accepting a body ReID merge. With the new MSMT17 weights, 2-of-3 false positives at 0.50 is exponentially unlikely (diff-person p90=0.534, so the probability of 2 wrong persons both exceeding 0.50 is low).
+**Layer 2: Body match (ENGINE SUPERSEDED 2026-07-17)**  
+~~Requires at least 2 of the top-3 unique-identity candidates to agree~~ — **dead**: search already unique-person. **Current live path:** body **median** to gallery (n≥2) ≥ 0.50 / recent ≥ 0.55 + ambiguity. See **2026-07-17 supersession** at end of this file / CONTEXT #25.
 
 **Layer 3: Body contamination gate (store-time, 0.50 median)**
 When storing a new body embedding, if the median cosine similarity to the existing cluster (≥3 embeddings) is below 0.50, reject it. At 0.50, same-person embeddings (median 0.680) are kept, diff-person embeddings (median 0.386) are rejected. Clean separation with good margin on both sides. The dedup job's iterative median-based outlier removal also uses this threshold.
@@ -733,7 +733,7 @@ PYTHONPATH=. venv/bin/python danger/compare_gender_models.py
 
 | Setting | Value | Notes |
 |---|---|---|
-| `FACE_MATCH_THRESHOLD` | `0.48` | Positive face match threshold (real-time) |
+| `FACE_MATCH_THRESHOLD` | `0.40` | Positive face match (live = same as dedup; was documented 0.48 historically) |
 | `FACE_CONTRADICTION_THRESHOLD` | `0.25` | Disassociation gate |
 | `FACE_BODY_EXCLUSION_THRESHOLD` | `0.30` | Body candidate face gate |
 | `FACE_CONTAMINATION_THRESHOLD` | `0.35` | Running-consensus contamination gate |
@@ -742,7 +742,7 @@ PYTHONPATH=. venv/bin/python danger/compare_gender_models.py
 | `FACE_IDENTITY_MIN_SCORE` | `0.60` | Min face_quality for identity creation |
 | `FACE_IDENTITY_MIN_DETECTIONS` | `2` | Min good face detections per track |
 | `MAX_FACE_EMBEDDINGS_PER_PERSON` | `5` | Multi-angle face storage cap |
-| `REID_MATCH_THRESHOLD` | `0.50` | Body ReID match threshold (MSMT17 OSNet, same-person median=0.680, diff-person median=0.386, best F1=0.49. Previously 0.85 — calibrated against broken ImageNet-backbone weights) |
+| `REID_MATCH_THRESHOLD` | `0.50` | Body **median** match (live; n_bodies≥2 + ambiguity). Not unique-person 2-of-3 votes — see 2026-07-17 note below. |
 | `BODY_CONTAMINATION_THRESHOLD` | `0.50` | Body contamination gate (store-time + dedup cleanup). Was 0.60, lowered to 0.50 with MSMT17 weights — same-person p25=0.537, diff-person p75=0.444. |
 | `SIGLIP2_MODEL_ID` | `google/siglip2-base-patch16-224` | Gender model (100% on clean CCTV) |
 | `SIGLIP2_GENDER_MARGIN_DELTA` | `0.5` | Female-biased gender margin (M only if male−female > δ) |
@@ -754,10 +754,33 @@ PYTHONPATH=. venv/bin/python danger/compare_gender_models.py
 | Dedup job interval | `10 min` | `jobs/scheduler.py` — includes staff classification + MinIO sweep |
 | Staff classification interval | `10 min` | Runs inside dedup job |
 | MinIO sweep interval | `10 min` | Runs inside dedup job — cross-references all `crops/` against DB |
-| `FACE_MATCH_THRESHOLD` | `0.48` | `.env` | Face similarity threshold for matching |
+| `FACE_MATCH_THRESHOLD` | `0.40` | `.env` / `config.py` | Face similarity threshold for matching (live) |
 | `FACE_IDENTITY_MIN_SCORE` | `0.60` | `config.py` | Min face quality for identity creation |
 | `FACE_IDENTITY_MIN_DETECTIONS` | `2` | `config.py` | Min good face detections per track |
 | `MAX_FACE_EMBEDDINGS_PER_PERSON` | `5` | `config.py` | Multi-angle face storage cap |
 | `YOLO_CONFIDENCE_THRESHOLD` | `0.30` | `.env` | Person detection confidence |
-| Billing dwell threshold | `90s` | DB `rules` table | Time in billing zone before purchase event |
+| Billing dwell threshold | `50s` | DB `rules` table | Live rule (was listed 90s historically; check `rules.dwell_threshold_seconds`) |
 | Stale track timeout | `5.0s` | `track_manager.py` | Track removed if unseen for this long |
+
+---
+
+## Supersession — Identity live path (2026-07-17)
+
+**Do not implement body matching as “2 of top-3 unique person_ids agree.”**  
+`_search_similar` returns **one row per person**. That vote model never reached 2 votes; ventilated `best_candidate=None` also blocked the recent body path.
+
+**Live body protocol (current):**
+- Gallery **median** body sim, `n_bodies ≥ 2`
+- Strict: median ≥ `REID_MATCH_THRESHOLD` (0.50)
+- Recent window: median ≥ `RECENT_BODY_SINGLE_MATCH_THRESHOLD` (0.55)
+- `BODY_MATCH_AMBIGUITY` (0.03) rejects close top-2 medians
+
+**Live face:** `FACE_MATCH_THRESHOLD=0.40` (not 0.48). Recent grey zone 0.35+ accepted via `match_tier` + median gate.
+
+**SAME_CAM overlap reject:** leave unassigned — **never create** a clone person.
+
+**FK / reextract race (P5):** SAVEPOINT attach, person exist/`FOR SHARE`, share advisory lock **1001** with faceless delete. No create-on-exception after poisonous flush.
+
+Full detail: repo `CONTEXT.md` issues **#25, #26, #27** (purchase dwell audit).  
+Tests: `tests/test_identity_decision_p0_p3.py`, `tests/test_identity_persistence_p5.py`.
+
