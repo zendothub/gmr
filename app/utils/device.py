@@ -182,8 +182,12 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
     from app.config import get_settings
     settings = get_settings()
     bitrate = settings.STREAM_BITRATE
+    max_height = settings.STREAM_MAX_HEIGHT
 
     device = get_device()
+
+    # Build scale filter if max_height > 0 (0 = passthrough native resolution)
+    scale_filter = [f"scale=-2:{max_height}"] if max_height > 0 else []
 
     if device == "cuda":
         if _NVENC_AVAILABLE or _probe_nvenc(ffmpeg_binary):
@@ -192,6 +196,7 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
                 "-c:v", "h264_nvenc",
                 "-preset", "p4",       # NVENC balanced preset (good quality / speed)
                 "-tune", "ll",         # low-latency tune
+                *scale_filter,
                 "-b:v", bitrate,
                 "-maxrate", bitrate,
                 "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",
@@ -204,6 +209,7 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
         logger.debug("FFmpeg encoder: h264_videotoolbox (MPS/Apple Silicon)")
         return [
             "-c:v", "h264_videotoolbox",
+            *scale_filter,
             "-b:v", bitrate,
             "-maxrate", bitrate,
             "-pix_fmt", "yuv420p",
@@ -215,6 +221,7 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
+        *scale_filter,
         "-b:v", bitrate,
         "-maxrate", bitrate,
         "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",

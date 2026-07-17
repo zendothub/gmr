@@ -207,6 +207,10 @@ class Settings(BaseSettings):
     # Without this, FFmpeg defaults to CRF-based quality encoding which
     # produces 5-8 Mbps — 4-6× heavier than necessary.
     STREAM_BITRATE: str = "1200k"
+    # Maximum output height in pixels for the browser overlay stream.
+    # 720 = 720p (1280×720).  Set to 0 to disable scaling (passthrough native).
+    # 720p has 55% fewer pixels than 1080p — cleaner video at the same bitrate.
+    STREAM_MAX_HEIGHT: int = 720
     # Auto-stop a published stream after this many seconds with no viewers.
     STREAM_IDLE_TIMEOUT_SECONDS: int = 120
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.
