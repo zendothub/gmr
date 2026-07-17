@@ -171,10 +171,18 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
       2. MPS   → h264_videotoolbox  (Apple VideoToolbox hardware encoder)
       3. CPU   → libx264  (software, veryfast + zerolatency)
 
+    All paths include explicit bitrate control (STREAM_BITRATE) because FFmpeg
+    defaults to CRF-based quality encoding without -b:v, producing 5-8 Mbps for
+    1080p surveillance — 4-6× heavier than the ~1.2 Mbps this pipeline targets.
+
     The returned list is ready to splice into an ffmpeg command, e.g.::
 
         cmd = [..., "-i", source] + get_ffmpeg_video_codec_args() + ["-f", "rtsp", url]
     """
+    from app.config import get_settings
+    settings = get_settings()
+    bitrate = settings.STREAM_BITRATE
+
     device = get_device()
 
     if device == "cuda":
@@ -184,6 +192,9 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
                 "-c:v", "h264_nvenc",
                 "-preset", "p4",       # NVENC balanced preset (good quality / speed)
                 "-tune", "ll",         # low-latency tune
+                "-b:v", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",
                 "-pix_fmt", "yuv420p",
             ]
         # CUDA GPU found but ffmpeg was built without NVENC — fall through to libx264
@@ -193,6 +204,8 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
         logger.debug("FFmpeg encoder: h264_videotoolbox (MPS/Apple Silicon)")
         return [
             "-c:v", "h264_videotoolbox",
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
             "-pix_fmt", "yuv420p",
         ]
 
@@ -202,6 +215,9 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
+        "-b:v", bitrate,
+        "-maxrate", bitrate,
+        "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",
         "-pix_fmt", "yuv420p",
     ]
 

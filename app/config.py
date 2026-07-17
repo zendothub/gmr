@@ -202,6 +202,11 @@ class Settings(BaseSettings):
     # Transcode preset for the republish step. "copy" = no re-encode (cheapest,
     # requires H.264). Use "lowlatency" to re-encode for browser-friendly output.
     STREAM_PUBLISH_MODE: str = "lowlatency"  # copy | lowlatency
+    # Target video bitrate for the browser overlay stream (burn-in) and
+    # lowlatency republish step.  1200k is plenty for annotated 1080p CCTV.
+    # Without this, FFmpeg defaults to CRF-based quality encoding which
+    # produces 5-8 Mbps — 4-6× heavier than necessary.
+    STREAM_BITRATE: str = "1200k"
     # Auto-stop a published stream after this many seconds with no viewers.
     STREAM_IDLE_TIMEOUT_SECONDS: int = 120
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.
