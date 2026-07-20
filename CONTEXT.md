@@ -555,6 +555,8 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 | Live `FACE_MATCH_THRESHOLD` | **0.40** (not 0.48) | Code/env truth; CONTEXT older rows said 0.48 |
 | Face recent thr | **0.35** + median grey check; accept via `match_tier` | Grey zone was dead without match_tier |
 | Body live match | **Median** n≥2 recent bodies only; 0.55 (body_recent); ambiguity 0.03 | Clothing-dependent — no full-lifetime customer body match |
+| Body-only create | `ENABLE_BODY_ONLY_IDENTITY_CREATE`; q≥0.55, nearest<0.45, staff<0.48 | Faceless bypass of REQUIRE_FACE; non-confident |
+| Backfill body-only | `danger/backfill_body_only_identity.py` days 2026-07-19+20 applied | +24 DISTINCT non-staff purchasers (85→109) |
 | Body store contamination | Gate vs **recent** cluster only; never delete old day bodies | Multi-day outfit change OK |
 | Staff reattach gallery | Full lifetime if activity-recent | Uniform stable across days |
 | Activity-recent | track overlap OR body emb in window (not stale last_seen alone) | Dedup grafts left last_seen Jul-11 while tracks Jul-20 |

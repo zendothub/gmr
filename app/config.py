@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     REID_CONFIDENCE_LIMIT: float = 0.75
     REID_MIN_QUALITY_FOR_SWITCH: float = 0.80
     REQUIRE_FACE_FOR_IDENTITY: bool = True
+    # Body-only identity create (FEATURE): faceless track may create a person
+    # when recent-window body is strong quality and far from all recent galleries
+    # (esp. staff). Explicit bypass of REQUIRE_FACE_FOR_IDENTITY with logs.
+    # Keep confidence non-confident (no face). Never body-create outside window
+    # isolation (nearest/staff gates use recent gallery only).
+    ENABLE_BODY_ONLY_IDENTITY_CREATE: bool = True
+    BODY_ONLY_CREATE_MIN_QUALITY: float = 0.55
+    BODY_ONLY_CREATE_MAX_NEAREST_SIM: float = 0.45   # nearest recent person median must be < this
+    BODY_ONLY_CREATE_MAX_STAFF_SIM: float = 0.48     # best staff median (full gal if active) must be < this
 
     # InsightFace
     INSIGHTFACE_MODEL: str = "buffalo_l"

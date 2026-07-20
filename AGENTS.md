@@ -29,7 +29,7 @@
 
 3. **No immediate MinIO deletion** — All deletions go through `CameraWorker._minio_cleanup()` → deferred set → periodic sweep. Never call `client.remove_object()` directly.
 
-4. **Face required for identity creation** — `REQUIRE_FACE_FOR_IDENTITY = True`. No person exists without a face. Body-only tracks get NULL `person_identity_id`.
+4. **Face required for identity creation** — `REQUIRE_FACE_FOR_IDENTITY = True` by default. Faceless body-only create is an **explicit bypass** when `ENABLE_BODY_ONLY_IDENTITY_CREATE=True` (recent-window isolation gates only). Confidence stays non-confident without face.
 
 5. **Test before deploying model changes** — Use `danger/test_*.py` scripts to validate any model change on real data before integrating into the pipeline.
 

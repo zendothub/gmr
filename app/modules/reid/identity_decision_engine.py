@@ -453,21 +453,31 @@ class IdentityDecisionEngine:
                             f"(cam={str(camera_id)[:8]} winner gone before attach)"
                         )
                         return None, 0.0, False, False, None
-                    # Create new anonymous person
+                    # Create new anonymous person (face-gated by default)
                     person_id = await self._create_new_person(
                         db, mean_embedding, camera_id, crop_quality_score, crop_path,
                         face_embedding, face_score, face_crop_path, good_face_count
                     )
                     if person_id is None:
+                        # Faceless body-only create (recent window isolation gates)
+                        person_id = await self._try_body_only_create(
+                            db,
+                            mean_embedding,
+                            camera_id,
+                            crop_quality_score,
+                            crop_path,
+                        )
+                    if person_id is None:
                         logger.info(
-                            "[Initial ReID] Identity creation blocked (face quality gate)."
+                            "[Initial ReID] Identity creation blocked "
+                            "(face gate and/or body-only create gate)."
                         )
                         return None, 0.0, False, False, None
-                        
+
                     logger.info(
                         f"[Initial ReID] Created new anonymous person ID {person_id} "
                         f"(best score: {best_similarity:.3f} < {required_threshold}, "
-                        f"tier={match_tier})"
+                        f"tier={match_tier or 'create'})"
                     )
                     return person_id, 0.0, False, True, None
 
@@ -542,13 +552,21 @@ class IdentityDecisionEngine:
                             face_embedding, face_score, face_crop_path, good_face_count
                         )
                         if new_pid is None:
+                            new_pid = await self._try_body_only_create(
+                                db,
+                                mean_embedding,
+                                camera_id,
+                                crop_quality_score,
+                                crop_path,
+                            )
+                        if new_pid is None:
                             logger.info(
                                 "[ReID Refined] Contradiction occurred but couldn't create "
-                                "new ID (face quality gate). Returning None."
+                                "new ID (face/body-only gate). Returning None."
                             )
                             prune_old_id = current_person_id if is_temporary else None
                             return None, 0.0, False, False, prune_old_id
-                            
+
                         prune_old_id = current_person_id if is_temporary else None
                         if prune_old_id:
                             await self._delete_person(db, prune_old_id, new_pid)
@@ -943,6 +961,8 @@ class IdentityDecisionEngine:
             return float(self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD)
         if match_tier == "body":
             return float(self.settings.REID_MATCH_THRESHOLD)
+        if match_tier == "body_only_create":
+            return 0.0  # newly created — no similarity gate
         if match_tier == "staff_reattach":
             return float(self.settings.STAFF_REATTACH_BODY_MEDIAN)
         if used_face:
@@ -1742,6 +1762,155 @@ class IdentityDecisionEngine:
             # unreferenced files.
         except Exception as e:
             logger.warning(f"Failed to delete temporary person {person_id}: {e}")
+
+    async def _try_body_only_create(
+        self,
+        db: AsyncSession,
+        mean_embedding: Optional[np.ndarray],
+        camera_id: uuid.UUID,
+        crop_quality_score: float,
+        crop_path: Optional[str],
+    ) -> Optional[uuid.UUID]:
+        """Create a faceless person when recent-window body is isolated enough.
+
+        Gates (SESSION_HANDOFF 2026-07-20 / dry-run):
+          - ENABLE_BODY_ONLY_IDENTITY_CREATE
+          - body emb present, crop quality ≥ BODY_ONLY_CREATE_MIN_QUALITY
+          - nearest recent-gallery person median < BODY_ONLY_CREATE_MAX_NEAREST_SIM
+          - best staff median (full gallery if activity-recent) < BODY_ONLY_CREATE_MAX_STAFF_SIM
+        Confidence always non-confident (no face). Explicit bypass of face-required create.
+        """
+        if not self.settings.ENABLE_BODY_ONLY_IDENTITY_CREATE:
+            return None
+        if mean_embedding is None:
+            return None
+        if crop_quality_score < float(self.settings.BODY_ONLY_CREATE_MIN_QUALITY):
+            logger.info(
+                f"[BODY-ONLY CREATE BLOCKED] reason=LOW_QUALITY "
+                f"q={crop_quality_score:.3f} < {self.settings.BODY_ONLY_CREATE_MIN_QUALITY} "
+                f"camera={str(camera_id)[:8]}"
+            )
+            return None
+
+        try:
+            nearest_sim = await self._nearest_recent_body_median(db, mean_embedding)
+            max_near = float(self.settings.BODY_ONLY_CREATE_MAX_NEAREST_SIM)
+            if nearest_sim is not None and nearest_sim >= max_near:
+                logger.info(
+                    f"[BODY-ONLY CREATE BLOCKED] reason=NEAR_RECENT "
+                    f"nearest_med={nearest_sim:.3f} ≥ {max_near} "
+                    f"camera={str(camera_id)[:8]}"
+                )
+                return None
+
+            staff_sim = await self._best_staff_body_median(db, mean_embedding)
+            max_staff = float(self.settings.BODY_ONLY_CREATE_MAX_STAFF_SIM)
+            if staff_sim is not None and staff_sim >= max_staff:
+                logger.info(
+                    f"[BODY-ONLY CREATE BLOCKED] reason=NEAR_STAFF "
+                    f"staff_med={staff_sim:.3f} ≥ {max_staff} "
+                    f"camera={str(camera_id)[:8]}"
+                )
+                return None
+
+            now = utc_now()
+            person = PersonIdentity(
+                label=None,
+                first_seen_at=now,
+                last_seen_at=now,
+                visit_count=1,
+                is_anonymous=True,
+                best_face_score=None,
+                face_crop_path=None,
+                metadata_json={"body_only_create": True, "created_tier": "body_only"},
+            )
+            db.add(person)
+            await db.flush()
+
+            emb = PersonEmbedding(
+                person_identity_id=person.id,
+                embedding=mean_embedding.tolist(),
+                camera_id=camera_id,
+                crop_quality=crop_quality_score,
+                crop_path=crop_path,
+                captured_at=now,
+            )
+            db.add(emb)
+            await db.flush()
+
+            logger.info(
+                f"[BODY-ONLY CREATE] person={str(person.id)[:8]} "
+                f"q={crop_quality_score:.3f} nearest={nearest_sim} staff={staff_sim} "
+                f"camera={str(camera_id)[:8]} — faceless; reid_confident=False"
+            )
+            return person.id
+        except Exception as e:
+            logger.error(f"[BODY-ONLY CREATE FAIL] camera={str(camera_id)[:8]} err={e}")
+            return None
+
+    async def _nearest_recent_body_median(
+        self, db: AsyncSession, query: np.ndarray
+    ) -> Optional[float]:
+        """Max over persons of median(query, recent bodies) [or staff full gal]."""
+        try:
+            win = int(self.settings.RECENT_WINDOW_MINUTES)
+            # All persons with ≥1 recent body emb
+            r = await db.execute(
+                text(
+                    """
+                    SELECT DISTINCT pe.person_identity_id::text
+                    FROM person_embeddings pe
+                    WHERE pe.embedding IS NOT NULL
+                      AND pe.captured_at > NOW() - make_interval(mins => :win)
+                    """
+                ),
+                {"win": win},
+            )
+            pids = [row[0] for row in r.fetchall()]
+            best = None
+            for pid in pids:
+                # staff? upcoming check uses full gallery for staff write-in staff method
+                st = await db.execute(
+                    text("SELECT is_staff FROM person_identities WHERE id::text = :pid"),
+                    {"pid": pid},
+                )
+                is_staff = bool(st.scalar())
+                if is_staff and self.settings.STAFF_BODY_USE_FULL_GALLERY:
+                    med = await self._person_body_median_sim(
+                        db, pid, query, recent_only=False
+                    )
+                else:
+                    med = await self._person_body_median_sim(
+                        db, pid, query, recent_only=True
+                    )
+                if med is not None and (best is None or med > best):
+                    best = med
+            return best
+        except Exception as e:
+            logger.debug(f"nearest recent body median failed: {e}")
+            return None
+
+    async def _best_staff_body_median(
+        self, db: AsyncSession, query: np.ndarray
+    ) -> Optional[float]:
+        """Best median vs activity-recent staff (full gallery when flag on)."""
+        try:
+            candidates = await self._search_similar_staff(db, query, top_k=10)
+            best = None
+            staff_full = bool(self.settings.STAFF_BODY_USE_FULL_GALLERY)
+            for cand in candidates:
+                pid = cand["person_identity_id"]
+                if not await self._person_is_recent(db, pid, cand.get("last_seen_at")):
+                    continue
+                med = await self._person_body_median_sim(
+                    db, pid, query, recent_only=not staff_full
+                )
+                if med is not None and (best is None or med > best):
+                    best = med
+            return best
+        except Exception as e:
+            logger.debug(f"best staff body median failed: {e}")
+            return None
 
     async def _create_new_person(
         self,

@@ -127,6 +127,7 @@ async def test_face_recent_non_recent_does_not_use_grey(engine, db):
         patch.object(engine, "_search_similar", new_callable=AsyncMock, return_value=[]),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
         patch.object(engine, "_create_new_person", new_callable=AsyncMock, return_value=None),
+        patch.object(engine, "_try_body_only_create", new_callable=AsyncMock, return_value=None),
     ):
         face_search.return_value = _cand(pid, dist=1.0 - 0.37, recent=False)
         person_id, score, conf, is_new, prune = await engine.decide_identity(
@@ -235,6 +236,7 @@ async def test_body_ambiguous_top_two_rejected(engine, db):
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
         patch.object(engine, "_create_new_person", new_callable=AsyncMock, return_value=None),
+        patch.object(engine, "_try_body_only_create", new_callable=AsyncMock, return_value=None),
     ):
         body_search.return_value = [
             _cand(pid_a, dist=0.30, recent=True),
@@ -290,7 +292,7 @@ async def test_same_cam_overlap_suppresses_create(engine, db):
 
 @pytest.mark.asyncio
 async def test_create_blocked_low_score_logs_and_returns_none(engine, db):
-    """P3: face score below min → no create."""
+    """P3: face score below min → no create (body-only also mocked off)."""
     cam = uuid.uuid4()
     face = _face(7)
     body = _body(7)
@@ -299,6 +301,7 @@ async def test_create_blocked_low_score_logs_and_returns_none(engine, db):
         patch.object(engine, "_search_similar_face", new_callable=AsyncMock, return_value=None),
         patch.object(engine, "_search_similar", new_callable=AsyncMock, return_value=[]),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
+        patch.object(engine, "_try_body_only_create", new_callable=AsyncMock, return_value=None),
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
     ):
         person_id, score, conf, is_new, _ = await engine.decide_identity(
