@@ -22,6 +22,8 @@ class ActiveTrack:
     last_seen_at: datetime = field(default_factory=utc_now)
     bbox: Optional[dict] = None
     prev_bbox: Optional[dict] = None
+    # In-memory only: last ~30 raw bboxes for live stability_score.
+    # Not the same as DB track_sessions.bbox_history (session debug log object).
     bbox_history: List[dict] = field(default_factory=list)
     current_zones: Set[str] = field(default_factory=set)
     zone_enter_times: Dict[str, datetime] = field(default_factory=dict)
@@ -61,6 +63,8 @@ class ActiveTrack:
     # Track's best crop (body)
     best_crop_quality: float = 0.0
     best_crop_path: Optional[str] = None
+    # Torso KP visibility (shoulders+hips 0–1) at the frame that set best_crop_quality
+    best_torso_visibility_ratio: Optional[float] = None
 
     # Track's current frame crop (for real-time quality debug)
     current_crop_quality: float = 0.0

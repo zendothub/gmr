@@ -30,6 +30,17 @@ class TrackSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     ended_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Session debug log only — never used for ReID/identity/analytics math.
+    # Legacy rows: plain JSON array of {x1,y1,x2,y2} boxes.
+    # Current shape (object): {
+    #   "boxes": [...],                    # last ≤30 bboxes (logging)
+    #   "best_crop_quality": float|null,   # body crop quality at best body frame
+    #   "torso_visibility_ratio": float|null,  # shoulders+hips KP ratio at best body
+    #   "best_face_crop_path": str|null,   # best durable face crop (any score)
+    #   "best_face_score": float|null,
+    #   "logged_at": ISO-8601 str|null,
+    # }
+    # Readers MUST tolerate array-or-object; treat missing keys as N/A.
     bbox_history: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
     avg_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_frames: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

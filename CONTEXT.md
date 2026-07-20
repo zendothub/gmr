@@ -559,5 +559,7 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 | Purchase metric | DISTINCT person_id, not is_staff | Critical findings #15 staff inflation fix |
 | Purchase dwell | **50s** (rule DB); do not drop to match 106 alone | Identity ceiling + bill vs person |
 | retail-ai-worker | Dedup/sweep/staff/probes/analytics | API freezes if jobs in uvicorn |
+| Track session debug log | `bbox_history` JSON object on close: boxes + best_crop_quality + torso_visibility_ratio + best_face_*; legacy rows stay bare arrays | No schema migration; debug tab `/api/v2/debug/track-sessions` |
+| MinIO protect | Also `bbox_history->>'best_face_crop_path'` when object-shaped | Unassigned face crops would otherwise be swept |
 
 **Required restarts after identity engine changes:** `sudo systemctl restart retail-ai.service` (camera workers load engine in-process). Worker only if jobscode changed.

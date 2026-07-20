@@ -1,17 +1,68 @@
 """Debug detection service."""
 
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Any
 from uuid import UUID
+
+from sqlalchemy import select, func, or_, String, Date, exists
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.models.camera import Camera
 from app.core.db.models.tracking import TrackSession
 from app.modules.debug.schemas import (
-    ActiveTracksRealtimeResponse, ActiveTrackResponse, ActiveTrackDemographics,
-    UniquePersonItem, PaginatedUniquePersonsResponse, PersonTrackDetail, PaginatedTracksResponse
+    ActiveTracksRealtimeResponse,
+    ActiveTrackResponse,
+    ActiveTrackDemographics,
+    UniquePersonItem,
+    PaginatedUniquePersonsResponse,
+    PersonTrackDetail,
+    PaginatedTracksResponse,
+    TrackSessionDebugItem,
+    TrackSessionPersonSummary,
+    PaginatedTrackSessionsResponse,
 )
+
+
+def _parse_session_debug_log(bbox_history: Any) -> dict:
+    """Safely extract quality/face debug fields from track_sessions.bbox_history.
+
+    Legacy: JSON array of boxes → all debug fields None (UI shows N/A).
+    Current: object with boxes + quality/face keys.
+    Never raises on bad/unexpected shapes.
+    """
+    empty = {
+        "best_crop_quality": None,
+        "torso_visibility_ratio": None,
+        "best_face_crop_path": None,
+        "best_face_score": None,
+    }
+    if bbox_history is None:
+        return empty
+    if isinstance(bbox_history, list):
+        return empty
+    if not isinstance(bbox_history, dict):
+        return empty
+
+    def _opt_float(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _opt_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return {
+        "best_crop_quality": _opt_float(bbox_history.get("best_crop_quality")),
+        "torso_visibility_ratio": _opt_float(bbox_history.get("torso_visibility_ratio")),
+        "best_face_crop_path": _opt_str(bbox_history.get("best_face_crop_path")),
+        "best_face_score": _opt_float(bbox_history.get("best_face_score")),
+    }
 
 
 class DebugService:
@@ -211,6 +262,199 @@ class DebugService:
             page=page,
             size=size,
             tracks=tracks_list
+        )
+
+    @staticmethod
+    async def list_track_sessions(
+        db: AsyncSession,
+        page: int = 1,
+        size: int = 20,
+        search: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        assignment: str = "all",
+        camera_id: Optional[UUID] = None,
+        has_face: Optional[bool] = None,
+        has_billing: Optional[bool] = None,
+    ) -> PaginatedTrackSessionsResponse:
+        """Browse track sessions with debug fields from bbox_history (safe for legacy arrays)."""
+        from app.core.db.models.person import PersonIdentity
+        from app.core.db.models.billing import BillingInteraction
+        from sqlalchemy import cast, and_
+
+        billing_count_subq = (
+            select(
+                BillingInteraction.track_session_id,
+                func.count(BillingInteraction.id).label("billing_count"),
+            )
+            .where(BillingInteraction.track_session_id.isnot(None))
+            .group_by(BillingInteraction.track_session_id)
+            .subquery()
+        )
+
+        # Face path present only on object-shaped debug logs (legacy array → no face)
+        face_txt = func.nullif(
+            func.jsonb_extract_path_text(TrackSession.bbox_history, "best_face_crop_path"),
+            "",
+        )
+        has_face_path = and_(
+            func.jsonb_typeof(TrackSession.bbox_history) == "object",
+            face_txt.isnot(None),
+        )
+
+        def _apply_filters(stmt):
+            if search:
+                stmt = stmt.where(
+                    cast(TrackSession.id, String).ilike(f"%{search.strip()}%")
+                )
+            if start_time is not None:
+                stmt = stmt.where(TrackSession.started_at >= start_time)
+            if end_time is not None:
+                stmt = stmt.where(TrackSession.started_at <= end_time)
+            if assignment == "assigned":
+                stmt = stmt.where(TrackSession.person_identity_id.isnot(None))
+            elif assignment == "unassigned":
+                stmt = stmt.where(TrackSession.person_identity_id.is_(None))
+            if camera_id is not None:
+                stmt = stmt.where(TrackSession.camera_id == camera_id)
+            if has_face is True:
+                stmt = stmt.where(has_face_path)
+            elif has_face is False:
+                stmt = stmt.where(~has_face_path)
+            if has_billing is True:
+                stmt = stmt.where(
+                    exists(
+                        select(1).where(
+                            BillingInteraction.track_session_id == TrackSession.id
+                        )
+                    )
+                )
+            elif has_billing is False:
+                stmt = stmt.where(
+                    ~exists(
+                        select(1).where(
+                            BillingInteraction.track_session_id == TrackSession.id
+                        )
+                    )
+                )
+            return stmt
+
+        count_stmt = _apply_filters(select(func.count(TrackSession.id)))
+        total_count = (await db.execute(count_stmt)).scalar() or 0
+
+        stmt = (
+            select(
+                TrackSession,
+                Camera.name.label("camera_name"),
+                func.coalesce(billing_count_subq.c.billing_count, 0).label("billing_count"),
+            )
+            .join(Camera, TrackSession.camera_id == Camera.id)
+            .outerjoin(
+                billing_count_subq,
+                billing_count_subq.c.track_session_id == TrackSession.id,
+            )
+        )
+        stmt = _apply_filters(stmt)
+        stmt = (
+            stmt.order_by(TrackSession.started_at.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+        )
+        rows = (await db.execute(stmt)).all()
+
+        person_ids = {
+            ts.person_identity_id for ts, _, _ in rows if ts.person_identity_id is not None
+        }
+        person_map: dict = {}
+        if person_ids:
+            purchase_subq = (
+                select(
+                    BillingInteraction.person_identity_id,
+                    func.count(BillingInteraction.id).label("purchase_count"),
+                )
+                .where(BillingInteraction.person_identity_id.in_(person_ids))
+                .group_by(BillingInteraction.person_identity_id)
+                .subquery()
+            )
+            tracks_subq = (
+                select(
+                    TrackSession.person_identity_id,
+                    func.count(TrackSession.id).label("total_tracks"),
+                    func.count(
+                        func.distinct(func.cast(TrackSession.started_at, Date))
+                    ).label("total_days"),
+                )
+                .where(TrackSession.person_identity_id.in_(person_ids))
+                .group_by(TrackSession.person_identity_id)
+                .subquery()
+            )
+            p_stmt = (
+                select(
+                    PersonIdentity,
+                    func.coalesce(tracks_subq.c.total_tracks, 0).label("total_tracks"),
+                    func.coalesce(tracks_subq.c.total_days, 0).label("total_days"),
+                    func.coalesce(purchase_subq.c.purchase_count, 0).label("purchase_count"),
+                )
+                .outerjoin(tracks_subq, tracks_subq.c.person_identity_id == PersonIdentity.id)
+                .outerjoin(purchase_subq, purchase_subq.c.person_identity_id == PersonIdentity.id)
+                .where(PersonIdentity.id.in_(person_ids))
+            )
+            for person, total_tracks, total_days, purchase_count in (await db.execute(p_stmt)).all():
+                person_map[person.id] = TrackSessionPersonSummary(
+                    id=person.id,
+                    gender=person.gender,
+                    age_group=person.age_group,
+                    estimated_age=person.estimated_age,
+                    is_staff=bool(person.is_staff),
+                    first_seen_at=person.first_seen_at,
+                    last_seen_at=person.last_seen_at,
+                    visit_count=person.visit_count or 0,
+                    total_tracks=int(total_tracks or 0),
+                    total_days=int(total_days or 0),
+                    face_crop_path=person.face_crop_path,
+                    best_face_score=person.best_face_score,
+                    total_purchases=int(purchase_count or 0),
+                )
+
+        tracks_out: list[TrackSessionDebugItem] = []
+        for ts, camera_name, billing_count in rows:
+            dbg = _parse_session_debug_log(ts.bbox_history)
+            end_time = ts.ended_at or ts.last_seen_at
+            duration = max(0.0, (end_time - ts.started_at).total_seconds()) if end_time else 0.0
+            pid = ts.person_identity_id
+            tracks_out.append(
+                TrackSessionDebugItem(
+                    track_session_id=ts.id,
+                    camera_id=ts.camera_id,
+                    camera_name=camera_name or str(ts.camera_id)[:8],
+                    local_track_id=ts.local_track_id,
+                    person_identity_id=pid,
+                    started_at=ts.started_at,
+                    ended_at=ts.ended_at,
+                    last_seen_at=ts.last_seen_at,
+                    duration_seconds=duration,
+                    total_frames=ts.total_frames or 0,
+                    is_active=bool(ts.is_active),
+                    gender=ts.gender,
+                    age_group=ts.age_group,
+                    avg_confidence=ts.avg_confidence,
+                    stability_score=ts.stability_score,
+                    body_crop_path=ts.best_crop_path,
+                    best_crop_quality=dbg["best_crop_quality"],
+                    torso_visibility_ratio=dbg["torso_visibility_ratio"],
+                    face_crop_path=dbg["best_face_crop_path"],
+                    best_face_score=dbg["best_face_score"],
+                    has_billing=int(billing_count or 0) > 0,
+                    billing_count=int(billing_count or 0),
+                    person=person_map.get(pid) if pid else None,
+                )
+            )
+
+        return PaginatedTrackSessionsResponse(
+            total_count=total_count,
+            page=page,
+            size=size,
+            tracks=tracks_out,
         )
     
     @staticmethod

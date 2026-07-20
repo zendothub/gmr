@@ -8,6 +8,7 @@ is unbounded for practical purposes).
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Optional
 
 from loguru import logger
@@ -35,10 +36,22 @@ def get_inference_executor() -> ThreadPoolExecutor:
     return _executor
 
 
-async def run_inference(func, *args):
-    """Run a blocking inference call on the capped executor."""
+async def run_inference(func, *args, **kwargs):
+    """Run a blocking inference call on the capped executor.
+
+    Supports keyword args (e.g. YOLO.predict(..., conf=0.3, verbose=False))
+    via functools.partial. Positional-only calls stay on the fast path.
+
+    BUGFIX 2026-07-20: previous signature ignored kwargs, so
+    `run_inference(yolo_pose.predict, crop, verbose=False, conf=0.3)` raised
+    TypeError every frame. Pose was silently skipped (DEBUG-only catch) and
+    track_sessions.bbox_history.torso_visibility_ratio was always null.
+    """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(get_inference_executor(), func, *args)
+    executor = get_inference_executor()
+    if kwargs:
+        return await loop.run_in_executor(executor, partial(func, *args, **kwargs))
+    return await loop.run_in_executor(executor, func, *args)
 
 
 def shutdown_inference_executor():

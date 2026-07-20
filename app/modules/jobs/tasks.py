@@ -980,6 +980,7 @@ async def _sweep_orphaned_crops(db) -> int:
       • person_identities.face_crop_path
       • person_embeddings.crop_path
       • track_sessions.best_crop_path
+      • track_sessions.bbox_history->>'best_face_crop_path' (debug object only)
 
     When running in the same process as the API server, this also drains
     ``CameraWorker._pending_minio_deletes``. When running in the separate
@@ -1025,6 +1026,19 @@ async def _sweep_orphaned_crops(db) -> int:
     ))
     for row in r.fetchall():
         known.add(row[0])
+
+    # best_face_crop_path nested in track_sessions.bbox_history debug object
+    # (legacy rows are a JSON array with no face key — COALESCE/jsonb skips them)
+    r = await db.execute(text("""
+        SELECT bbox_history->>'best_face_crop_path'
+        FROM track_sessions
+        WHERE jsonb_typeof(bbox_history) = 'object'
+          AND bbox_history ? 'best_face_crop_path'
+          AND NULLIF(bbox_history->>'best_face_crop_path', '') IS NOT NULL
+    """))
+    for row in r.fetchall():
+        if row[0]:
+            known.add(row[0])
 
     # ── 2. Drain the pending MinIO deletes queue (if in-process) ────────────
     # When running in the separate worker process, CameraWorker is not

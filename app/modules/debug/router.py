@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_current_user
 from app.core.db.models.user import User
 from app.modules.debug.schemas import (
-    ActiveTracksRealtimeResponse, PaginatedUniquePersonsResponse, PaginatedTracksResponse
+    ActiveTracksRealtimeResponse,
+    PaginatedUniquePersonsResponse,
+    PaginatedTracksResponse,
+    PaginatedTrackSessionsResponse,
 )
 from app.modules.debug.service import DebugService
 
@@ -70,3 +73,43 @@ async def get_unique_person_tracks(
     Get all track sessions where a person was detected (paginated).
     """
     return await DebugService.get_unique_person_tracks(db, person_id=person_id, page=page, size=size)
+
+
+@router.get("/track-sessions", response_model=PaginatedTrackSessionsResponse)
+async def list_track_sessions(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None, description="ILIKE substring on track_session UUID"),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+    assignment: str = Query(
+        "all",
+        pattern="^(all|assigned|unassigned)$",
+        description="Filter by person_identity_id presence",
+    ),
+    camera_id: Optional[UUID] = Query(None),
+    has_face: Optional[bool] = Query(
+        None,
+        description="Only rows with debug face path in bbox_history (legacy array → false)",
+    ),
+    has_billing: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Browse historical track sessions (assigned + unassigned) with body/face debug
+    fields from bbox_history. Legacy array-shaped bbox_history returns null
+    quality/face (UI should show N/A) — never errors.
+    """
+    return await DebugService.list_track_sessions(
+        db,
+        page=page,
+        size=size,
+        search=search,
+        start_time=start_time,
+        end_time=end_time,
+        assignment=assignment,
+        camera_id=camera_id,
+        has_face=has_face,
+        has_billing=has_billing,
+    )

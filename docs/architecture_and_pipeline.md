@@ -229,8 +229,10 @@ while self.is_running:
 │                                                                       │
 │   2a. track_manager.update_track(track_id, bbox, confidence)          │
 │       → Creates or updates ActiveTrack in memory                      │
-│       → Maintains: prev_bbox, bbox_history (last 30),                 │
-│         total_frames, confidence_sum, stability_score                 │
+│       → Maintains: prev_bbox, bbox_history (last 30, in-memory only   │
+│         for stability), total_frames, confidence_sum, stability_score │
+│       → DB track_sessions.bbox_history on close is a debug log object │
+│         (boxes + quality/face); legacy bare arrays; not ReID math     │
 │       → Stability score: variance of bbox centers over time           │
 │         (lower variance = higher stability, 0-1 scale)                │
 │                                                                       │
@@ -470,7 +472,9 @@ while self.is_running:
 │   │   - ended_at = now()                                            │ │
 │   │   - last_seen_at, is_active = False                             │ │
 │   │   - total_frames, avg_confidence, stability_score               │ │
-│   │   - bbox_history (last 30), best_crop_path                      │ │
+│   │   - bbox_history (session debug log: boxes + quality/face;    │ │
+│   │     legacy was bare array — not used for ReID math),           │ │
+│   │     best_crop_path                                              │ │
 │   │   - gender, age_group (if demographics captured)                │ │
 │   │                                                                  │ │
 │   │   HARDCODED EVENT: "person_left_view"                           │ │

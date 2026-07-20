@@ -752,6 +752,35 @@ class CameraWorker:
                 )
             )
 
+    @staticmethod
+    def _best_face_debug_for_session(track: ActiveTrack):
+        """Pick best durable face path/score for track_sessions.bbox_history debug log.
+
+        Preference: identity-gate face → highest score in face_embedding_list →
+        demographics face. Returns (path|None, score|None). Ephemeral curr_face_*
+        is never used (cleaned after each frame).
+        """
+        path = None
+        score = None
+        if track.best_face_crop_path_for_id:
+            path = track.best_face_crop_path_for_id
+            score = float(track.best_face_score_for_id) if track.best_face_score_for_id else None
+        if track.face_embedding_list:
+            for face_emb, face_scr, face_crp in track.face_embedding_list:
+                if not face_crp:
+                    continue
+                scr = float(face_scr) if face_scr is not None else 0.0
+                if path is None or scr > (score or 0.0):
+                    path = face_crp
+                    score = scr
+        if path is None and track.best_demographics:
+            demo_path = track.best_demographics.get("face_crop_path")
+            if demo_path:
+                path = demo_path
+                demo_scr = track.best_demographics.get("face_score")
+                score = float(demo_scr) if demo_scr is not None else None
+        return path, score
+
     async def _close_track_session(self, db, track: ActiveTrack):
         """Mark a track session as ended in PostgreSQL.
 
@@ -874,6 +903,9 @@ class CameraWorker:
                     logger.warning(f"Post-resolution update failed for track {track.local_track_id}: {e}")
 
         # 1. Update TrackSession
+        # bbox_history: session debug log (object). Legacy was a bare array of boxes.
+        # Not used for ReID/identity/analytics — readers must tolerate array|object.
+        face_log_path, face_log_score = self._best_face_debug_for_session(track)
         session_values = {
             "ended_at": utc_now(),
             "last_seen_at": track.last_seen_at,
@@ -881,7 +913,20 @@ class CameraWorker:
             "total_frames": track.total_frames,
             "avg_confidence": track.avg_confidence,
             "stability_score": track.stability_score,
-            "bbox_history": track.bbox_history[-30:],
+            "bbox_history": {
+                "boxes": track.bbox_history[-30:],
+                "best_crop_quality": (
+                    float(track.best_crop_quality) if track.best_crop_quality > 0 else None
+                ),
+                "torso_visibility_ratio": (
+                    float(track.best_torso_visibility_ratio)
+                    if track.best_torso_visibility_ratio is not None
+                    else None
+                ),
+                "best_face_crop_path": face_log_path,
+                "best_face_score": face_log_score,
+                "logged_at": utc_now().isoformat(),
+            },
             "best_crop_path": track.best_crop_path,
             "person_identity_id": track.person_identity_id,
         }
@@ -991,7 +1036,12 @@ class CameraWorker:
                                 confidence_threshold=self.settings.YOLO_POSE_CONFIDENCE
                             )
                 except Exception as pose_err:
-                    logger.debug(f"Pose check failed: {pose_err}")
+                    # Once per process: surface silent failures (e.g. kwargs bug)
+                    if not getattr(CameraWorker, "_pose_err_logged", False):
+                        CameraWorker._pose_err_logged = True
+                        logger.warning(f"Pose check failed (further at DEBUG): {pose_err}")
+                    else:
+                        logger.debug(f"Pose check failed: {pose_err}")
 
             # Assess quality (returns either a float score or a dict with detailed metrics)
             quality_result = await asyncio.to_thread(
@@ -1325,6 +1375,7 @@ class CameraWorker:
             if quality > track.best_crop_quality:
                 track.best_crop_quality = quality
                 track.best_crop_path = crop_path
+                track.best_torso_visibility_ratio = keypoint_visibility_ratio
 
             # Check if we should extract body ReID or fall back to face-only
             body_embedding = None
