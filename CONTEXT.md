@@ -67,8 +67,8 @@ Frame (2880×1620)
 | `FACE_CONTRADICTION_THRESHOLD` | `0.25` | Disassociation gate | Same-person X-angle ≥0.40. 0.25 avoids false disassociation |
 | `FACE_BODY_EXCLUSION_THRESHOLD` | `0.30` | Body candidate face gate | More permissive than match — allows body fallthrough for X-angle faces |
 | `FACE_CONTAMINATION_THRESHOLD` | `0.35` | Running-consensus contamination check (track + store + dedup) | Reject face if cosine sim < 0.35 to cluster (different person 0.10-0.30, same 0.40+). All comparisons use L2-normalized vectors via `_face_sim()`. |
-| `BODY_CONTAMINATION_THRESHOLD` | `0.50` | Body embedding contamination gate (store + dedup) | When storing body embedding: if median cosine sim to existing cluster (≥3 embeddings) < 0.50, reject. MSMT17 OSNet same-person median=0.680 (p25=0.537), diff-person median=0.386 (p75=0.444). Uses iterative median-based outlier removal in dedup job. Previously 0.60 (too close to same-person p25, rejected valid cross-angle embeddings). |
-| `REID_MATCH_THRESHOLD` | `0.50` | Body ReID match (live median) | MSMT17 OSNet same-person median=0.680. Live: gallery body median ≥0.50 + ambiguity 0.03 (not 2-of-3 unique-person votes — fixed 2026-07-17). |
+| `BODY_CONTAMINATION_THRESHOLD` | `0.50` | Body store gate vs **recent-window** cluster (≥3 embs in last 5m) | Never deletes older day bodies. Multi-day clothing change allowed to store. Same-visit stranger reject only. |
+| `REID_MATCH_THRESHOLD` | `0.50` | Customer body match (recent gallery median) | Only bodies with `captured_at` in RECENT_WINDOW. + ambiguity 0.03. |
 | `DEDUP_THRESHOLD` (dedup job) | `0.40` | Periodic dedup job only | Empirically determined. Catches 35% of same-pairs with 3% false merge rate |
 | `FACE_MIN_EYE_SPREAD` | `0.25` | Frontal gate | 3/4-view accepted, profile rejected |
 | `FACE_IDENTITY_MIN_SCORE` | `0.60` | Person creation gate | Min face_quality (det_score × frontality) |
@@ -79,9 +79,11 @@ Frame (2880×1620)
 | `MAX_EMBEDDINGS_PER_PERSON` (body) | `10` | Body storage cap | Pruned when exceeded |
 | `BODY_ONLY_CONFIDENCE_LIMIT` | `0.95` | Body-only match confidence | Body-only matches demoted to non-confident |
 | `ENABLE_RECENT_WINDOW_MATCHING` | `True` | Live engine feature flag | Toggles the recent-window relaxed matching (Step D). Rollback switch. |
-| `RECENT_WINDOW_MINUTES` | `5` | Live engine + backfill | Same-visit window. Body ReID reliable within a visit (same clothing); candidate pool small. |
+| `RECENT_WINDOW_MINUTES` | `5` | Live engine + backfill | Same-visit window. Dry-run window sweep: 7–15m does not improve purchase DISTINCT vs 5m. |
+| `BODY_MATCH_USE_RECENT_GALLERY_ONLY` | `True` | Live customer body ANN + median | Match only recent bodies; keep old rows (clothing change). |
+| `STAFF_BODY_USE_FULL_GALLERY` | `True` | Staff reattach | Activity-recent staff: full lifetime body gallery (uniform stable). |
 | `FACE_MATCH_THRESHOLD_RECENT` | `0.35` | Live engine recent-window face path | Relaxed from 0.40 within the window. Catches cross-angle handoffs (best face pair 0.35-0.40) that would otherwise create duplicates. Same metric as existing dedup job LATERAL MAX() — uses best cross-pair, not median (cross-angle faces need the best angle). |
-| `RECENT_BODY_SINGLE_MATCH_THRESHOLD` | `0.55` | Live body recent path | Median body sim, ≥2 bodies, face non-contradiction, recent `last_seen_at`. Replaces dead unique-person consensus. |
+| `RECENT_BODY_SINGLE_MATCH_THRESHOLD` | `0.55` | Live body recent path | Median vs **recent** bodies, ≥2 recent bodies, face non-contradiction, activity-recent (track/emb not stale last_seen alone). |
 | `FACE_MATCH_MEDIAN_THRESHOLD` | `0.30` | Live engine + backfill recent face path | When recent face best-pair is in grey zone [0.35, 0.40), require median of ALL cross-pairs ≥ this. Same-person min median=0.401, diff-person p50=0.200. At 0.30: 0% same-person rejected, 97.5% diff-person rejected. Only checked when ≥3 total cross-pairs. Catches single lucky crops from different people that hit 0.35+ on one pair. |
 | `OCCLUSION_IOU_THRESHOLD` | `0.10` | Face assign + body ReID | Pairwise body IoU ≥ this → both tracks `is_occluded=True` |
 | `FACE_ASSIGN_UPPER_BODY_FRAC` | `0.45` | Face assign (immature) | Face centre must sit in top 45% of body height |
@@ -552,7 +554,10 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 |----------|----------------|-----|
 | Live `FACE_MATCH_THRESHOLD` | **0.40** (not 0.48) | Code/env truth; CONTEXT older rows said 0.48 |
 | Face recent thr | **0.35** + median grey check; accept via `match_tier` | Grey zone was dead without match_tier |
-| Body live match | **Median** n≥2; 0.50 / recent 0.55; ambiguity 0.03 | 2-of-3 unique-person vote impossible |
+| Body live match | **Median** n≥2 recent bodies only; 0.55 (body_recent); ambiguity 0.03 | Clothing-dependent — no full-lifetime customer body match |
+| Body store contamination | Gate vs **recent** cluster only; never delete old day bodies | Multi-day outfit change OK |
+| Staff reattach gallery | Full lifetime if activity-recent | Uniform stable across days |
+| Activity-recent | track overlap OR body emb in window (not stale last_seen alone) | Dedup grafts left last_seen Jul-11 while tracks Jul-20 |
 | SAME_CAM reject | **No create** | Cloned staff/visitors |
 | MATCH STALE / attach FK | **No create**; SAVEPOINT; FOR SHARE; lock 1001 with reextract | Session poison + false IDs |
 | Create gates | face ≥0.60 + good_face≥2; INFO log | Keep; match can attach without relaxing create |

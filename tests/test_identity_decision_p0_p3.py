@@ -122,6 +122,7 @@ async def test_face_recent_non_recent_does_not_use_grey(engine, db):
         patch.object(
             engine, "_face_match_passes_cluster_median", new_callable=AsyncMock, return_value=True
         ),
+        patch.object(engine, "_person_is_activity_recent", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_search_similar", new_callable=AsyncMock, return_value=[]),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
@@ -155,6 +156,7 @@ async def test_body_recent_single_matches_without_consensus_votes(engine, db):
         patch.object(engine, "_search_similar", new_callable=AsyncMock) as body_search,
         patch.object(engine, "_person_body_count", new_callable=AsyncMock, return_value=3),
         patch.object(engine, "_person_body_median_sim", new_callable=AsyncMock, return_value=0.58),
+        patch.object(engine, "_person_is_activity_recent", new_callable=AsyncMock, return_value=True),
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_person_exists", new_callable=AsyncMock, return_value=True),
         patch.object(engine, "_attach_embeddings", new_callable=AsyncMock, return_value=True),
@@ -184,6 +186,7 @@ async def test_body_recent_single_matches_without_consensus_votes(engine, db):
 
 @pytest.mark.asyncio
 async def test_body_strict_median_match(engine, db):
+    """Strong recent-gallery body match (median ≥ 0.50) attaches."""
     pid = uuid.uuid4()
     cam = uuid.uuid4()
     body = _body(4)
@@ -192,6 +195,7 @@ async def test_body_strict_median_match(engine, db):
         patch.object(engine, "_search_similar", new_callable=AsyncMock) as body_search,
         patch.object(engine, "_person_body_count", new_callable=AsyncMock, return_value=4),
         patch.object(engine, "_person_body_median_sim", new_callable=AsyncMock, return_value=0.62),
+        patch.object(engine, "_person_is_activity_recent", new_callable=AsyncMock, return_value=True),
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_person_exists", new_callable=AsyncMock, return_value=True),
         patch.object(engine, "_attach_embeddings", new_callable=AsyncMock, return_value=True),
@@ -199,7 +203,8 @@ async def test_body_strict_median_match(engine, db):
         patch.object(engine, "_store_embedding", new_callable=AsyncMock),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
     ):
-        body_search.return_value = [_cand(pid, dist=0.35, recent=False)]
+        # Must be activity-recent: customer body gallery is recent-window only
+        body_search.return_value = [_cand(pid, dist=0.35, recent=True)]
         person_id, score, conf, is_new, _ = await engine.decide_identity(
             db=db,
             mean_embedding=body,
@@ -219,13 +224,14 @@ async def test_body_ambiguous_top_two_rejected(engine, db):
     cam = uuid.uuid4()
     body = _body(5)
 
-    async def median_sim(db_, pid, emb):
+    async def median_sim(db_, pid, emb, recent_only=False):
         return 0.70 if pid == pid_a else 0.69
 
     with (
         patch.object(engine, "_search_similar", new_callable=AsyncMock) as body_search,
         patch.object(engine, "_person_body_count", new_callable=AsyncMock, return_value=3),
         patch.object(engine, "_person_body_median_sim", new_callable=AsyncMock, side_effect=median_sim),
+        patch.object(engine, "_person_is_activity_recent", new_callable=AsyncMock, return_value=True),
         patch.object(engine, "_has_same_camera_overlap", new_callable=AsyncMock, return_value=False),
         patch.object(engine, "_try_staff_reattach", new_callable=AsyncMock, return_value=None),
         patch.object(engine, "_create_new_person", new_callable=AsyncMock, return_value=None),

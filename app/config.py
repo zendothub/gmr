@@ -87,20 +87,21 @@ class Settings(BaseSettings):
     BODY_ONLY_CONFIDENCE_LIMIT: float = 0.95  # Body-only (no face) matches require higher confidence for re-identification
     # FACE_SEARCH_THRESHOLD intentionally removed — skip_body_reid logic has been eliminated (caused duplicate registrations)
 
-    # ── Recent-window matching (plan 2026-07-09) ─────────────────────────────
-    # Within a short window of a person's first_seen_at, body ReID is reliable
-    # (same visit → same clothing) and the candidate pool is small. Allow a
-    # relaxed face threshold + a single-candidate body override in that window
-    # to catch same-person cross-angle/cross-camera handoffs that the strict
-    # thresholds miss (which otherwise create duplicate identities that the
-    # dedup job then has to merge).
-    #
-    # Outside the window: unchanged strict behaviour (clothing changes make body
-    # ReID unreliable; larger candidate pool raises false-positive risk).
+    # ── Recent-window matching (plan 2026-07-09; body gallery 2026-07-20) ────
+    # Body ReID is clothing-dependent. Customer body match uses ONLY body
+    # embeddings with captured_at inside RECENT_WINDOW_MINUTES (same visit /
+    # outfit). Older bodies stay stored — mismatch does NOT delete them; we
+    # simply do not merge. Activity-recent = track_sessions overlap OR any
+    # body emb in the window (not stale person.last_seen alone).
+    # Staff reattach: activity-recent + FULL lifetime body gallery (uniform).
     ENABLE_RECENT_WINDOW_MATCHING: bool = True
     RECENT_WINDOW_MINUTES: int = 5
+    # Customer body ANN + median gallery restricted to this window.
+    BODY_MATCH_USE_RECENT_GALLERY_ONLY: bool = True
+    # Staff body median / reattach may use all stored bodies if activity-recent.
+    STAFF_BODY_USE_FULL_GALLERY: bool = True
     FACE_MATCH_THRESHOLD_RECENT: float = 0.35   # relaxed face match within the window (strict 0.40 outside)
-    RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 bodies, face non-contradiction)
+    RECENT_BODY_SINGLE_MATCH_THRESHOLD: float = 0.55  # single-candidate body override (median sim, ≥2 recent bodies, face non-contradiction)
     # Reject body match if top-2 person medians are within this gap (ambiguous clothing / uniforms).
     BODY_MATCH_AMBIGUITY: float = 0.03
     FACE_MATCH_MEDIAN_THRESHOLD: float = 0.30  # When recent face best-pair is in grey zone [0.35, 0.40),

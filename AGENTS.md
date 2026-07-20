@@ -35,7 +35,7 @@
 
 6. **Keep CONTEXT.md updated** — After any significant change (new model, threshold adjustment, architectural decision), update CONTEXT.md with the rationale, data, and date.
 
-7. **Recent-window matching is feature-flagged** — `ENABLE_RECENT_WINDOW_MATCHING` in `config.py`. Body-only merge (no usable face) is valid ONLY within the 5-min window (`RECENT_WINDOW_MINUTES`). Outside it: face **0.40** / body **median ≥0.50** (n_bodies≥2) + top-2 ambiguity gap (`BODY_MATCH_AMBIGUITY=0.03`). Live path no longer uses unique-person 2-of-3 body votes (dead — see CONTEXT #25). Body ReID is clothing-dependent — never trust body alone across days.
+7. **Recent-window matching is feature-flagged** — `ENABLE_RECENT_WINDOW_MATCHING` in `config.py`. Customer body match uses **only bodies with `captured_at` in `RECENT_WINDOW_MINUTES` (5)**. Older body rows stay stored — mismatch means **do not merge**, not delete. Activity-recent = track activity or body emb in window (not stale `person.last_seen` alone). Staff reattach: activity-recent + full body gallery (`STAFF_BODY_USE_FULL_GALLERY`). Face **0.40** outside window / **0.35** recent. Body median ≥**0.55** recent (n_bodies_recent≥2) + `BODY_MATCH_AMBIGUITY=0.03`. Body ReID is clothing-dependent — never trust body alone across days.
 
 8. **Camera-aware overlap** — Cross-camera overlap (entry + counter simultaneously) is expected for the same person. Only same-camera overlap blocks a merge. After SAME_CAM reject: **do not create** a new person (leave unassigned). The backfill script (`danger/merge_recent_window_duplicates.py`) must distinguish cameras, not use a global overlap check.
 

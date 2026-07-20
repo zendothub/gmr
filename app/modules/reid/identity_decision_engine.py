@@ -166,7 +166,9 @@ class IdentityDecisionEngine:
                         self.settings.ENABLE_RECENT_WINDOW_MATCHING
                         and face_sim >= self.settings.FACE_MATCH_THRESHOLD_RECENT
                         and face_sim > best_similarity
-                        and self._is_recent(face_candidate.get("last_seen_at"))
+                        and await self._person_is_recent(
+                            db, cand_id, face_candidate.get("last_seen_at")
+                        )
                     ):
                         ok = await self._face_match_passes_cluster_median(
                             db, cand_id, track_face_list, face_sim, recent_grey=True
@@ -184,18 +186,28 @@ class IdentityDecisionEngine:
                             f"Person: {str(cand_id)[:8]}"
                         )
 
-            # Step 2: Fallback to Body ReID matching (face non-contradiction + median).
-            # Candidates from _search_similar are already UNIQUE persons — the old
-            # "2-of-3 person_id votes" gate was structurally impossible. Match on
-            # median body sim to the full gallery, with ambiguity / recent tiers.
+            # Step 2: Body ReID — customer gallery = RECENT-WINDOW bodies only
+            # (same visit/outfit). Older body rows stay stored; mismatch → do not
+            # merge (never delete old bodies). Candidates UNIQUE by person.
             if not used_face and mean_embedding is not None:
-                candidates = await self._search_similar(db, mean_embedding, top_k=5)
+                recent_only = bool(self.settings.BODY_MATCH_USE_RECENT_GALLERY_ONLY)
+                candidates = await self._search_similar(
+                    db,
+                    mean_embedding,
+                    top_k=5,
+                    recent_body_only=recent_only,
+                )
 
                 # (body_median, n_bodies, candidate_dict) for face-compatible persons
                 scored_bodies: list = []
                 for candidate in candidates:
                     candidate_id = candidate["person_identity_id"]
-                    is_recent_candidate = self._is_recent(candidate.get("last_seen_at"))
+                    is_recent_candidate = await self._person_is_recent(
+                        db, candidate_id, candidate.get("last_seen_at")
+                    )
+                    # No recent activity / recent body cluster → skip (don't merge)
+                    if recent_only and not is_recent_candidate:
+                        continue
 
                     if face_embedding is not None:
                         candidate_faces = await self._get_person_face_embeddings(
@@ -216,11 +228,16 @@ class IdentityDecisionEngine:
                             if best_f_sim < exclusion_bar:
                                 continue
 
-                    n_bodies = await self._person_body_count(db, candidate_id)
+                    n_bodies = await self._person_body_count(
+                        db, candidate_id, recent_only=recent_only
+                    )
                     if n_bodies < 2:
                         continue
                     body_median = await self._person_body_median_sim(
-                        db, candidate_id, mean_embedding
+                        db,
+                        candidate_id,
+                        mean_embedding,
+                        recent_only=recent_only,
                     )
                     if body_median is None:
                         continue
@@ -242,19 +259,15 @@ class IdentityDecisionEngine:
                             )
 
                     if not ambiguous:
-                        is_recent_top = self._is_recent(top_cand.get("last_seen_at"))
-                        # Strict (any age): median ≥ REID_MATCH_THRESHOLD
-                        if top_med >= self.settings.REID_MATCH_THRESHOLD:
-                            best_candidate = top_cand
-                            best_similarity = top_med
-                            match_tier = "body"
-                            logger.info(
-                                f"[Body Match] ID {str(top_cand['person_identity_id'])[:8]} "
-                                f"body_median={top_med:.3f} ≥{self.settings.REID_MATCH_THRESHOLD} "
-                                f"(n_bodies={top_n})"
-                            )
-                        # Recent-window relaxed: slightly lower bar, same clothing
-                        elif (
+                        is_recent_top = await self._person_is_recent(
+                            db,
+                            top_cand["person_identity_id"],
+                            top_cand.get("last_seen_at"),
+                        )
+                        # Prefer body_recent label when recent-gallery mode (correct
+                        # threshold ordering: 0.55 recent before hanging on 0.50 bare).
+                        win_m = self.settings.RECENT_WINDOW_MINUTES
+                        if (
                             self.settings.ENABLE_RECENT_WINDOW_MATCHING
                             and is_recent_top
                             and top_med >= self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD
@@ -263,17 +276,42 @@ class IdentityDecisionEngine:
                             best_similarity = top_med
                             match_tier = "body_recent"
                             logger.info(
-                                f"[Body RECENT single] ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"[Body RECENT] ID {str(top_cand['person_identity_id'])[:8]} "
                                 f"body_median={top_med:.3f} "
                                 f"≥{self.settings.RECENT_BODY_SINGLE_MATCH_THRESHOLD} "
-                                f"(n_bodies={top_n}, "
-                                f"window={self.settings.RECENT_WINDOW_MINUTES}min)"
+                                f"(n_bodies_recent={top_n}, window={win_m}min)"
+                            )
+                        elif (
+                            not recent_only
+                            and top_med >= self.settings.REID_MATCH_THRESHOLD
+                        ):
+                            # Legacy full-gallery path only if feature flag off
+                            best_candidate = top_cand
+                            best_similarity = top_med
+                            match_tier = "body"
+                            logger.info(
+                                f"[Body Match] ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"body_median={top_med:.3f} ≥{self.settings.REID_MATCH_THRESHOLD} "
+                                f"(n_bodies={top_n})"
+                            )
+                        elif (
+                            recent_only
+                            and top_med >= self.settings.REID_MATCH_THRESHOLD
+                        ):
+                            # Strong recent-gallery match (also clears 0.50)
+                            best_candidate = top_cand
+                            best_similarity = top_med
+                            match_tier = "body_recent"
+                            logger.info(
+                                f"[Body RECENT strong] ID {str(top_cand['person_identity_id'])[:8]} "
+                                f"body_median={top_med:.3f} ≥{self.settings.REID_MATCH_THRESHOLD} "
+                                f"(n_bodies_recent={top_n}, window={win_m}min)"
                             )
                         else:
                             logger.debug(
                                 f"[Body Match] top ID {str(top_cand['person_identity_id'])[:8]} "
                                 f"median={top_med:.3f} n_bodies={top_n} recent={is_recent_top} "
-                                f"— below body bars"
+                                f"— below body bars (no merge; old bodies kept)"
                             )
 
             # Step 2b: Staff reattach — last resort before create-new.
@@ -716,13 +754,20 @@ class IdentityDecisionEngine:
             raise IdentityStoreError(str(e)) from e
 
     async def _search_similar(
-        self, db: AsyncSession, embedding: np.ndarray, top_k: int
+        self,
+        db: AsyncSession,
+        embedding: np.ndarray,
+        top_k: int,
+        recent_body_only: bool = False,
     ) -> list:
         """Search for similar body embeddings using pgvector cosine distance.
 
         Deduplicates by person_identity_id — returns the best match per unique
         person, rather than raw embeddings.  This prevents a single person with
         10 stored body embeddings from dominating the top-K results.
+
+        recent_body_only: restrict ANN to bodies captured within RECENT_WINDOW
+        (customer clothing-state gallery). Older bodies stay in DB unused here.
         """
         try:
             embedding_list = embedding.tolist()
@@ -733,21 +778,42 @@ class IdentityDecisionEngine:
             # Fetch more candidates than needed for dedup by person
             fetch_limit = max(top_k * 5, 25)
 
-            query = text("""
-                SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
-                       pe.captured_at,
-                       pi.last_seen_at, pi.first_seen_at,
-                       pe.embedding <=> :embedding AS distance
-                FROM person_embeddings pe
-                JOIN person_identities pi ON pe.person_identity_id = pi.id
-                WHERE pe.captured_at > NOW() - INTERVAL '48 hours'
-                ORDER BY pe.embedding <=> :embedding
-                LIMIT :fetch_limit
-            """)
-
-            result = await db.execute(
-                query, {"embedding": str(embedding_list), "fetch_limit": fetch_limit}
-            )
+            if recent_body_only:
+                win = int(self.settings.RECENT_WINDOW_MINUTES)
+                query = text("""
+                    SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
+                           pe.captured_at,
+                           pi.last_seen_at, pi.first_seen_at,
+                           pe.embedding <=> :embedding AS distance
+                    FROM person_embeddings pe
+                    JOIN person_identities pi ON pe.person_identity_id = pi.id
+                    WHERE pe.captured_at > NOW() - make_interval(mins => :win)
+                    ORDER BY pe.embedding <=> :embedding
+                    LIMIT :fetch_limit
+                """)
+                result = await db.execute(
+                    query,
+                    {
+                        "embedding": str(embedding_list),
+                        "fetch_limit": fetch_limit,
+                        "win": win,
+                    },
+                )
+            else:
+                query = text("""
+                    SELECT pe.person_identity_id, pe.camera_id, pe.crop_quality,
+                           pe.captured_at,
+                           pi.last_seen_at, pi.first_seen_at,
+                           pe.embedding <=> :embedding AS distance
+                    FROM person_embeddings pe
+                    JOIN person_identities pi ON pe.person_identity_id = pi.id
+                    WHERE pe.captured_at > NOW() - INTERVAL '48 hours'
+                    ORDER BY pe.embedding <=> :embedding
+                    LIMIT :fetch_limit
+                """)
+                result = await db.execute(
+                    query, {"embedding": str(embedding_list), "fetch_limit": fetch_limit}
+                )
             rows = result.fetchall()
 
             # Deduplicate: keep only the best match per person_identity_id
@@ -884,12 +950,10 @@ class IdentityDecisionEngine:
         return float(self.settings.REID_MATCH_THRESHOLD)
 
     def _is_recent(self, last_seen_at) -> bool:
-        """True if a candidate's last_seen_at is within RECENT_WINDOW_MINUTES.
+        """True if last_seen_at is within RECENT_WINDOW_MINUTES (fast path).
 
-        Uses last_seen_at (not first_seen_at) because the question is 'is this
-        person currently in the store?' — a staff member who arrived 6 hours
-        ago but was tracked 30 seconds ago IS recent.  first_seen_at would
-        incorrectly mark them as non-recent.
+        Prefer `_person_is_recent` which also checks track/emb activity when
+        person.last_seen_at is stale.
         """
         if last_seen_at is None:
             return False
@@ -903,6 +967,57 @@ class IdentityDecisionEngine:
             return (utc_now() - fs) <= timedelta(minutes=self.settings.RECENT_WINDOW_MINUTES)
         except Exception:
             return False
+
+    async def _person_is_activity_recent(
+        self, db: AsyncSession, person_id
+    ) -> bool:
+        """True if person has track activity or body emb in RECENT_WINDOW.
+
+        Ground truth for 'in store now' when person.last_seen_at is stale
+        (e.g. after dedup track grafts that skip last_seen updates).
+        """
+        if person_id is None:
+            return False
+        try:
+            win = int(self.settings.RECENT_WINDOW_MINUTES)
+            r = await db.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM track_sessions
+                        WHERE person_identity_id = :pid
+                          AND started_at IS NOT NULL
+                          AND COALESCE(ended_at, last_seen_at) >= NOW()
+                              - make_interval(mins => :win)
+                          AND started_at <= NOW() + interval '1 minute'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM person_embeddings
+                        WHERE person_identity_id = :pid
+                          AND captured_at >= NOW() - make_interval(mins => :win)
+                    )
+                    """
+                ),
+                {"pid": str(person_id), "win": win},
+            )
+            val = r.scalar()
+            # Real PG returns bool; AsyncMock/unit stubs must not truthy-match
+            if val is True or val is False:
+                return bool(val)
+            if isinstance(val, (int, np.bool_)):
+                return bool(val)
+            return False
+        except Exception as e:
+            logger.debug(f"activity recent check failed for {person_id}: {e}")
+            return False
+
+    async def _person_is_recent(
+        self, db: AsyncSession, person_id, last_seen_at=None
+    ) -> bool:
+        """Activity-aware recent: last_seen fast path OR track/emb activity."""
+        if self._is_recent(last_seen_at):
+            return True
+        return await self._person_is_activity_recent(db, person_id)
 
     async def _has_same_camera_overlap(
         self,
@@ -994,14 +1109,24 @@ class IdentityDecisionEngine:
                 return None
 
             scored: list[tuple] = []  # (body_median, cand)
+            staff_full = bool(self.settings.STAFF_BODY_USE_FULL_GALLERY)
             for cand in candidates:
-                if not self._is_recent(cand.get("last_seen_at")):
-                    continue
                 pid = cand["person_identity_id"]
-                n_bodies = await self._person_body_count(db, pid)
+                # Staff must be activity-recent (in store now); not day-old last_seen only
+                if not await self._person_is_recent(db, pid, cand.get("last_seen_at")):
+                    continue
+                # Full lifetime gallery for uniforms when flag on; else recent only
+                n_bodies = await self._person_body_count(
+                    db, pid, recent_only=not staff_full
+                )
                 if n_bodies < self.settings.STAFF_REATTACH_MIN_BODIES:
                     continue
-                body_median = await self._person_body_median_sim(db, pid, body_embedding)
+                body_median = await self._person_body_median_sim(
+                    db,
+                    pid,
+                    body_embedding,
+                    recent_only=not staff_full,
+                )
                 if body_median is None or body_median < self.settings.STAFF_REATTACH_BODY_MEDIAN:
                     continue
                 scored.append((body_median, cand))
@@ -1107,30 +1232,69 @@ class IdentityDecisionEngine:
             logger.error(f"Staff body search failed: {e}")
             return []
 
-    async def _person_body_count(self, db: AsyncSession, person_id) -> int:
+    async def _person_body_count(
+        self, db: AsyncSession, person_id, recent_only: bool = False
+    ) -> int:
         try:
-            r = await db.execute(text(
-                "SELECT COUNT(*) FROM person_embeddings"
-                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
-            ), {"pid": str(person_id)})
+            if recent_only:
+                win = int(self.settings.RECENT_WINDOW_MINUTES)
+                r = await db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM person_embeddings"
+                        " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                        " AND captured_at > NOW() - make_interval(mins => :win)"
+                    ),
+                    {"pid": str(person_id), "win": win},
+                )
+            else:
+                r = await db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM person_embeddings"
+                        " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                    ),
+                    {"pid": str(person_id)},
+                )
             return int(r.scalar() or 0)
         except Exception:
             return 0
 
-    async def _person_body_median_sim(self, db: AsyncSession, person_id, query_embedding: np.ndarray) -> Optional[float]:
-        """Median cosine similarity of `query_embedding` to ALL of a person's
-        stored body embeddings (consistency check — a single lucky crop is not
-        enough). OSNet embeddings are L2-normalized at extract; query is
-        normalized here defensively."""
+    async def _person_body_median_sim(
+        self,
+        db: AsyncSession,
+        person_id,
+        query_embedding: np.ndarray,
+        recent_only: bool = False,
+    ) -> Optional[float]:
+        """Median cosine of query vs person's body gallery.
+
+        recent_only=True: only bodies with captured_at in RECENT_WINDOW
+        (customer clothing-state match). Older bodies are never deleted —
+        they are simply not compared. Staff reattach uses recent_only=False
+        for full lifetime uniform gallery when STAFF_BODY_USE_FULL_GALLERY.
+        """
         try:
             q = np.asarray(query_embedding, dtype=np.float32)
             nq = np.linalg.norm(q)
             if nq > 0:
                 q = q / nq
-            r = await db.execute(text(
-                "SELECT embedding FROM person_embeddings"
-                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
-            ), {"pid": str(person_id)})
+            if recent_only:
+                win = int(self.settings.RECENT_WINDOW_MINUTES)
+                r = await db.execute(
+                    text(
+                        "SELECT embedding FROM person_embeddings"
+                        " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                        " AND captured_at > NOW() - make_interval(mins => :win)"
+                    ),
+                    {"pid": str(person_id), "win": win},
+                )
+            else:
+                r = await db.execute(
+                    text(
+                        "SELECT embedding FROM person_embeddings"
+                        " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                    ),
+                    {"pid": str(person_id)},
+                )
             sims = []
             for row in r.fetchall():
                 raw = row[0]
@@ -1275,12 +1439,14 @@ class IdentityDecisionEngine:
     ) -> bool:
         """Store a new embedding for an existing person (capped per identity).
 
-        Body contamination gate: if this person already has >=3 stored body
-        embeddings, checks the median cosine similarity of the new embedding
-        to existing ones. If median < BODY_CONTAMINATION_THRESHOLD (0.50),
-        reject it — it belongs to a different person whose body ReID falsely
-        matched. Uses median instead of min to avoid single-edge false positives
-        (OSNet chains different-person clusters via weak edges around 0.66-0.75).
+        Body contamination gate (2026-07-20): compare new emb only against
+        RECENT-WINDOW bodies of this person (same visit/outfit). If fewer than
+        3 recent bodies, allow store (first samples of this visit / outfit).
+        Older day bodies are NEVER deleted — multi-day clothing change is
+        expected. Same-visit stranger bodies still fail the recent median bar.
+
+        Staff with STAFF_BODY_USE_FULL_GALLERY still get the recent-window
+        store gate here (protect same-visit); full gallery is only for match.
 
         Returns False if person gone / contamination. Raises IdentityStoreError on FK flush fail.
         """
@@ -1291,13 +1457,21 @@ class IdentityDecisionEngine:
             logger.info(f"[STORE SKIP] reason=PERSON_GONE body person={str(person_id)[:8]}")
             return False
 
-        # ── Body contamination gate ───────────────────────────────────────
+        # ── Body contamination gate (recent gallery only — keep old bodies) ──
         new_emb = np.array(embedding.tolist(), dtype=np.float32)
-        existing_body = await db.execute(text(
-            "SELECT embedding FROM person_embeddings"
-            " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
-            " ORDER BY crop_quality DESC LIMIT 10"
-        ), {"pid": str(person_id)})
+        nn = np.linalg.norm(new_emb)
+        if nn > 0:
+            new_emb = new_emb / nn
+        win = int(self.settings.RECENT_WINDOW_MINUTES)
+        existing_body = await db.execute(
+            text(
+                "SELECT embedding FROM person_embeddings"
+                " WHERE person_identity_id = :pid AND embedding IS NOT NULL"
+                " AND captured_at > NOW() - make_interval(mins => :win)"
+                " ORDER BY crop_quality DESC LIMIT 10"
+            ),
+            {"pid": str(person_id), "win": win},
+        )
         existing_rows = existing_body.fetchall()
         if len(existing_rows) >= 3:
             sims = []
@@ -1307,16 +1481,20 @@ class IdentityDecisionEngine:
                     emb = np.array(eval(raw), dtype=np.float32)
                 else:
                     emb = np.array(raw, dtype=np.float32)
+                ne = np.linalg.norm(emb)
+                if ne > 0:
+                    emb = emb / ne
                 sim = float(np.dot(emb, new_emb))
                 sims.append(sim)
             median_sim = float(np.median(sims))
             if median_sim < self.settings.BODY_CONTAMINATION_THRESHOLD:
                 logger.warning(
                     f"Body embedding CONTAMINATION rejected for person {person_id}: "
-                    f"median_sim_to_existing={median_sim:.3f} < "
+                    f"median_sim_to_recent={median_sim:.3f} < "
                     f"{self.settings.BODY_CONTAMINATION_THRESHOLD} "
+                    f"(window={win}m) "
                     f"samples={[f'{s:.3f}' for s in sorted(sims)[:5]]} "
-                    f"(different person's body — OSNet false positive)"
+                    f"— not stored; older bodies kept (no merge on mismatch)"
                 )
                 return False
 
