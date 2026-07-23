@@ -76,10 +76,10 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Device session cleanup every 5 minutes
+    # Device session cleanup every 2 minutes
     _scheduler.add_job(
         cleanup_stale_sessions,
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(minutes=2),
         id="cleanup_stale_sessions",
         replace_existing=True,
     )

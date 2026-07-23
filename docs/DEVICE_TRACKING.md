@@ -43,7 +43,7 @@ When the same credentials are shared across multiple users/devices, the system h
 
 ┌──────────────┐     ┌─────────────────────┐
 │  Scheduled   │────▶│  Deactivate idle     │
-│  Job (5 min) │     │  device sessions     │
+│  Job (2 min) │     │  device sessions     │
 │              │     │  Mark stale viewers  │
 └──────────────┘     └─────────────────────┘
 ```
@@ -168,7 +168,7 @@ SESSION_IDLE_TIMEOUT_SECONDS: int = 1800  # 30 minutes
 
 ## Cleanup
 
-A scheduled job runs every **5 minutes** (`cleanup_stale_sessions`):
+A scheduled job runs every **2 minutes** (`cleanup_stale_sessions`):
 
 1. **Device sessions:** Deactivates sessions where:
    - `expires_at` has passed, OR
