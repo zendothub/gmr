@@ -20,6 +20,7 @@ from app.modules.analytics.schemas import (
     DemographicsTableResponse,
     VisitorEntryExitResponse,
     DashboardV2Response,
+    LiveViewersResponse,
 )
 from app.modules.analytics.service import AnalyticsService
 
@@ -316,3 +317,13 @@ async def analytics_metrics(
         start_time=start_time,
         end_time=end_time,
     )
+
+
+@router.get("/live-viewers", response_model=LiveViewersResponse)
+async def live_viewers(
+    store_id: Optional[UUID] = Query(None, description="Filter by store"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Real-time snapshot of devices currently watching live camera feeds."""
+    return await AnalyticsService.get_live_viewers(db, store_id=store_id)

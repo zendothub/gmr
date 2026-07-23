@@ -243,6 +243,10 @@ class Settings(BaseSettings):
     SMTP_FROM: str = "abdur@zendot.in"          # source / sender address
     NOTIFICATION_EMAIL: str = "tech@zendot.in"  # destination address for feature-request alerts
 
+    # ── Device session tracking ────────────────────────────────────────
+    # Inactive device sessions (no API activity) expire after this many seconds.
+    SESSION_IDLE_TIMEOUT_SECONDS: int = 1800  # 30 minutes
+
     # CORS (comma-separated dashboard origins)
     CORS_ORIGINS: str = (
         "http://localhost:3000,"

@@ -1,5 +1,6 @@
 """Auth Pydantic schemas."""
 
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
@@ -21,8 +22,32 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user_id: UUID
     email: str
+    session_count: int = 0
 
 
+# ── Device session schemas ───────────────────────────────────────────
+
+class DeviceSessionResponse(BaseModel):
+    id: UUID
+    device_hash: str
+    device_label: str
+    user_agent: str | None = None
+    ip_address: str | None = None
+    login_at: datetime
+    last_active_at: datetime
+    is_current_device: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class SessionsListResponse(BaseModel):
+    total_active_sessions: int
+    sessions: list[DeviceSessionResponse]
+
+
+class RevokeSessionResponse(BaseModel):
+    message: str
 class RefreshTokenResponse(BaseModel):
     """Returned by the refresh endpoint: a freshly rotated token pair."""
     access_token: str

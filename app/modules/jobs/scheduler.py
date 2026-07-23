@@ -13,6 +13,7 @@ from app.modules.jobs.tasks import (
     cleanup_old_storage,
     probe_camera_statuses,
     deduplicate_persons,
+    cleanup_stale_sessions,
 )
 
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -75,8 +76,16 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Device session cleanup every 5 minutes
+    _scheduler.add_job(
+        cleanup_stale_sessions,
+        IntervalTrigger(minutes=5),
+        id="cleanup_stale_sessions",
+        replace_existing=True,
+    )
+
     _scheduler.start()
-    logger.info("Background job scheduler started (5 jobs registered)")
+    logger.info("Background job scheduler started (6 jobs registered)")
     return _scheduler
 
 
