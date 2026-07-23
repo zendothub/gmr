@@ -33,18 +33,21 @@ async def start_stream(
     LAN laptop gets the correct IP (e.g. ``http://10.251.39.75:8889/...``)
     instead of ``localhost``.
     """
-    return await StreamingService.start_stream(db, camera_id, public_host=request.url.hostname)
+    return await StreamingService.start_stream(
+        db, camera_id, public_host=request.url.hostname, request=request,
+    )
 
 
 @router.post("/{camera_id}/stream/stop")
 async def stop_stream(
+    request: Request,
     camera_id: UUID,
     force: bool = Query(False, description="Force-stop even if other viewers remain"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Detach a viewer; the stream auto-stops once idle (or force-stop now)."""
-    return await StreamingService.stop_stream(db, camera_id, force=force)
+    return await StreamingService.stop_stream(db, camera_id, force=force, request=request)
 
 
 @router.get("/{camera_id}/stream/status", response_model=StreamStatusResponse)

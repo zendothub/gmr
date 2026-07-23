@@ -324,6 +324,34 @@ class AnalyticsMetricsResponse(BaseModel):
     purchase_data: Optional[PurchaseMetricData] = None
 
 
+# ── Live Viewers (real-time device tracking) ──────────────────────────────
+
+class LiveViewerEntry(BaseModel):
+    """A single device watching a live camera feed."""
+    device_hash: str
+    device_label: str
+    ip_address: str | None = None
+    camera_id: UUID
+    camera_name: str
+    viewing_since: datetime
+    duration_minutes: float
+
+
+class LiveViewerCamera(BaseModel):
+    """Per-camera breakdown of active viewers."""
+    camera_id: UUID
+    camera_name: str
+    active_viewers: int
+    viewers: list[LiveViewerEntry]
+
+
+class LiveViewersResponse(BaseModel):
+    """Real-time snapshot of devices watching live feeds."""
+    total_devices_connected: int
+    total_devices_watching_feeds: int
+    cameras: list[LiveViewerCamera]
+
+
 class DashboardV2Response(BaseModel):
     """Unified V2 dashboard response.
 

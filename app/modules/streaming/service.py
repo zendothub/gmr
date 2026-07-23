@@ -1,19 +1,23 @@
 """Streaming service - ties cameras to the StreamManager and snapshots."""
 
+from datetime import datetime, timezone
 from uuid import UUID
 
+from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException
 from loguru import logger
 
 from app.core.db.models.camera import Camera
+from app.core.db.models.stream_viewer import StreamViewerSession
 from app.modules.streaming.manager import StreamManager
 from app.modules.streaming.mediamtx import MediaMTXManager
 from app.modules.streaming.snapshot import grab_snapshot_jpeg
 from app.modules.streaming.schemas import (
     StreamEndpointsResponse, StreamStatusResponse,
 )
+from app.utils.device_fingerprint import fingerprint
 
 
 class StreamingService:
@@ -27,8 +31,21 @@ class StreamingService:
         return camera
 
     @staticmethod
+    def _client_info(request: Request | None) -> tuple[str, str]:
+        """Extract user-agent and IP from request."""
+        ua = ""
+        ip = ""
+        if request:
+            ua = request.headers.get("user-agent", "")
+            ip = request.client.host if request.client else ""
+        return ua, ip
+
+    @staticmethod
     async def start_stream(
-        db: AsyncSession, camera_id: UUID, public_host: str | None = None,
+        db: AsyncSession,
+        camera_id: UUID,
+        public_host: str | None = None,
+        request: Request | None = None,
     ) -> StreamEndpointsResponse:
         """Start (or attach a viewer to) the live preview for a camera."""
         camera = await StreamingService._get_camera(db, camera_id)
@@ -38,6 +55,28 @@ class StreamingService:
         endpoints = await anyio.to_thread.run_sync(
             manager.add_viewer, camera.id, camera.rtsp_url, None, public_host,
         )
+
+        # ── Track stream viewer ───────────────────────────────────────
+        if request:
+            ua, ip = StreamingService._client_info(request)
+            device_hash = fingerprint(ua, ip)
+            now = datetime.now(timezone.utc)
+
+            # Get user_id from request state if available (set by auth middleware)
+            user_id = getattr(request.state, "user_id", None)
+
+            viewer = StreamViewerSession(
+                user_id=user_id,
+                camera_id=camera.id,
+                device_hash=device_hash,
+                ip_address=ip,
+                user_agent=ua,
+                started_at=now,
+                last_heartbeat_at=now,
+            )
+            db.add(viewer)
+            await db.flush()
+
         return StreamEndpointsResponse(
             camera_id=camera.id,
             path=endpoints.path,
@@ -47,10 +86,34 @@ class StreamingService:
         )
 
     @staticmethod
-    async def stop_stream(db: AsyncSession, camera_id: UUID, force: bool = False) -> dict:
+    async def stop_stream(
+        db: AsyncSession,
+        camera_id: UUID,
+        force: bool = False,
+        request: Request | None = None,
+    ) -> dict:
         """Detach a viewer (or force-stop) the preview for a camera."""
         await StreamingService._get_camera(db, camera_id)
         manager = StreamManager.get_instance()
+
+        # ── Mark viewer session as ended ──────────────────────────────
+        if request:
+            ua, ip = StreamingService._client_info(request)
+            device_hash = fingerprint(ua, ip)
+            now = datetime.now(timezone.utc)
+
+            result = await db.execute(
+                select(StreamViewerSession).where(
+                    StreamViewerSession.camera_id == camera_id,
+                    StreamViewerSession.device_hash == device_hash,
+                    StreamViewerSession.ended_at.is_(None),
+                ).order_by(StreamViewerSession.started_at.desc()).limit(1)
+            )
+            viewer = result.scalar_one_or_none()
+            if viewer:
+                viewer.ended_at = now
+                await db.flush()
+
         if force:
             stopped = manager.stop_stream(camera_id)
             return {"message": "Stream stopped" if stopped else "Stream was not running"}

@@ -1173,3 +1173,58 @@ async def probe_camera_statuses():
         except Exception as e:
             await db.rollback()
             logger.error(f"Camera status probe job failed: {e}")
+
+
+# ── Device Session Cleanup ────────────────────────────────────────────────
+
+async def cleanup_stale_sessions():
+    """Deactivate device sessions that have expired or been idle too long.
+
+    Also marks stale stream viewer sessions as ended (stream reaped but
+    viewer row never cleaned up).
+    """
+    from app.config import get_settings
+    from app.core.db.models.device_session import DeviceSession
+    from app.core.db.models.stream_viewer import StreamViewerSession
+
+    settings = get_settings()
+    now = utc_now()
+    idle_cutoff = now - timedelta(seconds=settings.SESSION_IDLE_TIMEOUT_SECONDS)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # 1. Deactivate expired or idle device sessions
+            result = await db.execute(
+                update(DeviceSession)
+                .where(
+                    DeviceSession.is_active == True,
+                    (
+                        (DeviceSession.expires_at < now)
+                        | (DeviceSession.last_active_at < idle_cutoff)
+                    ),
+                )
+                .values(is_active=False)
+            )
+            device_count = result.rowcount
+            if device_count:
+                logger.info(f"Cleaned up {device_count} stale device sessions")
+
+            # 2. Mark stale stream viewer sessions as ended
+            stream_idle_cutoff = now - timedelta(hours=2)  # 2h idle = dead
+            result = await db.execute(
+                update(StreamViewerSession)
+                .where(
+                    StreamViewerSession.ended_at.is_(None),
+                    StreamViewerSession.last_heartbeat_at < stream_idle_cutoff,
+                )
+                .values(ended_at=now)
+            )
+            stream_count = result.rowcount
+            if stream_count:
+                logger.info(f"Marked {stream_count} stale stream viewer sessions as ended")
+
+            await db.commit()
+
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Session cleanup job failed: {e}")

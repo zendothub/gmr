@@ -197,3 +197,21 @@ class StreamManager:
             for key, handle in to_stop:
                 handle.publisher.stop()
                 logger.info(f"Stream reaped (idle) for camera {key}")
+
+                # ── Mark all active viewer sessions for this camera as ended ──
+                try:
+                    self._end_viewer_sessions(key)
+                except Exception:
+                    pass
+
+    def _end_viewer_sessions(self, camera_key: str) -> None:
+        """Mark all open StreamViewerSession rows for this camera as ended.
+
+        The periodic cleanup job (tasks.py) will handle this — the reaper
+        runs in a sync thread and cannot safely run async DB operations.
+        We log the event so it's traceable.
+        """
+        logger.debug(
+            f"Stream reaped for camera {camera_key}; "
+            f"viewer sessions will be cleaned up by periodic job"
+        )

@@ -9,6 +9,10 @@ from loguru import logger
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+
+settings = get_settings()
+
 from app.core.db.models.camera import Camera, Zone
 from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
@@ -2083,4 +2087,83 @@ class AnalyticsService:
                 }
                 for e in events
             ],
+        )
+
+    # ── Live Viewers (real-time device tracking) ──────────────────────
+
+    @staticmethod
+    async def get_live_viewers(
+        db: AsyncSession,
+        store_id: Optional[UUID] = None,
+    ) -> "LiveViewersResponse":
+        """Real-time snapshot of devices watching live camera feeds."""
+        from datetime import datetime, timezone
+        from app.core.db.models.stream_viewer import StreamViewerSession
+        from app.core.db.models.device_session import DeviceSession
+        from app.modules.analytics.schemas import (
+            LiveViewersResponse,
+            LiveViewerCamera,
+            LiveViewerEntry,
+        )
+        from app.utils.device_fingerprint import device_label
+
+        now = datetime.now(timezone.utc)
+
+        # Active device sessions (logged in, active in last 30 min)
+        device_query = select(func.count(DeviceSession.id)).where(
+            DeviceSession.is_active == True,
+            DeviceSession.last_active_at >= now - timedelta(seconds=settings.SESSION_IDLE_TIMEOUT_SECONDS),
+        )
+        device_result = await db.execute(device_query)
+        total_devices_connected = device_result.scalar() or 0
+
+        # Active stream viewers (ended_at is NULL = still watching)
+        viewer_query = select(StreamViewerSession).where(
+            StreamViewerSession.ended_at.is_(None),
+        )
+        viewer_result = await db.execute(viewer_query)
+        active_viewers = viewer_result.scalars().all()
+
+        # Group by camera
+        camera_map: dict[UUID, dict] = {}
+        for v in active_viewers:
+            cid = v.camera_id
+            if cid not in camera_map:
+                cam = await db.get(Camera, cid)
+                camera_map[cid] = {
+                    "camera_id": cid,
+                    "camera_name": cam.name if cam else "Unknown",
+                    "viewers": [],
+                }
+            duration_minutes = (now - v.started_at).total_seconds() / 60.0
+            camera_map[cid]["viewers"].append(
+                LiveViewerEntry(
+                    device_hash=v.device_hash,
+                    device_label=device_label(v.user_agent or ""),
+                    ip_address=v.ip_address,
+                    camera_id=cid,
+                    camera_name=camera_map[cid]["camera_name"],
+                    viewing_since=v.started_at,
+                    duration_minutes=round(duration_minutes, 1),
+                )
+            )
+
+        # Build camera list
+        cameras = []
+        for cid, data in camera_map.items():
+            cameras.append(
+                LiveViewerCamera(
+                    camera_id=data["camera_id"],
+                    camera_name=data["camera_name"],
+                    active_viewers=len(data["viewers"]),
+                    viewers=data["viewers"],
+                )
+            )
+
+        total_watching = len(active_viewers)
+
+        return LiveViewersResponse(
+            total_devices_connected=total_devices_connected,
+            total_devices_watching_feeds=total_watching,
+            cameras=cameras,
         )
