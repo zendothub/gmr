@@ -77,7 +77,7 @@ class AuthService:
         session_count = 0
         if request:
             settings = get_settings()
-            ua, ip = AuthService._get_client_info(request)
+            ua, ip = await AuthService._get_client_info(request)
             device_hash = fingerprint(ua, ip)
             now = datetime.now(timezone.utc)
             expires = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
@@ -195,7 +195,7 @@ class AuthService:
         # Determine which session is the current device
         current_hash = ""
         if request:
-            ua, ip = AuthService._get_client_info(request)
+            ua, ip = await AuthService._get_client_info(request)
             current_hash = fingerprint(ua, ip)
 
         session_list = []
