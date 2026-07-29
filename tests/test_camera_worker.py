@@ -2,11 +2,13 @@
 
 import uuid
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 import numpy as np
 
 from app.modules.ai_runtime.camera_worker import CameraWorker
 from app.modules.tracking.track_manager import ActiveTrack
+from app.modules.rule_engine.rule_evaluator import RuleEvent
+from app.modules.rule_engine.zone_event_detector import ZoneEvent
 
 
 CAMERA_CONFIG = {
@@ -28,8 +30,8 @@ RUNTIME_CONFIG = {
 
 @pytest.fixture
 def mock_worker():
-    with patch("app.modules.ai_runtime.camera_worker.LatestFrameBuffer") as mock_buf, \
-         patch("app.modules.ai_runtime.camera_worker.get_shared_detector") as mock_det:
+    with patch("app.modules.ai_runtime.camera_worker.LatestFrameBuffer"), \
+         patch("app.modules.ai_runtime.camera_worker.get_camera_detector"):
         worker = CameraWorker(CAMERA_CONFIG, RUNTIME_CONFIG)
         yield worker
 
@@ -125,3 +127,66 @@ async def test_close_track_session_fires_exit_event(mock_worker):
     assert len(exit_events) == 1
     assert exit_events[0].person_identity_id == track.person_identity_id
     assert exit_events[0].track_session_id == track.track_session_id
+
+
+def test_refresh_event_person_ids_fills_null_from_active_track(mock_worker):
+    """Same-frame ReID: rule events snapshot null; refresh from live tracks."""
+    sid = uuid.uuid4()
+    pid = uuid.uuid4()
+    track = ActiveTrack(local_track_id=7, track_session_id=sid, person_identity_id=pid)
+    mock_worker.track_manager.get_active_tracks = MagicMock(return_value=[track])
+
+    rule = RuleEvent(
+        rule_id=uuid.uuid4(),
+        rule_type="billing_interaction",
+        camera_id=uuid.uuid4(),
+        zone_id=uuid.uuid4(),
+        track_session_id=sid,
+        person_identity_id=None,
+        event_type="billing_interaction",
+        severity="info",
+        description="test",
+        metadata={},
+    )
+    zone = ZoneEvent(
+        event_type="zone_dwell_milestone",
+        camera_id=uuid.uuid4(),
+        zone_id=uuid.uuid4(),
+        track_session_id=sid,
+        person_identity_id=None,
+        description="dwell",
+        metadata={},
+    )
+    mock_worker._refresh_event_person_ids([rule], [zone])
+    assert rule.person_identity_id == pid
+    assert zone.person_identity_id == pid
+
+
+def test_refresh_event_person_ids_keeps_existing(mock_worker):
+    sid = uuid.uuid4()
+    existing = uuid.uuid4()
+    other = uuid.uuid4()
+    track = ActiveTrack(local_track_id=1, track_session_id=sid, person_identity_id=other)
+    mock_worker.track_manager.get_active_tracks = MagicMock(return_value=[track])
+    rule = RuleEvent(
+        rule_id=uuid.uuid4(),
+        rule_type="billing_interaction",
+        camera_id=uuid.uuid4(),
+        zone_id=uuid.uuid4(),
+        track_session_id=sid,
+        person_identity_id=existing,
+        event_type="billing_interaction",
+        severity="info",
+        description="test",
+        metadata={},
+    )
+    mock_worker._refresh_event_person_ids([rule], [])
+    assert rule.person_identity_id == existing
+
+
+@pytest.mark.asyncio
+async def test_backfill_null_person_fks_noops_without_ids(mock_worker):
+    db = AsyncMock()
+    await mock_worker._backfill_null_person_fks(db, None, uuid.uuid4())
+    await mock_worker._backfill_null_person_fks(db, uuid.uuid4(), None)
+    db.execute.assert_not_called()

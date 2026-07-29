@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** July 17, 2026 (Identity P0–P5: body/recent face fix + SAME_CAM no-create + FK session poison fix; purchase/dwell audit)  
+> **Last updated:** July 29, 2026 (Purchase: null-BI person backfill on ReID + same-frame event snap; historical backfill script)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -548,6 +548,28 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 
 ---
 
+## 28. Null billing person_id after deferred identity (FIXED 2026-07-29)
+
+**Symptom:** Guest at counter long enough for `billing_interaction` (dwell≥50s) but analytics undercount — BI row exists with `person_identity_id=NULL`. Case e.g. `3235f0e9` Jul 24: short assigned slices + long unassigned fragments; also pure deferred-identity races.
+
+**Root causes:**
+1. Frame order: zone/rule eval **before** ReID → BI insert snapshots `track.person_identity_id` (often still None).
+2. Later ReID updated `track_sessions` + `person_entered_view` only — **never** prior `billing_interactions` / zone events.
+3. Analytics: `COUNT(DISTINCT person_identity_id)` skips NULL.
+4. Separate issue: ByteTrack fragmentation resets per-track dwell (no live track-stitch yet). Jul 27 audit: gated same-cam body stitch recovers only ~+4–6 guest purchases/day; thr 50→30 recovers ~+11 without merge — still short of store bill counts.
+
+**Live fix (`camera_worker.py`):**
+- `_refresh_event_person_ids` after ReID, before `_persist_events` (same-frame).
+- `_backfill_null_person_fks` on ReID resolve + track close: `UPDATE billing_interactions` / `events` SET person WHERE session matches AND person IS NULL.
+
+**Historical:** `danger/backfill_null_billing_person.py` (dry-run default; `--apply`). Joins null BI → session with person.
+
+**Not in this fix:** same-cam track stitch / dwell carry across ByteTrack IDs (body≥0.80, gap≤60s, bbox). Still deferred — staff uniform FP risk; pursue after null-BI repair + metrics.
+
+**Deploy:** `sudo systemctl restart retail-ai.service`.
+
+---
+
 ## Decision log — identity & analytics (must not be lost)
 
 | Decision | Value / action | Why |
@@ -565,6 +587,8 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 | Create gates | face ≥0.60 + good_face≥2; INFO log | Keep; match can attach without relaxing create |
 | Purchase metric | DISTINCT person_id, not is_staff | Critical findings #15 staff inflation fix |
 | Purchase dwell | **50s** (rule DB); do not drop to match 106 alone | Identity ceiling + bill vs person |
+| Null BI person backfill | Live on ReID/close + `danger/backfill_null_billing_person.py` | BI fired pre-identity was permanent undercount |
+| Counter track stitch | **Not shipped** (audit only Jul 27) | body+gap recovers little vs null-id ceiling; staff FP |
 | retail-ai-worker | Dedup/sweep/staff/probes/analytics | API freezes if jobs in uvicorn |
 | Track session debug log | `bbox_history` JSON object on close: boxes + best_crop_quality + torso_visibility_ratio + best_face_*; legacy rows stay bare arrays | No schema migration; debug tab `/api/v2/debug/track-sessions` |
 | MinIO protect | Also `bbox_history->>'best_face_crop_path'` when object-shaped | Unassigned face crops would otherwise be swept |
