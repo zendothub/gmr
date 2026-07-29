@@ -348,7 +348,53 @@ async def deduplicate_persons():
                     # ── Step 3: merge each loser into its winner ────────────────
                     # Each merge runs in its own SAVEPOINT (begin_nested). A single bad
                     # pair rolls back ONLY that merge and the batch continues.
+
+                    # ── Pre-merge: count purchase impact for each loser ─────────
+                    # The dashboard query is COUNT(DISTINCT person_identity_id)
+                    # WHERE NOT is_staff. Merging two non-staff persons → purchase
+                    # count drops by 1. Merging staff into non-staff → no change
+                    # (staff purchases were already excluded). Merging non-staff
+                    # into staff → purchases LOST (they become staff-associated).
+                    loser_ids_for_impact = [lid for _, lid in merges]
+                    winner_ids_for_impact = [wid for wid, _ in merges]
+                    # Fetch is_staff flags for all involved persons
+                    staff_lookup: dict[str, bool] = {}
+                    all_impact_ids = list(set(loser_ids_for_impact + winner_ids_for_impact))
+                    if all_impact_ids:
+                        staff_rows = await db.execute(text("""
+                            SELECT id::text, COALESCE(is_staff, false) AS is_staff
+                            FROM person_identities
+                            WHERE id::text = ANY(:ids)
+                        """), {"ids": all_impact_ids})
+                        staff_lookup = {r[0]: bool(r[1]) for r in staff_rows.fetchall()}
+                    # Count billing rows per loser (before merge)
+                    bi_counts = {}
+                    if loser_ids_for_impact:
+                        bi_rows = await db.execute(text("""
+                            SELECT person_identity_id::text, COUNT(*) AS n
+                            FROM billing_interactions
+                            WHERE person_identity_id::text = ANY(:ids)
+                            GROUP BY person_identity_id::text
+                        """), {"ids": loser_ids_for_impact})
+                        bi_counts = {r[0]: r[1] for r in bi_rows.fetchall()}
+
                     for winner_id, loser_id in merges:
+                        loser_staff = staff_lookup.get(loser_id, False)
+                        winner_staff = staff_lookup.get(winner_id, False)
+                        loser_bis = bi_counts.get(loser_id, 0)
+                        winner_bis = bi_counts.get(winner_id, 0)
+                        # After merge: loser's BIs will be reassigned to winner.
+                        # Impact: if both non-staff → DISTINCT drops by 1 (one person_id).
+                        # If loser is staff → no change (staff BIs already excluded).
+                        # If loser non-staff, winner staff → loser's purchases become
+                        # staff-associated → they DROP from analytics.
+                        will_decrease = (
+                            loser_bis > 0
+                            and winner_staff
+                            and not loser_staff
+                        )
+                        purchase_impact = "COUNT DECREASE" if will_decrease else "no change"
+
                         try:
                             extra_visits = meta.get(loser_id, {}).get("visits", 0)
                             async with db.begin_nested():
@@ -409,6 +455,9 @@ async def deduplicate_persons():
                             logger.info(
                                 f"Dedup: merged {loser_id[:8]} → {winner_id[:8]} "
                                 f"(sim>{threshold:.2f}, +{extra_visits} visits, "
+                                f"loser_staff={loser_staff}, winner_staff={winner_staff}, "
+                                f"loser_BI_rows={loser_bis}, winner_BI_rows={winner_bis}, "
+                                f"purchase_impact={purchase_impact}, "
                                 f"faces+body absorbed, gender re-voted)"
                             )
 

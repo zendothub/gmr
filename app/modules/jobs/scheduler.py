@@ -66,12 +66,14 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Periodic person-identity deduplication every 10 minutes.
+    # Periodic person-identity deduplication every 7 minutes.
     # Merges identities that were registered separately by different cameras for
     # the same physical person (cross-angle face similarity just below threshold).
+    # Faster cadence reduces the window where duplicate person_ids inflate
+    # the purchase count before the dashboard query aggregates them.
     _scheduler.add_job(
         deduplicate_persons,
-        IntervalTrigger(minutes=10),
+        IntervalTrigger(minutes=7),
         id="deduplicate_persons",
         replace_existing=True,
     )
