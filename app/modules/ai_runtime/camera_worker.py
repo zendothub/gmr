@@ -645,6 +645,68 @@ class CameraWorker:
     # Persistence (batched)
     # ------------------------------------------------------------------
 
+    def _refresh_event_person_ids(
+        self,
+        rule_events: List[RuleEvent],
+        zone_events: List[ZoneEvent],
+    ) -> None:
+        """Fill null person_identity_id on pending events from live tracks.
+
+        Rule/zone eval runs before ReID in the frame loop; same-batch identity
+        resolve would otherwise stamp billing_interactions with NULL forever.
+        """
+        by_sid: Dict[uuid.UUID, uuid.UUID] = {}
+        for t in self.track_manager.get_active_tracks():
+            if t.track_session_id and t.person_identity_id:
+                by_sid[t.track_session_id] = t.person_identity_id
+        for ev in rule_events:
+            if ev.person_identity_id is None and ev.track_session_id in by_sid:
+                ev.person_identity_id = by_sid[ev.track_session_id]
+        for ev in zone_events:
+            if ev.person_identity_id is None and ev.track_session_id in by_sid:
+                ev.person_identity_id = by_sid[ev.track_session_id]
+
+    async def _backfill_null_person_fks(
+        self,
+        db,
+        track_session_id: Optional[uuid.UUID],
+        person_id: Optional[uuid.UUID],
+    ) -> None:
+        """Attach resolved identity to prior null-person BI/event rows.
+
+        Billing may fire while identity is still deferred; analytics
+        COUNT(DISTINCT person_identity_id) ignores NULL, so backfill once known.
+        """
+        if not track_session_id or not person_id:
+            return
+        from sqlalchemy import update
+        from app.core.db.models.billing import BillingInteraction
+        from app.core.db.models.event import Event
+
+        bi_res = await db.execute(
+            update(BillingInteraction)
+            .where(
+                BillingInteraction.track_session_id == track_session_id,
+                BillingInteraction.person_identity_id.is_(None),
+            )
+            .values(person_identity_id=person_id)
+        )
+        ev_res = await db.execute(
+            update(Event)
+            .where(
+                Event.track_session_id == track_session_id,
+                Event.person_identity_id.is_(None),
+            )
+            .values(person_identity_id=person_id)
+        )
+        bi_n = getattr(bi_res, "rowcount", None) or 0
+        ev_n = getattr(ev_res, "rowcount", None) or 0
+        if bi_n or ev_n:
+            logger.info(
+                f"Backfilled null person FKs session={str(track_session_id)[:8]} "
+                f"person={str(person_id)[:8]} billing={bi_n} events={ev_n}"
+            )
+
     async def _persist_batch(
         self,
         frame,
@@ -663,6 +725,11 @@ class CameraWorker:
 
                 for track in reid_tracks:
                     await self._run_reid(db, frame, track)
+
+                # ReID may assign person_id after rule/zone eval this frame.
+                # Snap event person FKs from in-memory tracks before BI insert
+                # so COUNT(DISTINCT person_identity_id) is not lost to NULL.
+                self._refresh_event_person_ids(rule_events, zone_events)
 
                 if rule_events or zone_events:
                     await self._persist_events(db, frame, rule_events, zone_events)
@@ -877,6 +944,9 @@ class CameraWorker:
                             description=f"Person {str(track.person_identity_id)[:8]} entered view."
                         )
                     )
+                    await self._backfill_null_person_fks(
+                        db, track.track_session_id, track.person_identity_id
+                    )
 
                     # Persist demographics to PersonIdentity if available
                     if track.best_demographics:
@@ -941,6 +1011,13 @@ class CameraWorker:
             .where(TrackSession.id == track.track_session_id)
             .values(**session_values)
         )
+
+        # Ensure any null BI/events for this session pick up the final person_id
+        # (covers BI that fired before ReID on long counter dwells).
+        if track.person_identity_id:
+            await self._backfill_null_person_fks(
+                db, track.track_session_id, track.person_identity_id
+            )
         
         # 1.5 Fire person_left_view event
         from app.core.db.models.event import Event, EventSeverity
@@ -1629,6 +1706,12 @@ class CameraWorker:
                             .where(Event.track_session_id == track.track_session_id)
                             .where(Event.event_type == "person_entered_view")
                             .values(person_identity_id=person_id, description=f"Person {str(person_id)[:8]} entered view.")
+                        )
+
+                    # Prior BI/zone events often fire pre-identity (NULL person_id)
+                    if person_id:
+                        await self._backfill_null_person_fks(
+                            db, track.track_session_id, person_id
                         )
 
                 if person_id and track.best_demographics:
