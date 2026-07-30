@@ -32,19 +32,6 @@ class ZoneEventDetector:
         self._last_zones: Dict[int, Set[str]] = {}  # local_track_id -> set of zone_ids
         self._fired_milestones: Dict[Tuple[int, str], Set[int]] = {}  # (local_track_id, zone_id) -> set of milestones (30, 60, 120)
 
-    def remap_milestones(self, old_track_id: int, new_track_id: int) -> None:
-        """Transfer fired milestone state from old track to new track (track stitch).
-
-        When a new track is stitched to a recently closed fragment, the dwell
-        milestones that already fired for the old track must be carried forward
-        so they don't fire again on the new track.
-        """
-        keys_to_remap = [(tid, zid) for (tid, zid) in self._fired_milestones if tid == old_track_id]
-        for (_, zone_id) in keys_to_remap:
-            old_key = (old_track_id, zone_id)
-            new_key = (new_track_id, zone_id)
-            self._fired_milestones[new_key] = self._fired_milestones.pop(old_key, set())
-
     def detect(self, active_tracks: List[ActiveTrack]) -> List[ZoneEvent]:
         """
         Compare current track zones against previous frame to detect events.

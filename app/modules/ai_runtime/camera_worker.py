@@ -33,8 +33,8 @@ from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
 from app.utils.image_utils import extract_crop, save_image, save_image_async, resize_pad_square
 
-from app.utils.time_utils import utc_now, seconds_since
-from app.utils.geometry import polygon_from_json, bbox_iou, face_area_in_body_frac, bbox_center
+from app.utils.time_utils import utc_now
+from app.utils.geometry import polygon_from_json, bbox_iou, face_area_in_body_frac
 
 # How often to sample a track_observation row per track
 OBS_SAMPLE_SECONDS = 2.0
@@ -102,17 +102,6 @@ class CameraWorker:
         self.current_fps: float = 0.0
         self.error_message: Optional[str] = None
         self.last_tracker_reset: float = time.time()
-
-        # ── Same-camera track stitch graveyard ──────────────────────────────
-        # When a track goes stale, we save a snapshot before closing it.
-        # New tracks are checked against this graveyard to stitch fragments
-        # of the same physical person split by ByteTrack occlusions/timeouts.
-        # Each entry: (local_track_id, track_session_id, person_identity_id,
-        #              closed_at, last_bbox, best_body_embedding, zone_dwell_map)
-        self._recently_closed: List[tuple] = []
-        # Track the last local_track_id that was stitched to prevent
-        # re-stitching a new track to the same graveyard entry twice.
-        self._stitched_track_ids: Set[int] = set()
 
     # ------------------------------------------------------------------
     # Stream burn-in helpers
@@ -534,10 +523,7 @@ class CameraWorker:
                 active_tracks.append(track)
 
                 if track.track_session_id is None:
-                    # Attempt same-camera track stitch before creating a new session
-                    new_center = bbox_center(track.bbox)
-                    if not self._try_stitch_track(track, new_center):
-                        new_tracks.append(track)
+                    new_tracks.append(track)
 
                 if (
                     self.reid_enabled
@@ -870,10 +856,6 @@ class CameraWorker:
         """
         if not track.track_session_id:
             return
-
-        # Save to stitch graveyard before closing (so new tracks can re-attach)
-        self._save_to_graveyard(track)
-
         from sqlalchemy import update, select
         from app.core.db.models.tracking import TrackSession
         from app.core.db.models.person import PersonIdentity
@@ -1085,134 +1067,6 @@ class CameraWorker:
         """
         if full_path:
             CameraWorker._pending_minio_deletes.add(full_path)
-
-    # ── Same-camera track stitch ────────────────────────────────────────────
-
-    def _save_to_graveyard(self, track: ActiveTrack) -> None:
-        """Save a snapshot of a stale track before it is closed.
-
-        The graveyard holds recently closed tracks so that new tracks can be
-        checked for stitch eligibility (same person, ByteTrack split).
-        """
-        if not self.settings.ENABLE_TRACK_STITCH:
-            return
-        if track.bbox is None:
-            return
-        now = utc_now()
-        # Purge expired entries
-        max_age = self.settings.STITCH_GRAVEYARD_MAX_AGE
-        self._recently_closed = [
-            e for e in self._recently_closed
-            if (now - e[3]).total_seconds() < max_age
-        ]
-        # Evict oldest if over capacity
-        while len(self._recently_closed) >= self.settings.STITCH_GRAVEYARD_MAX_SIZE:
-            self._recently_closed.pop(0)
-        self._recently_closed.append((
-            track.local_track_id,
-            track.track_session_id,
-            track.person_identity_id,
-            now,
-            dict(track.bbox),
-            track.best_body_embedding,
-            dict(track.zone_enter_times),
-            dict(track.dwell_seconds),
-        ))
-
-    def _try_stitch_track(self, track: ActiveTrack, new_center: tuple) -> bool:
-        """Attempt to stitch a new track to a recently closed fragment.
-
-        Returns True if the stitch succeeded (track state was modified).
-        """
-        if not self.settings.ENABLE_TRACK_STITCH:
-            return False
-        if not self._recently_closed:
-            return False
-        now = utc_now()
-        max_gap = self.settings.STITCH_MAX_GAP_SECONDS
-
-        for i, entry in enumerate(self._recently_closed):
-            (old_tid, old_sid, old_pid, closed_at, old_bbox,
-             old_body_emb, old_zone_enter, old_dwell) = entry
-
-            # Gate 1: temporal proximity
-            gap = (now - closed_at).total_seconds()
-            if gap > max_gap:
-                continue
-
-            # Gate 2: bbox spatial proximity
-            old_center = bbox_center(old_bbox)
-            dist = ((new_center[0] - old_center[0]) ** 2 +
-                    (new_center[1] - old_center[1]) ** 2) ** 0.5
-            # Use a fixed reference diagonal (1920×1080) for consistency
-            frame_diag = (1920 ** 2 + 1080 ** 2) ** 0.5
-            if dist > self.settings.STITCH_MAX_BBOX_DISTANCE_FRAC * frame_diag:
-                continue
-
-            # Gate 3: anti-staff — never stitch to a staff track
-            if old_pid is not None and self._is_graveyard_staff(old_pid):
-                continue
-
-            # Gate 4: body similarity (if both have embeddings)
-            if old_body_emb is not None and track.best_body_embedding is not None:
-                sim = float(np.dot(old_body_emb, track.best_body_embedding) /
-                            (np.linalg.norm(old_body_emb) * np.linalg.norm(track.best_body_embedding)))
-                if sim < self.settings.STITCH_BODY_SIM_THRESHOLD:
-                    continue
-            # If old track has no body embedding, skip similarity gate
-            # (allow stitch based on temporal + spatial alone)
-
-            # ── All gates passed: perform the stitch ──────────────
-            # Carry forward track_session_id, identity, and zone dwell
-            if old_sid is not None:
-                track.track_session_id = old_sid
-            if old_pid is not None:
-                track.person_identity_id = old_pid
-            track.reid_resolved = old_pid is not None
-
-            # Carry forward zone dwell from the old fragment
-            # Only for zones the new track is STILL in
-            for zone_id, enter_time in old_zone_enter.items():
-                if zone_id in track.current_zones and zone_id not in track.zone_enter_times:
-                    track.zone_enter_times[zone_id] = enter_time
-                    track.dwell_seconds[zone_id] = (now - enter_time).total_seconds()
-            # Also carry forward dwell for zones already set (preserve original enter time)
-            for zone_id in track.zone_enter_times:
-                if zone_id in old_dwell:
-                    track.dwell_seconds[zone_id] = old_dwell[zone_id]
-
-            # Carry forward best body embedding for future ReID
-            if old_body_emb is not None and track.best_body_embedding is None:
-                track.best_body_embedding = old_body_emb
-
-            # Remap fired milestones to prevent duplicate dwell events
-            self.zone_event_detector.remap_milestones(old_tid, track.local_track_id)
-
-            # Mark consumed
-            self._stitched_track_ids.add(track.local_track_id)
-            self._recently_closed.pop(i)
-
-            logger.info(
-                f"Track stitch: new_track={track.local_track_id} "
-                f"old_track={old_tid} gap={gap:.1f}s dist={dist:.0f}px "
-                f"person={str(old_pid)[:8] if old_pid else 'None'} "
-                f"cam={self.camera_id}"
-            )
-            return True
-
-        return False
-
-    def _is_graveyard_staff(self, person_id: uuid.UUID) -> bool:
-        """Check if a person_id from the graveyard is staff.
-
-        We check the in-memory track state first; if the person is still
-        active in track_manager, we use its status. Otherwise we accept
-        the stitch (staff status is unknown for closed tracks).
-        """
-        for t in self.track_manager.get_active_tracks():
-            if t.person_identity_id == person_id:
-                return getattr(t, 'is_staff', False)
-        return False
 
     async def _run_reid(self, db, frame, track: ActiveTrack):
         """Run ReID pipeline: crop -> quality -> embedding -> accumulation -> decision."""
