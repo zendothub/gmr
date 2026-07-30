@@ -148,20 +148,6 @@ class Settings(BaseSettings):
     ENABLE_SAME_CAMERA_OVERLAP_GATE: bool = True
     SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 1.0
 
-    # ── Same-camera track stitch (2026-07-29) ──────────────────────────
-    # ByteTrack splits continuous counter visits into multiple track IDs
-    # (occlusion, 5s stale timeout). When a new track appears near where a
-    # recently closed track disappeared, stitch them so zone dwell continues
-    # across the gap and billing thresholds are not reset.
-    # Staff tracks are excluded (uniform body FPs); body similarity ≥0.80
-    # and bbox proximity together gate the merge.
-    ENABLE_TRACK_STITCH: bool = True
-    STITCH_MAX_GAP_SECONDS: float = 60.0           # max gap between track close and new track start
-    STITCH_MAX_BBOX_DISTANCE_FRAC: float = 0.15    # max bbox-center distance as fraction of frame diagonal
-    STITCH_BODY_SIM_THRESHOLD: float = 0.80        # min body embedding cosine similarity for stitch
-    STITCH_GRAVEYARD_MAX_SIZE: int = 20            # max recently closed tracks to keep
-    STITCH_GRAVEYARD_MAX_AGE: float = 60.0         # max age (seconds) before evicting from graveyard
-
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase
     # analytics exclude employees (who generate hundreds of billing events
