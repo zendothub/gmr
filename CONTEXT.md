@@ -581,14 +581,16 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 
 Steps:
 1. Fill null BI/event `person_identity_id` from `track_sessions` (lookback `BILLING_VISIT_LOOKBACK_HOURS=48`).
-2. Per enabled `billing_interaction` rule/zone: load sessions with zone dwell evidence in events; group by **same `person_identity_id` + same `camera_id`** with inter-fragment gap ≤ `BILLING_VISIT_STITCH_GAP_SECONDS=60`; **reject same-camera overlap** (different people).
-3. `total_dwell = sum(max event dwell per session)`; if ≥ rule thr and no existing BI for person+zone in visit window → insert one `billing_interactions` + matching event (`metadata.billing_visit_repair=true`, fragment ids, sum dwell). Skip `is_staff`.
+2. **Null-session stitch** (`_stitch_null_billing_sessions`): billing-zone sessions with NULL person, same camera as a non-staff person session with gap ≤ `BILLING_VISIT_STITCH_GAP_SECONDS=60` and **no time overlap**. Re-extract body (OSNet from `best_crop_path`) and/or face (InsightFace from `bbox_history.best_face_crop_path` or body crop). Accept if face_max ≥ 0.40 **or** (no face + body_median ≥ 0.80). Reject staff body ≥0.70, face contradiction <0.25, body/face ambiguity. On accept: set `track_sessions.person_identity_id` + null BI/events.
+3. Group by **same `person_identity_id` + same `camera_id`** (gap ≤60s; reject overlap). `total_dwell = sum(max event dwell per session)`; if ≥ rule thr and no existing BI for person+zone in visit window → insert one BI + event (`metadata.billing_visit_repair=true`). Skip `is_staff`.
 
-**Safety:** person_id grouping only — **no body-only stitch** in this job (staff uniform FP). Faceless null sessions still need body-only identity path / backfill separately.
+**Example fixed:** fragments 13s/24s/25s with only 25s ReID’d → body/face stitch attaches 13+24 to same person if same cam within 1 min → sum dwell 62s → BI if thr ≤62.
 
-**Config:** `ENABLE_BILLING_VISIT_REPAIR`, `BILLING_VISIT_LOOKBACK_HOURS`, `BILLING_VISIT_STITCH_GAP_SECONDS`, `BILLING_VISIT_DEFAULT_DWELL_THRESHOLD`.
+**Safety:** same-camera only; overlap never fused; staff never attach target; body thr high (0.80).
 
-**Tests:** `tests/test_billing_visit_repair.py` (cluster pure function).
+**Config:** `ENABLE_BILLING_VISIT_REPAIR`, lookback/gap/default thr, `ENABLE_BILLING_VISIT_BODY_STITCH`, `ENABLE_BILLING_VISIT_FACE_STITCH`, `BILLING_VISIT_STITCH_BODY_MEDIAN`, `BILLING_VISIT_STITCH_FACE_THRESHOLD`, `BILLING_VISIT_STITCH_MAX_STAFF_BODY`.
+
+**Tests:** `tests/test_billing_visit_repair.py` (cluster + temporal gap).
 
 ---
 
@@ -609,7 +611,7 @@ Steps:
 | Create gates | face ≥0.60 + good_face≥2; INFO log | Keep; match can attach without relaxing create |
 | Purchase metric | DISTINCT person_id, not is_staff | Critical findings #15 staff inflation fix |
 | Purchase dwell | rule DB thr (live was 25s Jul 31); do not drop only to chase store bills | Identity ceiling + bill vs person |
-| Counter visit repair | post-dedup `repair_fragmented_billing_visits`; person+cam+gap 60s; sum dwell | fragmentation missed BI; no body-only group |
+| Counter visit repair | post-dedup visit sum + same-cam body/face null stitch (gap 60s, body 0.80 / face 0.40) | fragmentation missed BI; 13+24+25 only-one-ReID case |
 | Null BI person backfill | Live on ReID/close + `danger/backfill_null_billing_person.py` | BI fired pre-identity was permanent undercount |
 | Counter track stitch | Live body stitch **not** shipped; **visit repair** sums dwell by person_id post-dedup (#29) | body-only stitch staff FP; person-id group safer |
 | retail-ai-worker | Dedup/sweep/staff/probes/analytics | API freezes if jobs in uvicorn |

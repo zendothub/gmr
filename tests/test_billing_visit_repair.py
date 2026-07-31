@@ -1,7 +1,7 @@
-"""Unit tests for fragmented billing visit clustering."""
+"""Unit tests for fragmented billing visit clustering / temporal stitch."""
 from datetime import datetime, timedelta, timezone
 
-from app.modules.jobs.tasks import cluster_sessions_into_visits
+from app.modules.jobs.tasks import cluster_sessions_into_visits, temporal_gap_seconds
 
 
 def _s(start_off: float, dur: float, dwell: float = 10.0) -> dict:
@@ -23,7 +23,6 @@ def test_cluster_single_session():
 
 
 def test_cluster_gap_within_threshold_sums_fragments():
-    # 20s + gap5 + 20s + gap5 + 15s → one visit (fragmentation case)
     sessions = [_s(0, 20, 20), _s(25, 20, 20), _s(50, 15, 15)]
     visits = cluster_sessions_into_visits(sessions, gap_seconds=60)
     assert len(visits) == 1
@@ -33,14 +32,29 @@ def test_cluster_gap_within_threshold_sums_fragments():
 
 
 def test_cluster_large_gap_splits_visits():
-    sessions = [_s(0, 20, 20), _s(200, 20, 20)]  # gap 180s > 60
+    sessions = [_s(0, 20, 20), _s(200, 20, 20)]
     visits = cluster_sessions_into_visits(sessions, gap_seconds=60)
     assert len(visits) == 2
 
 
 def test_cluster_same_cam_overlap_does_not_mix():
-    # Concurrent on same camera cannot be same person → new visit
     a = _s(0, 60, 30)
-    b = _s(10, 60, 30)  # starts while a still open
+    b = _s(10, 60, 30)
     visits = cluster_sessions_into_visits([a, b], gap_seconds=60)
     assert len(visits) == 2
+
+
+def test_temporal_gap_within_one_minute():
+    base = datetime(2026, 7, 31, 10, 0, 0, tzinfo=timezone.utc)
+    a0, a1 = base, base + timedelta(seconds=13)
+    b0, b1 = base + timedelta(seconds=20), base + timedelta(seconds=44)
+    g = temporal_gap_seconds(a0, a1, b0, b1)
+    assert g == 7.0
+    assert g <= 60
+
+
+def test_temporal_gap_overlap_is_none():
+    base = datetime(2026, 7, 31, 10, 0, 0, tzinfo=timezone.utc)
+    a0, a1 = base, base + timedelta(seconds=60)
+    b0, b1 = base + timedelta(seconds=10), base + timedelta(seconds=70)
+    assert temporal_gap_seconds(a0, a1, b0, b1) is None

@@ -6,8 +6,8 @@ Same logic as the periodic post-dedup job
 `app.modules.jobs.tasks.repair_fragmented_billing_visits`:
 
   1. Fill null BI/event person_identity_id from track_sessions
-  2. Group same person + camera sessions (gap ≤ BILLING_VISIT_STITCH_GAP_SECONDS)
-  3. Sum per-session max zone dwell; if sum ≥ rule thr and no BI yet → insert BI
+  2. Same-camera body/face stitch of null billing-zone sessions (gap ≤ 60s)
+  3. Group same person + camera sessions; sum max zone dwell; insert BI if needed
 
 Default: dry-run (apply=False). Pass --apply to write.
 
