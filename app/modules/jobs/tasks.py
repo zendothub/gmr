@@ -493,6 +493,368 @@ async def deduplicate_persons():
             await db.rollback()
             logger.error(f"Dedup job failed: {e}")
 
+    # After person merges stabilize FKs — repair fragmented counter dwell /
+    # null-person BI that same-session live backfill cannot fix.
+    try:
+        await repair_fragmented_billing_visits()
+    except Exception as e:
+        logger.error(f"Billing visit repair after dedup failed: {e}")
+
+
+def cluster_sessions_into_visits(
+    sessions: list[dict],
+    gap_seconds: float,
+) -> list[list[dict]]:
+    """Group same person+camera sessions when inter-fragment gap ≤ gap_seconds.
+
+    sessions: list of dicts with started_at, ended_at (datetimes). Must already
+    be filtered to one (person_id, camera_id). Sorted by started_at in-place copy.
+    Rejects same-camera temporal overlap hard collisions inside a visit by
+    starting a new visit (cannot be same person concurrent on one camera).
+    """
+    if not sessions:
+        return []
+    ordered = sorted(sessions, key=lambda s: s["started_at"])
+    visits: list[list[dict]] = []
+    cur: list[dict] = [ordered[0]]
+    cur_end = ordered[0]["ended_at"]
+    for s in ordered[1:]:
+        gap = (s["started_at"] - cur_end).total_seconds()
+        # Overlap on same camera → different people; never fuse
+        if s["started_at"] < cur_end:
+            visits.append(cur)
+            cur = [s]
+            cur_end = s["ended_at"]
+            continue
+        if gap <= gap_seconds:
+            cur.append(s)
+            if s["ended_at"] > cur_end:
+                cur_end = s["ended_at"]
+        else:
+            visits.append(cur)
+            cur = [s]
+            cur_end = s["ended_at"]
+    visits.append(cur)
+    return visits
+
+
+async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
+    """Post-dedup billing repair for track fragmentation + null bio person.
+
+    Fixes (person_identity_id grouping only — no body-onlystitch):
+      1. BI/events with NULL person where track_session already has person
+      2. Multi-session counter visit: sum per-session max zone dwell; if
+         sum ≥ rule dwell thr and no BI for that person+zone in visit window,
+         insert one BI (primary = highest-dwell session)
+    Safe levers: same person_id, same camera only, gap gate, skip is_staff.
+    """
+    import json
+    import uuid as _uuid
+
+    from app.config import get_settings
+    settings = get_settings()
+    stats = {
+        "null_bi_filled": 0,
+        "null_events_filled": 0,
+        "visits_checked": 0,
+        "bi_inserted": 0,
+        "skipped_staff": 0,
+        "skipped_has_bi": 0,
+        "skipped_under_thr": 0,
+    }
+    if not settings.ENABLE_BILLING_VISIT_REPAIR:
+        logger.debug("Billing visit repair disabled (ENABLE_BILLING_VISIT_REPAIR=False)")
+        return stats
+
+    lookback_h = int(settings.BILLING_VISIT_LOOKBACK_HOURS)
+    gap_sec = float(settings.BILLING_VISIT_STITCH_GAP_SECONDS)
+    default_thr = float(settings.BILLING_VISIT_DEFAULT_DWELL_THRESHOLD)
+    since = utc_now() - timedelta(hours=lookback_h)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # ── 1) Null BI/event person from session (same-session race) ──
+            if apply:
+                bi_res = await db.execute(
+                    text("""
+                        UPDATE billing_interactions bi
+                        SET person_identity_id = ts.person_identity_id,
+                            updated_at = now()
+                        FROM track_sessions ts
+                        WHERE bi.track_session_id = ts.id
+                          AND bi.person_identity_id IS NULL
+                          AND ts.person_identity_id IS NOT NULL
+                          AND bi.entered_at >= :since
+                    """),
+                    {"since": since},
+                )
+                ev_res = await db.execute(
+                    text("""
+                        UPDATE events e
+                        SET person_identity_id = ts.person_identity_id,
+                            updated_at = now()
+                        FROM track_sessions ts
+                        WHERE e.track_session_id = ts.id
+                          AND e.person_identity_id IS NULL
+                          AND ts.person_identity_id IS NOT NULL
+                          AND e.occurred_at >= :since
+                    """),
+                    {"since": since},
+                )
+                stats["null_bi_filled"] = bi_res.rowcount or 0
+                stats["null_events_filled"] = ev_res.rowcount or 0
+            else:
+                n_bi = (
+                    await db.execute(
+                        text("""
+                            SELECT COUNT(*) FROM billing_interactions bi
+                            JOIN track_sessions ts ON ts.id = bi.track_session_id
+                            WHERE bi.person_identity_id IS NULL
+                              AND ts.person_identity_id IS NOT NULL
+                              AND bi.entered_at >= :since
+                        """),
+                        {"since": since},
+                    )
+                ).scalar() or 0
+                n_ev = (
+                    await db.execute(
+                        text("""
+                            SELECT COUNT(*) FROM events e
+                            JOIN track_sessions ts ON ts.id = e.track_session_id
+                            WHERE e.person_identity_id IS NULL
+                              AND ts.person_identity_id IS NOT NULL
+                              AND e.occurred_at >= :since
+                        """),
+                        {"since": since},
+                    )
+                ).scalar() or 0
+                stats["null_bi_filled"] = int(n_bi)
+                stats["null_events_filled"] = int(n_ev)
+
+            # ── 2) Billing rules → zone + thr ──
+            rules = (
+                await db.execute(
+                    text("""
+                        SELECT id::text, zone_id::text, camera_id::text,
+                               dwell_threshold_seconds
+                        FROM rules
+                        WHERE is_enabled = TRUE
+                          AND rule_type::text IN (
+                            'BILLING_INTERACTION', 'billing_interaction'
+                          )
+                          AND zone_id IS NOT NULL
+                    """)
+                )
+            ).fetchall()
+            if not rules:
+                if apply:
+                    await db.commit()
+                logger.debug("Billing visit repair: no enabled billing rules")
+                return stats
+
+            for rule in rules:
+                zone_id = rule[1]
+                rule_cam = rule[2]  # may be null = all cameras
+                thr = float(rule[3]) if rule[3] is not None else default_thr
+
+                # Per-session max dwell in this billing zone (event evidence)
+                rows = (
+                    await db.execute(
+                        text("""
+                            WITH dwell_ev AS (
+                              SELECT
+                                e.track_session_id,
+                                MAX((e.metadata_json->>'dwell_seconds')::float) AS max_dwell
+                              FROM events e
+                              WHERE e.zone_id = CAST(:zid AS uuid)
+                                AND e.occurred_at >= :since
+                                AND e.track_session_id IS NOT NULL
+                                AND e.event_type IN (
+                                  'zone_exit', 'zone_dwell_milestone',
+                                  'billing_interaction', 'zone_dwell_exceeded'
+                                )
+                                AND e.metadata_json ? 'dwell_seconds'
+                              GROUP BY e.track_session_id
+                            )
+                            SELECT
+                              ts.id::text AS sid,
+                              ts.person_identity_id::text AS pid,
+                              ts.camera_id::text AS camera_id,
+                              ts.started_at AS started_at,
+                              COALESCE(ts.ended_at, ts.last_seen_at) AS ended_at,
+                              d.max_dwell AS max_dwell,
+                              COALESCE(pi.is_staff, false) AS is_staff
+                            FROM dwell_ev d
+                            JOIN track_sessions ts ON ts.id = d.track_session_id
+                            LEFT JOIN person_identities pi ON pi.id = ts.person_identity_id
+                            WHERE ts.person_identity_id IS NOT NULL
+                              AND ts.started_at IS NOT NULL
+                              AND COALESCE(ts.ended_at, ts.last_seen_at) IS NOT NULL
+                              AND (
+                                CAST(:rule_cam AS text) IS NULL
+                                OR ts.camera_id::text = CAST(:rule_cam AS text)
+                              )
+                            ORDER BY ts.person_identity_id, ts.camera_id, ts.started_at
+                        """),
+                        {
+                            "zid": zone_id,
+                            "since": since,
+                            "rule_cam": rule_cam,
+                        },
+                    )
+                ).mappings().all()
+
+                # Bucket by (person, camera)
+                buckets: dict[tuple[str, str], list[dict]] = {}
+                for r in rows:
+                    key = (r["pid"], r["camera_id"])
+                    buckets.setdefault(key, []).append(dict(r))
+
+                for (pid, camera_id), sess_list in buckets.items():
+                    visits = cluster_sessions_into_visits(sess_list, gap_sec)
+                    for visit in visits:
+                        stats["visits_checked"] += 1
+                        if visit[0]["is_staff"]:
+                            stats["skipped_staff"] += 1
+                            continue
+
+                        total_dwell = sum(float(s["max_dwell"] or 0.0) for s in visit)
+                        if total_dwell < thr:
+                            stats["skipped_under_thr"] += 1
+                            continue
+
+                        visit_start = min(s["started_at"] for s in visit)
+                        visit_end = max(s["ended_at"] for s in visit)
+                        # Pad window so BI entered_at (fire time) near visit matches
+                        pad = timedelta(seconds=gap_sec)
+                        win_start = visit_start - pad
+                        win_end = visit_end + pad
+
+                        sid_list = [s["sid"] for s in visit]
+                        existing = (
+                            await db.execute(
+                                text("""
+                                    SELECT 1 FROM billing_interactions bi
+                                    WHERE bi.zone_id = CAST(:zid AS uuid)
+                                      AND bi.person_identity_id = CAST(:pid AS uuid)
+                                      AND (
+                                        bi.track_session_id::text = ANY(:sids)
+                                        OR (
+                                          bi.entered_at >= :win_start
+                                          AND bi.entered_at <= :win_end
+                                        )
+                                      )
+                                    LIMIT 1
+                                """),
+                                {
+                                    "zid": zone_id,
+                                    "pid": pid,
+                                    "sids": sid_list,
+                                    "win_start": win_start,
+                                    "win_end": win_end,
+                                },
+                            )
+                        ).fetchone()
+                        if existing:
+                            stats["skipped_has_bi"] += 1
+                            continue
+
+                        primary = max(visit, key=lambda s: float(s["max_dwell"] or 0.0))
+                        meta = {
+                            "dwell_seconds": total_dwell,
+                            "billing_visit_repair": True,
+                            "source": "fragmented_visit_sum",
+                            "fragment_count": len(visit),
+                            "fragment_session_ids": sid_list,
+                            "dwell_threshold": thr,
+                            "stitch_gap_seconds": gap_sec,
+                        }
+                        if not apply:
+                            stats["bi_inserted"] += 1
+                            logger.info(
+                                f"[billing visit dry-run] person={pid[:8]} cam={camera_id[:8]} "
+                                f"zone={zone_id[:8]} fragments={len(visit)} "
+                                f"sum_dwell={total_dwell:.1f}s thr={thr:.0f}s"
+                            )
+                            continue
+
+                        await db.execute(
+                            text("""
+                                INSERT INTO billing_interactions (
+                                  id, camera_id, person_identity_id, track_session_id,
+                                  zone_id, entered_at, exited_at, dwell_seconds,
+                                  interaction_type, metadata_json, created_at, updated_at
+                                ) VALUES (
+                                  CAST(:id AS uuid), CAST(:camera_id AS uuid),
+                                  CAST(:pid AS uuid), CAST(:sid AS uuid),
+                                  CAST(:zid AS uuid), :entered_at, NULL, :dwell,
+                                  'billing_counter', CAST(:meta AS jsonb), now(), now()
+                                )
+                            """),
+                            {
+                                "id": str(_uuid.uuid4()),
+                                "camera_id": camera_id,
+                                "pid": pid,
+                                "sid": primary["sid"],
+                                "zid": zone_id,
+                                "entered_at": visit_start,
+                                "dwell": total_dwell,
+                                "meta": json.dumps(meta),
+                            },
+                        )
+                        # Matching event so history mirrors live path
+                        await db.execute(
+                            text("""
+                                INSERT INTO events (
+                                  id, camera_id, rule_id, zone_id, person_identity_id,
+                                  track_session_id, event_type, severity, description,
+                                  metadata_json, occurred_at, is_acknowledged,
+                                  is_false_positive, created_at, updated_at
+                                ) VALUES (
+                                  CAST(:id AS uuid), CAST(:camera_id AS uuid),
+                                  CAST(:rule_id AS uuid), CAST(:zid AS uuid),
+                                  CAST(:pid AS uuid), CAST(:sid AS uuid),
+                                  'billing_interaction', 'Low',
+                                  :desc, CAST(:meta AS jsonb), :occurred_at,
+                                  false, false, now(), now()
+                                )
+                            """),
+                            {
+                                "id": str(_uuid.uuid4()),
+                                "camera_id": camera_id,
+                                "rule_id": rule[0],
+                                "zid": zone_id,
+                                "pid": pid,
+                                "sid": primary["sid"],
+                                "desc": (
+                                    f"Billing interaction (visit repair, "
+                                    f"{total_dwell:.0f}s across {len(visit)} fragments)"
+                                ),
+                                "meta": json.dumps(meta),
+                                "occurred_at": visit_start,
+                            },
+                        )
+                        stats["bi_inserted"] += 1
+                        logger.info(
+                            f"Billing visit repair: person={pid[:8]} cam={camera_id[:8]} "
+                            f"fragments={len(visit)} sum_dwell={total_dwell:.1f}s thr={thr:.0f}s "
+                            f"primary_session={primary['sid'][:8]}"
+                        )
+
+            if apply:
+                await db.commit()
+            logger.info(
+                f"Billing visit repair done: null_bi={stats['null_bi_filled']} "
+                f"null_ev={stats['null_events_filled']} visits={stats['visits_checked']} "
+                f"inserted={stats['bi_inserted']} under_thr={stats['skipped_under_thr']} "
+                f"has_bi={stats['skipped_has_bi']} staff={stats['skipped_staff']} "
+                f"apply={apply}"
+            )
+            return stats
+        except Exception:
+            await db.rollback()
+            raise
+
 
 async def _clean_contaminated_face_embeddings(db, settings) -> int:
     """
