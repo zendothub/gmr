@@ -630,7 +630,7 @@ async def _stitch_null_billing_sessions(
 ) -> None:
     """Attach null person_id billing-zone sessions to nearby same-cam persons.
 
-    Same camera, gap ≤ gap_sec (default 60s = 1 min), no time overlap.
+    Same camera, gap ≤ gap_sec (default 30s), no time overlap.
     Accept: face_max ≥ FACE thr OR (no usable face + body_median ≥ BODY thr).
     Reject: face contradiction, staff body, body ambiguity.
     """
@@ -972,7 +972,7 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
 
     1. Fill null BI/event person from track_sessions
     2. Body/face stitch null billing-zone sessions → nearby same-cam person
-       (gap ≤ 60s, no overlap, high body thr / face thr, no staff)
+       (gap ≤ 30s, no overlap, high body thr / face thr, no staff)
     3. Group same person+camera sessions; sum max zone dwell; insert BI if
        sum ≥ rule thr and no BI yet
     """

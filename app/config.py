@@ -173,11 +173,11 @@ class Settings(BaseSettings):
     # each time so no fragment may hit dwell_threshold alone (missed BI),
     # or each can fire separately. Live _refresh/_backfill only same session.
     # After dedup: fill null BI person, body/face-stitch null billing-zone
-    # sessions (same cam, gap≤60s), then group by person+cam and sum dwell.
+    # sessions (same cam, gap≤30s), then group by person+cam and sum dwell.
     # Body stitch thr high (0.80); face thr 0.40; no staff attach target.
     ENABLE_BILLING_VISIT_REPAIR: bool = True
     BILLING_VISIT_LOOKBACK_HOURS: int = 48
-    BILLING_VISIT_STITCH_GAP_SECONDS: float = 60.0   # max gap between fragments / null stitch (1 min)
+    BILLING_VISIT_STITCH_GAP_SECONDS: float = 30.0   # max gap between fragments / null stitch
     BILLING_VISIT_DEFAULT_DWELL_THRESHOLD: float = 25.0  # fallback if rule thr null
     # Null-session stitch onto nearby same-camera person (billing zone only).
     # Body thr high (0.80) — CONTEXT audit; face 0.40 matches live thr.
