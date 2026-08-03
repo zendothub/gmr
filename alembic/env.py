@@ -21,6 +21,7 @@ from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.analytics import DailyAnalyticsSummary
 from app.core.db.models.storage import StorageObject
 from app.core.db.models.feature_request import FeatureRequest
+from app.core.db.models.audit import IdentityMergeEvent, FragmentedTrackEvent
 
 config = context.config
 

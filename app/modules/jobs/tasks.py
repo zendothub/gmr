@@ -313,12 +313,35 @@ async def deduplicate_persons():
                 # Fetch identity metadata to pick the best winner per component
                 id_list = list(all_ids)
                 meta_result = await db.execute(text("""
-                    SELECT id::text, best_face_score, first_seen_at, visit_count
+                    SELECT id::text, best_face_score, first_seen_at, visit_count, face_crop_path
                     FROM   person_identities
                     WHERE  id::text = ANY(:ids)
                 """), {"ids": id_list})
-                meta = {r[0]: {"score": r[1] or 0.0, "first_seen": r[2], "visits": r[3]}
-                        for r in meta_result.fetchall()}
+                meta = {
+                    r[0]: {
+                        "score": r[1] or 0.0,
+                        "first_seen": r[2],
+                        "visits": r[3] or 0,
+                        "face_crop": r[4],
+                    }
+                    for r in meta_result.fetchall()
+                }
+                # Best pairwise face sim for audit (pair keys unordered)
+                pair_sim: dict[tuple[str, str], float] = {}
+                for row in pairs:
+                    a, b, sim = str(row[0]), str(row[1]), float(row[2])
+                    key = (a, b) if a < b else (b, a)
+                    prev = pair_sim.get(key)
+                    if prev is None or sim > prev:
+                        pair_sim[key] = sim
+
+                track_cnt_res = await db.execute(text("""
+                    SELECT person_identity_id::text, COUNT(*)::int
+                    FROM track_sessions
+                    WHERE person_identity_id::text = ANY(:ids)
+                    GROUP BY person_identity_id
+                """), {"ids": id_list})
+                track_counts = {r[0]: int(r[1]) for r in track_cnt_res.fetchall()}
 
                 # Group IDs by their representative (root of union-find tree)
                 components: dict[str, list[str]] = {}
@@ -398,6 +421,52 @@ async def deduplicate_persons():
                                     SELECT face_crop_path   FROM person_identities      WHERE id::text = :loser
                                 """), {"loser": loser_id})
                                 deferred_minio_paths.extend(r[0] for r in paths_result.fetchall() if r[0])
+
+                                # Audit row BEFORE delete (loser id snapshot only)
+                                sim_key = (
+                                    (winner_id, loser_id)
+                                    if winner_id < loser_id
+                                    else (loser_id, winner_id)
+                                )
+                                face_sim = pair_sim.get(sim_key)
+                                await db.execute(text("""
+                                    INSERT INTO identity_merge_events (
+                                      merged_at, source,
+                                      winner_person_id, loser_person_id,
+                                      face_similarity, winner_face_score, loser_face_score,
+                                      winner_first_seen_at, loser_first_seen_at,
+                                      loser_visit_count, loser_track_count,
+                                      winner_visit_count_before,
+                                      winner_face_crop_path, loser_face_crop_path,
+                                      metadata_json, created_at, updated_at
+                                    ) VALUES (
+                                      now(), 'dedup',
+                                      CAST(:winner AS uuid), CAST(:loser AS uuid),
+                                      :face_sim, :w_score, :l_score,
+                                      :w_first, :l_first,
+                                      :l_visits, :l_tracks,
+                                      :w_visits,
+                                      :w_crop, :l_crop,
+                                      CAST(:meta AS jsonb), now(), now()
+                                    )
+                                """), {
+                                    "winner": winner_id,
+                                    "loser": loser_id,
+                                    "face_sim": face_sim,
+                                    "w_score": winner_meta.get("score"),
+                                    "l_score": loser_meta.get("score"),
+                                    "w_first": winner_first,
+                                    "l_first": loser_first,
+                                    "l_visits": int(extra_visits or 0),
+                                    "l_tracks": int(track_counts.get(loser_id, 0)),
+                                    "w_visits": int(winner_meta.get("visits") or 0),
+                                    "w_crop": winner_meta.get("face_crop"),
+                                    "l_crop": loser_meta.get("face_crop"),
+                                    "meta": __import__("json").dumps({
+                                        "threshold": threshold,
+                                        "source_job": "deduplicate_persons",
+                                    }),
+                                })
 
                                 # Delete loser (embeddings already absorbed → no cascade)
                                 await db.execute(
@@ -931,6 +1000,9 @@ async def _stitch_null_billing_sessions(
         )
         if not apply:
             continue
+        # camera_id from null session row
+        n_row = next((x for x in nulls if x["sid"] == sid), None)
+        cam_id = n_row["camera_id"] if n_row else None
         await db.execute(
             text("""
                 UPDATE track_sessions
@@ -964,6 +1036,43 @@ async def _stitch_null_billing_sessions(
         stats["null_bi_filled"] = stats.get("null_bi_filled", 0) + (bi_res.rowcount or 0)
         stats["null_events_filled"] = stats.get("null_events_filled", 0) + (
             ev_res.rowcount or 0
+        )
+        await db.execute(
+            text("""
+                INSERT INTO fragmented_track_events (
+                  occurred_at, event_type, person_identity_id, camera_id, zone_id,
+                  primary_track_session_id, fragment_session_ids, fragment_count,
+                  sum_dwell_seconds, stitch_gap_seconds, stitch_reason,
+                  body_median, face_max, metadata_json, created_at, updated_at
+                ) VALUES (
+                  now(), 'null_stitch',
+                  CAST(:pid AS uuid),
+                  CAST(:cam AS uuid),
+                  CAST(:zid AS uuid),
+                  CAST(:sid AS uuid),
+                  CAST(:sids AS jsonb), 1,
+                  :dwell, :gap, :reason,
+                  :body_med, :face_max,
+                  CAST(:meta AS jsonb), now(), now()
+                )
+            """),
+            {
+                "pid": pid,
+                "cam": cam_id,
+                "zid": zone_id,
+                "sid": sid,
+                "sids": __import__("json").dumps([sid]),
+                "dwell": float(n_row["max_dwell"]) if n_row and n_row.get("max_dwell") is not None else None,
+                "gap": gap_sec,
+                "reason": reason,
+                "body_med": b_med if b_med and b_med > 0 else None,
+                "face_max": f_max if f_max is not None and f_max >= 0 else None,
+                "meta": __import__("json").dumps({
+                    "source": "billing_visit_stitch",
+                    "bi_filled": bi_res.rowcount or 0,
+                    "events_filled": ev_res.rowcount or 0,
+                }),
+            },
         )
 
 
@@ -1229,6 +1338,7 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                             )
                             continue
 
+                        bi_id = str(_uuid.uuid4())
                         await db.execute(
                             text("""
                                 INSERT INTO billing_interactions (
@@ -1243,7 +1353,7 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                                 )
                             """),
                             {
-                                "id": str(_uuid.uuid4()),
+                                "id": bi_id,
                                 "camera_id": camera_id,
                                 "pid": pid,
                                 "sid": primary["sid"],
@@ -1282,6 +1392,42 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                                 ),
                                 "meta": json.dumps(meta),
                                 "occurred_at": visit_start,
+                            },
+                        )
+                        await db.execute(
+                            text("""
+                                INSERT INTO fragmented_track_events (
+                                  occurred_at, event_type, person_identity_id, camera_id,
+                                  zone_id, billing_interaction_id, primary_track_session_id,
+                                  fragment_session_ids, fragment_count, sum_dwell_seconds,
+                                  dwell_threshold, stitch_gap_seconds, metadata_json,
+                                  created_at, updated_at
+                                ) VALUES (
+                                  :occurred_at, 'billing_insert',
+                                  CAST(:pid AS uuid), CAST(:camera_id AS uuid),
+                                  CAST(:zid AS uuid), CAST(:bi_id AS uuid),
+                                  CAST(:sid AS uuid),
+                                  CAST(:sids AS jsonb), :frag_n, :dwell,
+                                  :thr, :gap, CAST(:meta AS jsonb),
+                                  now(), now()
+                                )
+                            """),
+                            {
+                                "occurred_at": visit_start,
+                                "pid": pid,
+                                "camera_id": camera_id,
+                                "zid": zone_id,
+                                "bi_id": bi_id,
+                                "sid": primary["sid"],
+                                "sids": json.dumps(sid_list),
+                                "frag_n": len(visit),
+                                "dwell": total_dwell,
+                                "thr": thr,
+                                "gap": gap_sec,
+                                "meta": json.dumps({
+                                    "source": "fragmented_visit_sum",
+                                    "fragment_session_ids": sid_list,
+                                }),
                             },
                         )
                         stats["bi_inserted"] += 1

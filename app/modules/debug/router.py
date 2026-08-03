@@ -14,6 +14,8 @@ from app.modules.debug.schemas import (
     PaginatedUniquePersonsResponse,
     PaginatedTracksResponse,
     PaginatedTrackSessionsResponse,
+    PaginatedIdentityMergeEventsResponse,
+    PaginatedFragmentedTrackEventsResponse,
 )
 from app.modules.debug.service import DebugService
 
@@ -112,4 +114,55 @@ async def list_track_sessions(
         camera_id=camera_id,
         has_face=has_face,
         has_billing=has_billing,
+    )
+
+
+@router.get("/merged-persons", response_model=PaginatedIdentityMergeEventsResponse)
+async def list_merged_persons(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None, description="Winner/loser UUID or source"),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+    source: Optional[str] = Query(None, description="e.g. dedup"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated identity merge audit (who lost → who won, timestamped)."""
+    return await DebugService.list_merged_persons(
+        db,
+        page=page,
+        size=size,
+        search=search,
+        start_time=start_time,
+        end_time=end_time,
+        source=source,
+    )
+
+
+@router.get("/fragmented-tracks", response_model=PaginatedFragmentedTrackEventsResponse)
+async def list_fragmented_tracks(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(
+        None, description="Person/billing/session UUID or event_type"
+    ),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+    event_type: Optional[str] = Query(
+        None,
+        description="billing_insert | null_stitch | null_bi_fill",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated fragmented-track / billing visit-repair audit events."""
+    return await DebugService.list_fragmented_tracks(
+        db,
+        page=page,
+        size=size,
+        search=search,
+        start_time=start_time,
+        end_time=end_time,
+        event_type=event_type,
     )
