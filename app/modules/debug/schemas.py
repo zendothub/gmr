@@ -150,6 +150,8 @@ class IdentityMergeEventItem(BaseModel):
     id: UUID
     merged_at: datetime
     source: str
+    job_run_id: Optional[UUID] = None
+    job_run_at: Optional[datetime] = None
     winner_person_id: Optional[UUID] = None
     loser_person_id: UUID
     face_similarity: Optional[float] = None
@@ -182,6 +184,8 @@ class FragmentedTrackEventItem(BaseModel):
     id: UUID
     occurred_at: datetime
     event_type: str
+    job_run_id: Optional[UUID] = None
+    job_run_at: Optional[datetime] = None
     person_identity_id: Optional[UUID] = None
     camera_id: Optional[UUID] = None
     camera_name: Optional[str] = None

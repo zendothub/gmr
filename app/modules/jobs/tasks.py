@@ -184,12 +184,15 @@ async def deduplicate_persons():
          • DELETE loser (cascades to person_embeddings / person_face_embeddings)
     4. Log a summary.
 
-    This job runs every 10 minutes.  It does NOT modify any config or realtime
+    This job runs every 6 minutes.  It does NOT modify any config or realtime
     state — only the PostgreSQL person tables.
     """
     from app.config import get_settings
     settings = get_settings()
     threshold = 0.40  # empirically determined from retail CCTV face distribution
+    import uuid as _uuid_mod
+    job_run_id = str(_uuid_mod.uuid4())
+    job_run_at = utc_now()
 
     async with AsyncSessionLocal() as db:
         try:
@@ -431,7 +434,7 @@ async def deduplicate_persons():
                                 face_sim = pair_sim.get(sim_key)
                                 await db.execute(text("""
                                     INSERT INTO identity_merge_events (
-                                      merged_at, source,
+                                      merged_at, source, job_run_id, job_run_at,
                                       winner_person_id, loser_person_id,
                                       face_similarity, winner_face_score, loser_face_score,
                                       winner_first_seen_at, loser_first_seen_at,
@@ -441,6 +444,7 @@ async def deduplicate_persons():
                                       metadata_json, created_at, updated_at
                                     ) VALUES (
                                       now(), 'dedup',
+                                      CAST(:job_run_id AS uuid), :job_run_at,
                                       CAST(:winner AS uuid), CAST(:loser AS uuid),
                                       :face_sim, :w_score, :l_score,
                                       :w_first, :l_first,
@@ -450,6 +454,8 @@ async def deduplicate_persons():
                                       CAST(:meta AS jsonb), now(), now()
                                     )
                                 """), {
+                                    "job_run_id": job_run_id,
+                                    "job_run_at": job_run_at,
                                     "winner": winner_id,
                                     "loser": loser_id,
                                     "face_sim": face_sim,
@@ -565,7 +571,10 @@ async def deduplicate_persons():
     # After person merges stabilize FKs — repair fragmented counter dwell /
     # null-person BI that same-session live backfill cannot fix.
     try:
-        await repair_fragmented_billing_visits()
+        await repair_fragmented_billing_visits(
+            job_run_id=job_run_id,
+            job_run_at=job_run_at,
+        )
     except Exception as e:
         logger.error(f"Billing visit repair after dedup failed: {e}")
 
@@ -696,6 +705,8 @@ async def _stitch_null_billing_sessions(
     settings,
     apply: bool,
     stats: dict,
+    job_run_id: str | None = None,
+    job_run_at=None,
 ) -> None:
     """Attach null person_id billing-zone sessions to nearby same-cam persons.
 
@@ -1040,12 +1051,14 @@ async def _stitch_null_billing_sessions(
         await db.execute(
             text("""
                 INSERT INTO fragmented_track_events (
-                  occurred_at, event_type, person_identity_id, camera_id, zone_id,
+                  occurred_at, event_type, job_run_id, job_run_at,
+                  person_identity_id, camera_id, zone_id,
                   primary_track_session_id, fragment_session_ids, fragment_count,
                   sum_dwell_seconds, stitch_gap_seconds, stitch_reason,
                   body_median, face_max, metadata_json, created_at, updated_at
                 ) VALUES (
                   now(), 'null_stitch',
+                  CAST(:job_run_id AS uuid), :job_run_at,
                   CAST(:pid AS uuid),
                   CAST(:cam AS uuid),
                   CAST(:zid AS uuid),
@@ -1057,6 +1070,8 @@ async def _stitch_null_billing_sessions(
                 )
             """),
             {
+                "job_run_id": job_run_id,
+                "job_run_at": job_run_at,
                 "pid": pid,
                 "cam": cam_id,
                 "zid": zone_id,
@@ -1076,7 +1091,12 @@ async def _stitch_null_billing_sessions(
         )
 
 
-async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
+async def repair_fragmented_billing_visits(
+    *,
+    apply: bool = True,
+    job_run_id: str | None = None,
+    job_run_at=None,
+) -> dict:
     """Post-dedup billing repair for track fragmentation + null person.
 
     1. Fill null BI/event person from track_sessions
@@ -1084,12 +1104,19 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
        (gap ≤ 30s, no overlap, high body thr / face thr, no staff)
     3. Group same person+camera sessions; sum max zone dwell; insert BI if
        sum ≥ rule thr and no BI yet
+
+    job_run_id / job_run_at: optional parent dedup cycle stamp (written on
+    fragmented_track_events so UI can group BI inserts by job run).
     """
     import json
     import uuid as _uuid
 
     from app.config import get_settings
     settings = get_settings()
+    if job_run_id is None:
+        job_run_id = str(_uuid.uuid4())
+    if job_run_at is None:
+        job_run_at = utc_now()
     stats = {
         "null_bi_filled": 0,
         "null_events_filled": 0,
@@ -1102,6 +1129,8 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
         "skipped_staff": 0,
         "skipped_has_bi": 0,
         "skipped_under_thr": 0,
+        "job_run_id": job_run_id,
+        "job_run_at": job_run_at.isoformat() if hasattr(job_run_at, "isoformat") else str(job_run_at),
     }
     if not settings.ENABLE_BILLING_VISIT_REPAIR:
         logger.debug("Billing visit repair disabled (ENABLE_BILLING_VISIT_REPAIR=False)")
@@ -1209,6 +1238,8 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                         settings=settings,
                         apply=apply,
                         stats=stats,
+                        job_run_id=job_run_id,
+                        job_run_at=job_run_at,
                     )
                 except Exception as e:
                     logger.warning(f"Billing null-session stitch failed zone={zone_id[:8]}: {e}")
@@ -1397,13 +1428,15 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                         await db.execute(
                             text("""
                                 INSERT INTO fragmented_track_events (
-                                  occurred_at, event_type, person_identity_id, camera_id,
+                                  occurred_at, event_type, job_run_id, job_run_at,
+                                  person_identity_id, camera_id,
                                   zone_id, billing_interaction_id, primary_track_session_id,
                                   fragment_session_ids, fragment_count, sum_dwell_seconds,
                                   dwell_threshold, stitch_gap_seconds, metadata_json,
                                   created_at, updated_at
                                 ) VALUES (
                                   :occurred_at, 'billing_insert',
+                                  CAST(:job_run_id AS uuid), :job_run_at,
                                   CAST(:pid AS uuid), CAST(:camera_id AS uuid),
                                   CAST(:zid AS uuid), CAST(:bi_id AS uuid),
                                   CAST(:sid AS uuid),
@@ -1414,6 +1447,8 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                             """),
                             {
                                 "occurred_at": visit_start,
+                                "job_run_id": job_run_id,
+                                "job_run_at": job_run_at,
                                 "pid": pid,
                                 "camera_id": camera_id,
                                 "zid": zone_id,
@@ -1427,6 +1462,7 @@ async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
                                 "meta": json.dumps({
                                     "source": "fragmented_visit_sum",
                                     "fragment_session_ids": sid_list,
+                                    "job_run_id": job_run_id,
                                 }),
                             },
                         )

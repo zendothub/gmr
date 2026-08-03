@@ -20,6 +20,13 @@ class IdentityMergeEvent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     source: Mapped[str] = mapped_column(String(40), nullable=False, default="dedup", index=True)
+    # Parent dedup job cycle (same id/at for all merges in one run)
+    job_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    job_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
     winner_person_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
@@ -61,6 +68,13 @@ class FragmentedTrackEvent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     # billing_insert | null_stitch | null_bi_fill
     event_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    # Parent dedup job that invoked visit-repair (groups BI inserts from one cycle)
+    job_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    job_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
     person_identity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),

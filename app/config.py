@@ -151,7 +151,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase
     # analytics exclude employees (who generate hundreds of billing events
-    # per shift).  Runs inside the periodic dedup job (every 10 min).
+    # per shift).  Runs inside the periodic dedup job (every 6 min).
     # ------------------------------------------------------------------
     STAFF_DURATION_THRESHOLD_SECONDS: int = 1800   # total visible time across all sessions (default 30 min)
     STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
