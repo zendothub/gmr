@@ -6,7 +6,8 @@ the event loop during heavy DB/MinIO operations (dedup, sweep, etc.).
 No GPU models, no camera workers, no HTTP endpoints — just scheduled jobs.
 
 Jobs registered:
-  - deduplicate_persons     every 10 min  (merge duplicates, absorb embeddings, re-vote gender)
+  - deduplicate_persons     every 10 min  (merge duplicates, absorb embeddings, re-vote gender;
+                            then repair_fragmented_billing_visits: null BI fill + visit dwell sum)
   - close_stale_track_sessions  every 5 min
   - probe_camera_statuses   every 2 min
   - aggregate_daily_analytics  daily 00:15

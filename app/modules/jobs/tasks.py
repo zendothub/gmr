@@ -493,6 +493,819 @@ async def deduplicate_persons():
             await db.rollback()
             logger.error(f"Dedup job failed: {e}")
 
+    # After person merges stabilize FKs — repair fragmented counter dwell /
+    # null-person BI that same-session live backfill cannot fix.
+    try:
+        await repair_fragmented_billing_visits()
+    except Exception as e:
+        logger.error(f"Billing visit repair after dedup failed: {e}")
+
+
+def cluster_sessions_into_visits(
+    sessions: list[dict],
+    gap_seconds: float,
+) -> list[list[dict]]:
+    """Group same person+camera sessions when inter-fragment gap ≤ gap_seconds.
+
+    sessions: list of dicts with started_at, ended_at (datetimes). Must already
+    be filtered to one (person_id, camera_id). Sorted by started_at in-place copy.
+    Rejects same-camera temporal overlap hard collisions inside a visit by
+    starting a new visit (cannot be same person concurrent on one camera).
+    """
+    if not sessions:
+        return []
+    ordered = sorted(sessions, key=lambda s: s["started_at"])
+    visits: list[list[dict]] = []
+    cur: list[dict] = [ordered[0]]
+    cur_end = ordered[0]["ended_at"]
+    for s in ordered[1:]:
+        gap = (s["started_at"] - cur_end).total_seconds()
+        # Overlap on same camera → different people; never fuse
+        if s["started_at"] < cur_end:
+            visits.append(cur)
+            cur = [s]
+            cur_end = s["ended_at"]
+            continue
+        if gap <= gap_seconds:
+            cur.append(s)
+            if s["ended_at"] > cur_end:
+                cur_end = s["ended_at"]
+        else:
+            visits.append(cur)
+            cur = [s]
+            cur_end = s["ended_at"]
+    visits.append(cur)
+    return visits
+
+
+def temporal_gap_seconds(a0, a1, b0, b1):
+    """Gap seconds between two intervals; None if they overlap (same-cam reject)."""
+    start = max(a0, b0)
+    end = min(a1, b1)
+    if end > start:
+        return None  # overlap
+    if b0 >= a1:
+        return (b0 - a1).total_seconds()
+    return (a0 - b1).total_seconds()
+
+
+def _parse_vec(raw):
+    import numpy as np
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, str):
+            v = np.asarray(eval(raw), dtype=np.float32).flatten()
+        else:
+            v = np.asarray(raw, dtype=np.float32).flatten()
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n
+        return v
+    except Exception:
+        return None
+
+
+def _cos_sim(a, b) -> float:
+    return float(__import__("numpy").dot(a, b))
+
+
+def _median_body_sim(query, gallery: list):
+    import numpy as np
+    if not gallery:
+        return None
+    return float(np.median([_cos_sim(query, g) for g in gallery]))
+
+
+def _max_face_sim(query, gallery: list):
+    if not gallery:
+        return None
+    return max(_cos_sim(query, g) for g in gallery)
+
+
+def _download_minio_crop(crop_path: str):
+    """Download BGR image from MinIO crop path; None on failure."""
+    if not crop_path:
+        return None
+    try:
+        import cv2
+        import numpy as np
+        from app.modules.storage.minio_client import BUCKET_PREFIX, get_client
+
+        key = crop_path
+        if key.startswith(f"{BUCKET_PREFIX}/"):
+            key = key[len(BUCKET_PREFIX) + 1 :]
+        if "/" in key and not key.startswith("crops/") and not key.startswith("snapshots/"):
+            key = key.split("/", 1)[1]
+        client = get_client()
+        resp = client.get_object(BUCKET_PREFIX, key)
+        data = resp.read()
+        resp.close()
+        resp.release_conn()
+        arr = np.frombuffer(data, np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        logger.debug(f"billing visit crop download failed {str(crop_path)[:60]}: {e}")
+        return None
+
+
+def _face_path_from_bbox_history(bbox_history):
+    if isinstance(bbox_history, dict):
+        p = bbox_history.get("best_face_crop_path")
+        if p:
+            return str(p)
+    return None
+
+
+async def _stitch_null_billing_sessions(
+    db,
+    *,
+    zone_id: str,
+    rule_cam,
+    since,
+    gap_sec: float,
+    settings,
+    apply: bool,
+    stats: dict,
+) -> None:
+    """Attach null person_id billing-zone sessions to nearby same-cam persons.
+
+    Same camera, gap ≤ gap_sec (default 30s), no time overlap.
+    Accept: face_max ≥ FACE thr OR (no usable face + body_median ≥ BODY thr).
+    Reject: face contradiction, staff body, body ambiguity.
+    """
+    use_body = bool(getattr(settings, "ENABLE_BILLING_VISIT_BODY_STITCH", True))
+    use_face = bool(getattr(settings, "ENABLE_BILLING_VISIT_FACE_STITCH", True))
+    if not use_body and not use_face:
+        return
+
+    body_thr = float(settings.BILLING_VISIT_STITCH_BODY_MEDIAN)
+    body_min = int(settings.BILLING_VISIT_STITCH_BODY_MIN_BODIES)
+    body_amb = float(settings.BILLING_VISIT_STITCH_BODY_AMBIGUITY)
+    face_thr = float(settings.BILLING_VISIT_STITCH_FACE_THRESHOLD)
+    face_contra = float(settings.BILLING_VISIT_STITCH_FACE_CONTRADICTION)
+    staff_body_max = float(settings.BILLING_VISIT_STITCH_MAX_STAFF_BODY)
+
+    rows = (
+        await db.execute(
+            text("""
+                WITH dwell_ev AS (
+                  SELECT
+                    e.track_session_id,
+                    MAX((e.metadata_json->>'dwell_seconds')::float) AS max_dwell
+                  FROM events e
+                  WHERE e.zone_id = CAST(:zid AS uuid)
+                    AND e.occurred_at >= :since
+                    AND e.track_session_id IS NOT NULL
+                    AND e.event_type IN (
+                      'zone_exit', 'zone_dwell_milestone',
+                      'billing_interaction', 'zone_dwell_exceeded'
+                    )
+                    AND e.metadata_json ? 'dwell_seconds'
+                  GROUP BY e.track_session_id
+                )
+                SELECT
+                  ts.id::text AS sid,
+                  ts.person_identity_id::text AS pid,
+                  ts.camera_id::text AS camera_id,
+                  ts.started_at AS started_at,
+                  COALESCE(ts.ended_at, ts.last_seen_at) AS ended_at,
+                  d.max_dwell AS max_dwell,
+                  ts.best_crop_path AS best_crop_path,
+                  ts.bbox_history AS bbox_history,
+                  COALESCE(pi.is_staff, false) AS is_staff
+                FROM dwell_ev d
+                JOIN track_sessions ts ON ts.id = d.track_session_id
+                LEFT JOIN person_identities pi ON pi.id = ts.person_identity_id
+                WHERE ts.started_at IS NOT NULL
+                  AND COALESCE(ts.ended_at, ts.last_seen_at) IS NOT NULL
+                  AND (
+                    CAST(:rule_cam AS text) IS NULL
+                    OR ts.camera_id::text = CAST(:rule_cam AS text)
+                  )
+            """),
+            {"zid": zone_id, "since": since, "rule_cam": rule_cam},
+        )
+    ).mappings().all()
+
+    nulls = []
+    assigned = []
+    for r in rows:
+        item = dict(r)
+        if item.get("pid"):
+            assigned.append(item)
+        else:
+            nulls.append(item)
+
+    if not nulls or not assigned:
+        return
+
+    # Build same-camera temporal candidate edges: null → person if gap ≤ gap_sec, no overlap
+    # person_ids that appear near at least one null
+    candidate_pids: set = set()
+    null_candidates: dict = {}  # sid -> list of pid
+    for n in nulls:
+        cands = []
+        for a in assigned:
+            if a["camera_id"] != n["camera_id"]:
+                continue
+            if a.get("is_staff"):
+                continue  # never attach null fragment to staff for purchase path
+            g = temporal_gap_seconds(
+                n["started_at"], n["ended_at"], a["started_at"], a["ended_at"]
+            )
+            if g is None:
+                continue  # overlap → different people
+            if g <= gap_sec:
+                cands.append(a["pid"])
+                candidate_pids.add(a["pid"])
+        null_candidates[n["sid"]] = list(dict.fromkeys(cands))
+
+    nulls_to_try = [n for n in nulls if null_candidates.get(n["sid"])]
+    if not nulls_to_try:
+        return
+
+    # Preload body/face galleries for candidate persons
+    pid_list = list(candidate_pids)
+    body_gal: dict = {p: [] for p in pid_list}
+    face_gal: dict = {p: [] for p in pid_list}
+
+    if use_body and pid_list:
+        b_rows = (
+            await db.execute(
+                text("""
+                    SELECT person_identity_id::text, embedding
+                    FROM person_embeddings
+                    WHERE person_identity_id::text = ANY(:pids)
+                      AND captured_at >= :since
+                """),
+                {"pids": pid_list, "since": since - timedelta(hours=1)},
+            )
+        ).fetchall()
+        for pid, emb in b_rows:
+            v = _parse_vec(emb)
+            if v is not None:
+                body_gal.setdefault(pid, []).append(v)
+
+    if use_face and pid_list:
+        f_rows = (
+            await db.execute(
+                text("""
+                    SELECT person_identity_id::text, embedding
+                    FROM person_face_embeddings
+                    WHERE person_identity_id::text = ANY(:pids)
+                """),
+                {"pids": pid_list},
+            )
+        ).fetchall()
+        for pid, emb in f_rows:
+            v = _parse_vec(emb)
+            if v is not None:
+                face_gal.setdefault(pid, []).append(v)
+
+    # Also reject if body strongly matches ANY staff (pollution)
+    staff_bodies = []
+    if use_body:
+        s_rows = (
+            await db.execute(
+                text("""
+                    SELECT pe.embedding
+                    FROM person_embeddings pe
+                    JOIN person_identities pi ON pi.id = pe.person_identity_id
+                    WHERE pi.is_staff = TRUE
+                      AND pe.captured_at >= :since
+                """),
+                {"since": since - timedelta(hours=1)},
+            )
+        ).fetchall()
+        for (emb,) in s_rows:
+            v = _parse_vec(emb)
+            if v is not None:
+                staff_bodies.append(v)
+
+    body_cache = {}
+    face_cache = {}
+    osnet = None
+    face_analyzer = None
+
+    def _body_emb(path):
+        nonlocal osnet
+        if not path or not use_body:
+            return None
+        if path in body_cache:
+            return body_cache[path]
+        img = _download_minio_crop(path)
+        if img is None:
+            body_cache[path] = None
+            return None
+        try:
+            if osnet is None:
+                from app.modules.reid.osnet_extractor import get_shared_extractor
+                osnet = get_shared_extractor()
+            emb = osnet.extract(img)
+            if emb is not None:
+                emb = _parse_vec(emb.tolist() if hasattr(emb, "tolist") else emb)
+        except Exception as e:
+            logger.debug(f"OSNet extract failed: {e}")
+            emb = None
+        body_cache[path] = emb
+        return emb
+
+    def _face_emb(path, body_path=None):
+        nonlocal face_analyzer
+        if not use_face:
+            return None
+        key = path or body_path
+        if not key:
+            return None
+        if key in face_cache:
+            return face_cache[key]
+        img = _download_minio_crop(path) if path else None
+        if img is None and body_path:
+            img = _download_minio_crop(body_path)
+        if img is None:
+            face_cache[key] = None
+            return None
+        try:
+            if face_analyzer is None:
+                from app.modules.reid.insightface_analyzer import get_shared_analyzer
+                face_analyzer = get_shared_analyzer()
+            res = face_analyzer.analyze(img)
+            emb = None
+            if res is not None and getattr(res, "embedding", None) is not None:
+                emb = _parse_vec(
+                    res.embedding.tolist()
+                    if hasattr(res.embedding, "tolist")
+                    else res.embedding
+                )
+        except Exception as e:
+            logger.debug(f"Face extract failed: {e}")
+            emb = None
+        face_cache[key] = emb
+        return emb
+
+    attaches = []  # (sid, pid, reason, body_med, face_max)
+
+    for n in nulls_to_try:
+        cands = null_candidates[n["sid"]]
+        if not cands:
+            continue
+
+        q_body = _body_emb(n.get("best_crop_path"))
+        face_path = _face_path_from_bbox_history(n.get("bbox_history"))
+        q_face = _face_emb(face_path, n.get("best_crop_path"))
+
+        # Staff body veto
+        if q_body is not None and staff_bodies:
+            staff_med = _median_body_sim(q_body, staff_bodies)
+            if staff_med is not None and staff_med >= staff_body_max:
+                stats["stitch_reject_staff"] = stats.get("stitch_reject_staff", 0) + 1
+                logger.debug(
+                    f"[stitch reject] sid={n['sid'][:8]} staff_body={staff_med:.3f}"
+                )
+                continue
+
+        scored = []  # (pid, body_med, face_max, accept_reason)
+        for pid in cands:
+            b_med = None
+            f_max = None
+            if q_body is not None:
+                gal = body_gal.get(pid) or []
+                if len(gal) >= body_min:
+                    b_med = _median_body_sim(q_body, gal)
+            if q_face is not None:
+                fgal = face_gal.get(pid) or []
+                if fgal:
+                    f_max = _max_face_sim(q_face, fgal)
+
+            # Face contradiction hard reject
+            if q_face is not None and f_max is not None and f_max < face_contra:
+                continue
+
+            accept = None
+            if f_max is not None and f_max >= face_thr:
+                accept = "face"
+            elif q_face is None and b_med is not None and b_med >= body_thr:
+                accept = "body"
+            elif (
+                q_face is not None
+                and f_max is not None
+                and f_max >= face_contra
+                and b_med is not None
+                and b_med >= body_thr
+            ):
+                # face present but mid-range; body very strong
+                accept = "body_face_ok"
+
+            if accept:
+                scored.append((pid, b_med or 0.0, f_max if f_max is not None else -1.0, accept))
+
+        if not scored:
+            stats["stitch_no_match"] = stats.get("stitch_no_match", 0) + 1
+            continue
+
+        # Rank: face first, then body
+        scored.sort(key=lambda x: (x[2], x[1]), reverse=True)
+        best = scored[0]
+        if len(scored) >= 2:
+            # Ambiguity on body among near face-ties
+            if abs(scored[0][1] - scored[1][1]) < body_amb and scored[0][2] < face_thr:
+                stats["stitch_reject_ambig"] = stats.get("stitch_reject_ambig", 0) + 1
+                continue
+            if scored[0][2] >= face_thr and scored[1][2] >= face_thr:
+                if abs(scored[0][2] - scored[1][2]) < 0.03:
+                    stats["stitch_reject_ambig"] = stats.get("stitch_reject_ambig", 0) + 1
+                    continue
+
+        pid, b_med, f_max, reason = best
+        attaches.append((n["sid"], pid, reason, b_med, f_max))
+
+    stitch_map = stats.setdefault("_stitch_map", {})
+    for sid, pid, reason, b_med, f_max in attaches:
+        stats["stitch_attached"] = stats.get("stitch_attached", 0) + 1
+        stitch_map[sid] = pid
+        logger.info(
+            f"[stitch {'dry-run' if not apply else 'apply'}] "
+            f"session={sid[:8]} → person={pid[:8]} via={reason} "
+            f"body={b_med:.3f} face={f_max if f_max >= 0 else None}"
+        )
+        if not apply:
+            continue
+        await db.execute(
+            text("""
+                UPDATE track_sessions
+                SET person_identity_id = CAST(:pid AS uuid),
+                    updated_at = now()
+                WHERE id = CAST(:sid AS uuid)
+                  AND person_identity_id IS NULL
+            """),
+            {"pid": pid, "sid": sid},
+        )
+        bi_res = await db.execute(
+            text("""
+                UPDATE billing_interactions
+                SET person_identity_id = CAST(:pid AS uuid),
+                    updated_at = now()
+                WHERE track_session_id = CAST(:sid AS uuid)
+                  AND person_identity_id IS NULL
+            """),
+            {"pid": pid, "sid": sid},
+        )
+        ev_res = await db.execute(
+            text("""
+                UPDATE events
+                SET person_identity_id = CAST(:pid AS uuid),
+                    updated_at = now()
+                WHERE track_session_id = CAST(:sid AS uuid)
+                  AND person_identity_id IS NULL
+            """),
+            {"pid": pid, "sid": sid},
+        )
+        stats["null_bi_filled"] = stats.get("null_bi_filled", 0) + (bi_res.rowcount or 0)
+        stats["null_events_filled"] = stats.get("null_events_filled", 0) + (
+            ev_res.rowcount or 0
+        )
+
+
+async def repair_fragmented_billing_visits(*, apply: bool = True) -> dict:
+    """Post-dedup billing repair for track fragmentation + null person.
+
+    1. Fill null BI/event person from track_sessions
+    2. Body/face stitch null billing-zone sessions → nearby same-cam person
+       (gap ≤ 30s, no overlap, high body thr / face thr, no staff)
+    3. Group same person+camera sessions; sum max zone dwell; insert BI if
+       sum ≥ rule thr and no BI yet
+    """
+    import json
+    import uuid as _uuid
+
+    from app.config import get_settings
+    settings = get_settings()
+    stats = {
+        "null_bi_filled": 0,
+        "null_events_filled": 0,
+        "stitch_attached": 0,
+        "stitch_reject_staff": 0,
+        "stitch_reject_ambig": 0,
+        "stitch_no_match": 0,
+        "visits_checked": 0,
+        "bi_inserted": 0,
+        "skipped_staff": 0,
+        "skipped_has_bi": 0,
+        "skipped_under_thr": 0,
+    }
+    if not settings.ENABLE_BILLING_VISIT_REPAIR:
+        logger.debug("Billing visit repair disabled (ENABLE_BILLING_VISIT_REPAIR=False)")
+        return stats
+
+    lookback_h = int(settings.BILLING_VISIT_LOOKBACK_HOURS)
+    gap_sec = float(settings.BILLING_VISIT_STITCH_GAP_SECONDS)
+    default_thr = float(settings.BILLING_VISIT_DEFAULT_DWELL_THRESHOLD)
+    since = utc_now() - timedelta(hours=lookback_h)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # ── 1) Null BI/event person from session (same-session race) ──
+            if apply:
+                bi_res = await db.execute(
+                    text("""
+                        UPDATE billing_interactions bi
+                        SET person_identity_id = ts.person_identity_id,
+                            updated_at = now()
+                        FROM track_sessions ts
+                        WHERE bi.track_session_id = ts.id
+                          AND bi.person_identity_id IS NULL
+                          AND ts.person_identity_id IS NOT NULL
+                          AND bi.entered_at >= :since
+                    """),
+                    {"since": since},
+                )
+                ev_res = await db.execute(
+                    text("""
+                        UPDATE events e
+                        SET person_identity_id = ts.person_identity_id,
+                            updated_at = now()
+                        FROM track_sessions ts
+                        WHERE e.track_session_id = ts.id
+                          AND e.person_identity_id IS NULL
+                          AND ts.person_identity_id IS NOT NULL
+                          AND e.occurred_at >= :since
+                    """),
+                    {"since": since},
+                )
+                stats["null_bi_filled"] = bi_res.rowcount or 0
+                stats["null_events_filled"] = ev_res.rowcount or 0
+            else:
+                n_bi = (
+                    await db.execute(
+                        text("""
+                            SELECT COUNT(*) FROM billing_interactions bi
+                            JOIN track_sessions ts ON ts.id = bi.track_session_id
+                            WHERE bi.person_identity_id IS NULL
+                              AND ts.person_identity_id IS NOT NULL
+                              AND bi.entered_at >= :since
+                        """),
+                        {"since": since},
+                    )
+                ).scalar() or 0
+                n_ev = (
+                    await db.execute(
+                        text("""
+                            SELECT COUNT(*) FROM events e
+                            JOIN track_sessions ts ON ts.id = e.track_session_id
+                            WHERE e.person_identity_id IS NULL
+                              AND ts.person_identity_id IS NOT NULL
+                              AND e.occurred_at >= :since
+                        """),
+                        {"since": since},
+                    )
+                ).scalar() or 0
+                stats["null_bi_filled"] = int(n_bi)
+                stats["null_events_filled"] = int(n_ev)
+
+            # ── 2) Billing rules → zone + thr ──
+            rules = (
+                await db.execute(
+                    text("""
+                        SELECT id::text, zone_id::text, camera_id::text,
+                               dwell_threshold_seconds
+                        FROM rules
+                        WHERE is_enabled = TRUE
+                          AND rule_type::text IN (
+                            'BILLING_INTERACTION', 'billing_interaction'
+                          )
+                          AND zone_id IS NOT NULL
+                    """)
+                )
+            ).fetchall()
+            if not rules:
+                if apply:
+                    await db.commit()
+                logger.debug("Billing visit repair: no enabled billing rules")
+                return stats
+
+            for rule in rules:
+                zone_id = rule[1]
+                rule_cam = rule[2]
+                thr = float(rule[3]) if rule[3] is not None else default_thr
+
+                # ── 2a) Stitch null sessions via body/face before visit sum ──
+                try:
+                    await _stitch_null_billing_sessions(
+                        db,
+                        zone_id=zone_id,
+                        rule_cam=rule_cam,
+                        since=since,
+                        gap_sec=gap_sec,
+                        settings=settings,
+                        apply=apply,
+                        stats=stats,
+                    )
+                except Exception as e:
+                    logger.warning(f"Billing null-session stitch failed zone={zone_id[:8]}: {e}")
+
+                # Per-session max dwell (after stitch may have assigned persons)
+                rows = (
+                    await db.execute(
+                        text("""
+                            WITH dwell_ev AS (
+                              SELECT
+                                e.track_session_id,
+                                MAX((e.metadata_json->>'dwell_seconds')::float) AS max_dwell
+                              FROM events e
+                              WHERE e.zone_id = CAST(:zid AS uuid)
+                                AND e.occurred_at >= :since
+                                AND e.track_session_id IS NOT NULL
+                                AND e.event_type IN (
+                                  'zone_exit', 'zone_dwell_milestone',
+                                  'billing_interaction', 'zone_dwell_exceeded'
+                                )
+                                AND e.metadata_json ? 'dwell_seconds'
+                              GROUP BY e.track_session_id
+                            )
+                            SELECT
+                              ts.id::text AS sid,
+                              ts.person_identity_id::text AS pid,
+                              ts.camera_id::text AS camera_id,
+                              ts.started_at AS started_at,
+                              COALESCE(ts.ended_at, ts.last_seen_at) AS ended_at,
+                              d.max_dwell AS max_dwell,
+                              COALESCE(pi.is_staff, false) AS is_staff
+                            FROM dwell_ev d
+                            JOIN track_sessions ts ON ts.id = d.track_session_id
+                            LEFT JOIN person_identities pi ON pi.id = ts.person_identity_id
+                            WHERE ts.started_at IS NOT NULL
+                              AND COALESCE(ts.ended_at, ts.last_seen_at) IS NOT NULL
+                              AND (
+                                CAST(:rule_cam AS text) IS NULL
+                                OR ts.camera_id::text = CAST(:rule_cam AS text)
+                              )
+                            ORDER BY ts.person_identity_id, ts.camera_id, ts.started_at
+                        """),
+                        {
+                            "zid": zone_id,
+                            "since": since,
+                            "rule_cam": rule_cam,
+                        },
+                    )
+                ).mappings().all()
+
+                stitch_map = stats.get("_stitch_map") or {}
+                buckets: dict = {}
+                for r in rows:
+                    item = dict(r)
+                    if not item.get("pid") and item["sid"] in stitch_map:
+                        item["pid"] = stitch_map[item["sid"]]
+                        item["is_staff"] = False
+                    if not item.get("pid"):
+                        continue
+                    key = (item["pid"], item["camera_id"])
+                    buckets.setdefault(key, []).append(item)
+
+                for (pid, camera_id), sess_list in buckets.items():
+                    visits = cluster_sessions_into_visits(sess_list, gap_sec)
+                    for visit in visits:
+                        stats["visits_checked"] += 1
+                        if visit[0]["is_staff"]:
+                            stats["skipped_staff"] += 1
+                            continue
+
+                        total_dwell = sum(float(s["max_dwell"] or 0.0) for s in visit)
+                        if total_dwell < thr:
+                            stats["skipped_under_thr"] += 1
+                            continue
+
+                        visit_start = min(s["started_at"] for s in visit)
+                        visit_end = max(s["ended_at"] for s in visit)
+                        pad = timedelta(seconds=gap_sec)
+                        win_start = visit_start - pad
+                        win_end = visit_end + pad
+                        sid_list = [s["sid"] for s in visit]
+
+                        existing = (
+                            await db.execute(
+                                text("""
+                                    SELECT 1 FROM billing_interactions bi
+                                    WHERE bi.zone_id = CAST(:zid AS uuid)
+                                      AND bi.person_identity_id = CAST(:pid AS uuid)
+                                      AND (
+                                        bi.track_session_id::text = ANY(:sids)
+                                        OR (
+                                          bi.entered_at >= :win_start
+                                          AND bi.entered_at <= :win_end
+                                        )
+                                      )
+                                    LIMIT 1
+                                """),
+                                {
+                                    "zid": zone_id,
+                                    "pid": pid,
+                                    "sids": sid_list,
+                                    "win_start": win_start,
+                                    "win_end": win_end,
+                                },
+                            )
+                        ).fetchone()
+                        if existing:
+                            stats["skipped_has_bi"] += 1
+                            continue
+
+                        primary = max(visit, key=lambda s: float(s["max_dwell"] or 0.0))
+                        meta = {
+                            "dwell_seconds": total_dwell,
+                            "billing_visit_repair": True,
+                            "source": "fragmented_visit_sum",
+                            "fragment_count": len(visit),
+                            "fragment_session_ids": sid_list,
+                            "dwell_threshold": thr,
+                            "stitch_gap_seconds": gap_sec,
+                        }
+                        if not apply:
+                            stats["bi_inserted"] += 1
+                            logger.info(
+                                f"[billing visit dry-run] person={pid[:8]} cam={camera_id[:8]} "
+                                f"zone={zone_id[:8]} fragments={len(visit)} "
+                                f"sum_dwell={total_dwell:.1f}s thr={thr:.0f}s"
+                            )
+                            continue
+
+                        await db.execute(
+                            text("""
+                                INSERT INTO billing_interactions (
+                                  id, camera_id, person_identity_id, track_session_id,
+                                  zone_id, entered_at, exited_at, dwell_seconds,
+                                  interaction_type, metadata_json, created_at, updated_at
+                                ) VALUES (
+                                  CAST(:id AS uuid), CAST(:camera_id AS uuid),
+                                  CAST(:pid AS uuid), CAST(:sid AS uuid),
+                                  CAST(:zid AS uuid), :entered_at, NULL, :dwell,
+                                  'billing_counter', CAST(:meta AS jsonb), now(), now()
+                                )
+                            """),
+                            {
+                                "id": str(_uuid.uuid4()),
+                                "camera_id": camera_id,
+                                "pid": pid,
+                                "sid": primary["sid"],
+                                "zid": zone_id,
+                                "entered_at": visit_start,
+                                "dwell": total_dwell,
+                                "meta": json.dumps(meta),
+                            },
+                        )
+                        await db.execute(
+                            text("""
+                                INSERT INTO events (
+                                  id, camera_id, rule_id, zone_id, person_identity_id,
+                                  track_session_id, event_type, severity, description,
+                                  metadata_json, occurred_at, is_acknowledged,
+                                  is_false_positive, created_at, updated_at
+                                ) VALUES (
+                                  CAST(:id AS uuid), CAST(:camera_id AS uuid),
+                                  CAST(:rule_id AS uuid), CAST(:zid AS uuid),
+                                  CAST(:pid AS uuid), CAST(:sid AS uuid),
+                                  'billing_interaction', 'Low',
+                                  :desc, CAST(:meta AS jsonb), :occurred_at,
+                                  false, false, now(), now()
+                                )
+                            """),
+                            {
+                                "id": str(_uuid.uuid4()),
+                                "camera_id": camera_id,
+                                "rule_id": rule[0],
+                                "zid": zone_id,
+                                "pid": pid,
+                                "sid": primary["sid"],
+                                "desc": (
+                                    f"Billing interaction (visit repair, "
+                                    f"{total_dwell:.0f}s across {len(visit)} fragments)"
+                                ),
+                                "meta": json.dumps(meta),
+                                "occurred_at": visit_start,
+                            },
+                        )
+                        stats["bi_inserted"] += 1
+                        logger.info(
+                            f"Billing visit repair: person={pid[:8]} cam={camera_id[:8]} "
+                            f"fragments={len(visit)} sum_dwell={total_dwell:.1f}s thr={thr:.0f}s "
+                            f"primary_session={primary['sid'][:8]}"
+                        )
+
+            if apply:
+                await db.commit()
+            logger.info(
+                f"Billing visit repair done: null_bi={stats['null_bi_filled']} "
+                f"null_ev={stats['null_events_filled']} "
+                f"stitch={stats['stitch_attached']} "
+                f"visits={stats['visits_checked']} inserted={stats['bi_inserted']} "
+                f"under_thr={stats['skipped_under_thr']} has_bi={stats['skipped_has_bi']} "
+                f"staff={stats['skipped_staff']} apply={apply}"
+            )
+            return stats
+        except Exception:
+            await db.rollback()
+            raise
+
 
 async def _clean_contaminated_face_embeddings(db, settings) -> int:
     """

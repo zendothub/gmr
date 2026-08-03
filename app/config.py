@@ -168,6 +168,29 @@ class Settings(BaseSettings):
     STAFF_REATTACH_AMBIGUITY: float = 0.03        # reject if top-2 staff body medians within this gap
     # STAFF_REATTACH_FACE_QUALITY_HIGH: float = 0.75  # FUTURE — high-quality face + low sim = hard veto
 
+    # ── Billing visit repair (post-dedup; 2026-07-31) ─────────────────
+    # ByteTrack splits one counter stay into N track_sessions; dwell resets
+    # each time so no fragment may hit dwell_threshold alone (missed BI),
+    # or each can fire separately. Live _refresh/_backfill only same session.
+    # After dedup: fill null BI person, body/face-stitch null billing-zone
+    # sessions (same cam, gap≤30s), then group by person+cam and sum dwell.
+    # Body stitch thr high (0.80); face thr 0.40; no staff attach target.
+    ENABLE_BILLING_VISIT_REPAIR: bool = True
+    BILLING_VISIT_LOOKBACK_HOURS: int = 48
+    BILLING_VISIT_STITCH_GAP_SECONDS: float = 30.0   # max gap between fragments / null stitch
+    BILLING_VISIT_DEFAULT_DWELL_THRESHOLD: float = 25.0  # fallback if rule thr null
+    # Null-session stitch onto nearby same-camera person (billing zone only).
+    # Body thr high (0.80) — CONTEXT audit; face 0.40 matches live thr.
+    # Reject same-camera time overlap (different people). No staff attach.
+    ENABLE_BILLING_VISIT_BODY_STITCH: bool = True
+    ENABLE_BILLING_VISIT_FACE_STITCH: bool = True
+    BILLING_VISIT_STITCH_BODY_MEDIAN: float = 0.80
+    BILLING_VISIT_STITCH_BODY_MIN_BODIES: int = 1
+    BILLING_VISIT_STITCH_BODY_AMBIGUITY: float = 0.05
+    BILLING_VISIT_STITCH_FACE_THRESHOLD: float = 0.40
+    BILLING_VISIT_STITCH_FACE_CONTRADICTION: float = 0.25
+    BILLING_VISIT_STITCH_MAX_STAFF_BODY: float = 0.70  # reject if staff body med ≥ this
+
     # ------------------------------------------------------------------
     # SigLIP2 — zero-shot gender classifier (pre-computed text embeddings)
     # ------------------------------------------------------------------

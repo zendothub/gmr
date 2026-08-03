@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** July 29, 2026 (Purchase: null-BI person backfill on ReID + same-frame event snap; historical backfill script)  
+> **Last updated:** July 31, 2026 (Billing visit repair post-dedup: fragmented dwell sum + null BI fill)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -564,9 +564,33 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 
 **Historical:** `danger/backfill_null_billing_person.py` (dry-run default; `--apply`). Joins null BI → session with person.
 
-**Not in this fix:** same-cam track stitch / dwell carry across ByteTrack IDs (body≥0.80, gap≤60s, bbox). Still deferred — staff uniform FP risk; pursue after null-BI repair + metrics.
+**Also not in #28 alone:** same-cam track stitch / dwell carry across ByteTrack IDs. See #29.
 
 **Deploy:** `sudo systemctl restart retail-ai.service`.
+
+---
+
+## 29. Fragmented counter visit billing repair (NEW 2026-07-31)
+
+**Bugs:**
+1. ByteTrack splits one continuous counter stay into N `track_sessions`; each `ActiveTrack.dwell_seconds` resets to 0 → no fragment hits rule thr → **missed purchase**.
+2. Null `billing_interactions.person_identity_id` when identity later attaches only to another fragment (live `_backfill_null_person_fks` is **same session only**).
+3. Live `_refresh_event_person_ids` only patches pending events same batch — not historical multi-session visits.
+
+**Fix (post-dedup job):** `repair_fragmented_billing_visits()` in `app/modules/jobs/tasks.py`, invoked at end of `deduplicate_persons()` (every 10 min). Also `danger/repair_fragmented_billing_visits.py` (`--apply` to write).
+
+Steps:
+1. Fill null BI/event `person_identity_id` from `track_sessions` (lookback `BILLING_VISIT_LOOKBACK_HOURS=48`).
+2. **Null-session stitch** (`_stitch_null_billing_sessions`): billing-zone sessions with NULL person, same camera as a non-staff person session with gap ≤ `BILLING_VISIT_STITCH_GAP_SECONDS=30` and **no time overlap**. Re-extract body (OSNet from `best_crop_path`) and/or face (InsightFace from `bbox_history.best_face_crop_path` or body crop). Accept if face_max ≥ 0.40 **or** (no face + body_median ≥ 0.80). Reject staff body ≥0.70, face contradiction <0.25, body/face ambiguity. On accept: set `track_sessions.person_identity_id` + null BI/events.
+3. Group by **same `person_identity_id` + same `camera_id`** (gap ≤30s; reject overlap). `total_dwell = sum(max event dwell per session)`; if ≥ rule thr and no existing BI for person+zone in visit window → insert one BI + event (`metadata.billing_visit_repair=true`). Skip `is_staff`.
+
+**Example fixed:** fragments 13s/24s/25s with only 25s ReID’d → body/face stitch attaches 13+24 to same person if same cam within 30s → sum dwell 62s → BI if thr ≤62.
+
+**Safety:** same-camera only; overlap never fused; staff never attach target; body thr high (0.80).
+
+**Config:** `ENABLE_BILLING_VISIT_REPAIR`, lookback/gap/default thr, `ENABLE_BILLING_VISIT_BODY_STITCH`, `ENABLE_BILLING_VISIT_FACE_STITCH`, `BILLING_VISIT_STITCH_BODY_MEDIAN`, `BILLING_VISIT_STITCH_FACE_THRESHOLD`, `BILLING_VISIT_STITCH_MAX_STAFF_BODY`.
+
+**Tests:** `tests/test_billing_visit_repair.py` (cluster + temporal gap).
 
 ---
 
@@ -586,9 +610,10 @@ Cross-process concurrency: live `pg_advisory_xact_lock(1001)` did **not** cover 
 | MATCH STALE / attach FK | **No create**; SAVEPOINT; FOR SHARE; lock 1001 with reextract | Session poison + false IDs |
 | Create gates | face ≥0.60 + good_face≥2; INFO log | Keep; match can attach without relaxing create |
 | Purchase metric | DISTINCT person_id, not is_staff | Critical findings #15 staff inflation fix |
-| Purchase dwell | **50s** (rule DB); do not drop to match 106 alone | Identity ceiling + bill vs person |
+| Purchase dwell | rule DB thr (live was 25s Jul 31); do not drop only to chase store bills | Identity ceiling + bill vs person |
+| Counter visit repair | post-dedup visit sum + same-cam body/face null stitch (gap 30s, body 0.80 / face 0.40) | fragmentation missed BI; 13+24+25 only-one-ReID case |
 | Null BI person backfill | Live on ReID/close + `danger/backfill_null_billing_person.py` | BI fired pre-identity was permanent undercount |
-| Counter track stitch | **Not shipped** (audit only Jul 27) | body+gap recovers little vs null-id ceiling; staff FP |
+| Counter track stitch | Live body stitch **not** shipped; **visit repair** sums dwell by person_id post-dedup (#29) | body-only stitch staff FP; person-id group safer |
 | retail-ai-worker | Dedup/sweep/staff/probes/analytics | API freezes if jobs in uvicorn |
 | Track session debug log | `bbox_history` JSON object on close: boxes + best_crop_quality + torso_visibility_ratio + best_face_*; legacy rows stay bare arrays | No schema migration; debug tab `/api/v2/debug/track-sessions` |
 | MinIO protect | Also `bbox_history->>'best_face_crop_path'` when object-shaped | Unassigned face crops would otherwise be swept |
