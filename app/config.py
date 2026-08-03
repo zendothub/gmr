@@ -178,7 +178,7 @@ class Settings(BaseSettings):
     ENABLE_BILLING_VISIT_REPAIR: bool = True
     BILLING_VISIT_LOOKBACK_HOURS: int = 48
     BILLING_VISIT_STITCH_GAP_SECONDS: float = 30.0   # max gap between fragments / null stitch
-    BILLING_VISIT_DEFAULT_DWELL_THRESHOLD: float = 25.0  # fallback if rule thr null
+    BILLING_VISIT_DEFAULT_DWELL_THRESHOLD: float = 20.0  # fallback if rule thr null
     # Null-session stitch onto nearby same-camera person (billing zone only).
     # Body thr high (0.80) — CONTEXT audit; face 0.40 matches live thr.
     # Reject same-camera time overlap (different people). No staff attach.

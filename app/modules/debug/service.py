@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.models.camera import Camera
 from app.core.db.models.tracking import TrackSession
+from app.core.db.models.person import PersonIdentity
+from app.core.db.models.audit import IdentityMergeEvent, FragmentedTrackEvent
 from app.modules.debug.schemas import (
     ActiveTracksRealtimeResponse,
     ActiveTrackResponse,
@@ -20,6 +22,10 @@ from app.modules.debug.schemas import (
     TrackSessionDebugItem,
     TrackSessionPersonSummary,
     PaginatedTrackSessionsResponse,
+    IdentityMergeEventItem,
+    PaginatedIdentityMergeEventsResponse,
+    FragmentedTrackEventItem,
+    PaginatedFragmentedTrackEventsResponse,
 )
 
 
@@ -554,4 +560,163 @@ class DebugService:
             total_identified_tracks=total_identified,
             total_inactive_tracks=total_inactive,
             active_tracks=active_tracks_list
+        )
+
+    @staticmethod
+    async def list_merged_persons(
+        db: AsyncSession,
+        page: int = 1,
+        size: int = 20,
+        search: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        source: Optional[str] = None,
+    ) -> PaginatedIdentityMergeEventsResponse:
+        filters = []
+        if start_time is not None:
+            filters.append(IdentityMergeEvent.merged_at >= start_time)
+        if end_time is not None:
+            filters.append(IdentityMergeEvent.merged_at <= end_time)
+        if source:
+            filters.append(IdentityMergeEvent.source == source)
+        if search:
+            term = f"%{search.strip()}%"
+            filters.append(
+                or_(
+                    IdentityMergeEvent.winner_person_id.cast(String).ilike(term),
+                    IdentityMergeEvent.loser_person_id.cast(String).ilike(term),
+                    IdentityMergeEvent.source.ilike(term),
+                )
+            )
+
+        count_q = select(func.count()).select_from(IdentityMergeEvent)
+        if filters:
+            count_q = count_q.where(*filters)
+        total = int((await db.execute(count_q)).scalar() or 0)
+
+        q = (
+            select(IdentityMergeEvent, PersonIdentity)
+            .outerjoin(
+                PersonIdentity,
+                PersonIdentity.id == IdentityMergeEvent.winner_person_id,
+            )
+            .order_by(IdentityMergeEvent.merged_at.desc())
+        )
+        if filters:
+            q = q.where(*filters)
+        q = q.offset((page - 1) * size).limit(size)
+        rows = (await db.execute(q)).all()
+
+        items: list[IdentityMergeEventItem] = []
+        for ev, winner in rows:
+            items.append(
+                IdentityMergeEventItem(
+                    id=ev.id,
+                    merged_at=ev.merged_at,
+                    source=ev.source,
+                    winner_person_id=ev.winner_person_id,
+                    loser_person_id=ev.loser_person_id,
+                    face_similarity=ev.face_similarity,
+                    winner_face_score=ev.winner_face_score,
+                    loser_face_score=ev.loser_face_score,
+                    winner_first_seen_at=ev.winner_first_seen_at,
+                    loser_first_seen_at=ev.loser_first_seen_at,
+                    loser_visit_count=ev.loser_visit_count or 0,
+                    loser_track_count=ev.loser_track_count or 0,
+                    winner_visit_count_before=ev.winner_visit_count_before,
+                    winner_face_crop_path=ev.winner_face_crop_path,
+                    loser_face_crop_path=ev.loser_face_crop_path,
+                    winner_still_exists=winner is not None,
+                    winner_is_staff=bool(winner.is_staff) if winner is not None else None,
+                    winner_gender=winner.gender if winner is not None else None,
+                    winner_visit_count_now=winner.visit_count if winner is not None else None,
+                    metadata_json=ev.metadata_json,
+                )
+            )
+        return PaginatedIdentityMergeEventsResponse(
+            total_count=total, page=page, size=size, items=items
+        )
+
+    @staticmethod
+    async def list_fragmented_tracks(
+        db: AsyncSession,
+        page: int = 1,
+        size: int = 20,
+        search: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        event_type: Optional[str] = None,
+    ) -> PaginatedFragmentedTrackEventsResponse:
+        filters = []
+        if start_time is not None:
+            filters.append(FragmentedTrackEvent.occurred_at >= start_time)
+        if end_time is not None:
+            filters.append(FragmentedTrackEvent.occurred_at <= end_time)
+        if event_type:
+            filters.append(FragmentedTrackEvent.event_type == event_type)
+        if search:
+            term = f"%{search.strip()}%"
+            filters.append(
+                or_(
+                    FragmentedTrackEvent.person_identity_id.cast(String).ilike(term),
+                    FragmentedTrackEvent.billing_interaction_id.cast(String).ilike(term),
+                    FragmentedTrackEvent.primary_track_session_id.cast(String).ilike(term),
+                    FragmentedTrackEvent.event_type.ilike(term),
+                    FragmentedTrackEvent.stitch_reason.ilike(term),
+                )
+            )
+
+        count_q = select(func.count()).select_from(FragmentedTrackEvent)
+        if filters:
+            count_q = count_q.where(*filters)
+        total = int((await db.execute(count_q)).scalar() or 0)
+
+        q = (
+            select(FragmentedTrackEvent, Camera, PersonIdentity)
+            .outerjoin(Camera, Camera.id == FragmentedTrackEvent.camera_id)
+            .outerjoin(
+                PersonIdentity,
+                PersonIdentity.id == FragmentedTrackEvent.person_identity_id,
+            )
+            .order_by(FragmentedTrackEvent.occurred_at.desc())
+        )
+        if filters:
+            q = q.where(*filters)
+        q = q.offset((page - 1) * size).limit(size)
+        rows = (await db.execute(q)).all()
+
+        items: list[FragmentedTrackEventItem] = []
+        for ev, cam, person in rows:
+            frags = ev.fragment_session_ids
+            if isinstance(frags, list):
+                frag_ids = [str(x) for x in frags]
+            else:
+                frag_ids = None
+            items.append(
+                FragmentedTrackEventItem(
+                    id=ev.id,
+                    occurred_at=ev.occurred_at,
+                    event_type=ev.event_type,
+                    person_identity_id=ev.person_identity_id,
+                    camera_id=ev.camera_id,
+                    camera_name=cam.name if cam is not None else None,
+                    zone_id=ev.zone_id,
+                    billing_interaction_id=ev.billing_interaction_id,
+                    primary_track_session_id=ev.primary_track_session_id,
+                    fragment_session_ids=frag_ids,
+                    fragment_count=ev.fragment_count or 1,
+                    sum_dwell_seconds=ev.sum_dwell_seconds,
+                    dwell_threshold=ev.dwell_threshold,
+                    stitch_gap_seconds=ev.stitch_gap_seconds,
+                    stitch_reason=ev.stitch_reason,
+                    body_median=ev.body_median,
+                    face_max=ev.face_max,
+                    person_is_staff=bool(person.is_staff) if person is not None else None,
+                    person_gender=person.gender if person is not None else None,
+                    person_face_crop_path=person.face_crop_path if person is not None else None,
+                    metadata_json=ev.metadata_json,
+                )
+            )
+        return PaginatedFragmentedTrackEventsResponse(
+            total_count=total, page=page, size=size, items=items
         )

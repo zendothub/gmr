@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** July 31, 2026 (Billing visit repair post-dedup: fragmented dwell sum + null BI fill)  
+> **Last updated:** August 3, 2026 (Debug audit tables: identity merges + fragmented track billing events)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -591,6 +591,24 @@ Steps:
 **Config:** `ENABLE_BILLING_VISIT_REPAIR`, lookback/gap/default thr, `ENABLE_BILLING_VISIT_BODY_STITCH`, `ENABLE_BILLING_VISIT_FACE_STITCH`, `BILLING_VISIT_STITCH_BODY_MEDIAN`, `BILLING_VISIT_STITCH_FACE_THRESHOLD`, `BILLING_VISIT_STITCH_MAX_STAFF_BODY`.
 
 **Tests:** `tests/test_billing_visit_repair.py` (cluster + temporal gap).
+
+---
+
+## 30. Debug audit: merges + fragmented tracks (NEW 2026-08-03)
+
+**Tables:**
+- `identity_merge_events` — one row per dedup loser→winner merge (timestamp, face sim, visit/track counts, face crop paths). Loser UUID is snapshot only (no FK; loser deleted).
+- `fragmented_track_events` — visit-repair audit: `null_stitch` (session attach) and `billing_insert` (new BI from fragment dwell sum) with fragment_session_ids.
+
+**Writers:** `deduplicate_persons` (merge loop), `_stitch_null_billing_sessions`, `repair_fragmented_billing_visits` BI insert.
+
+**API (super_admin debug):**
+- `GET /api/v2/debug/merged-persons`
+- `GET /api/v2/debug/fragmented-tracks`
+
+**UI:** Debug page tabs **Merged Persons** | **Fragmented Tracks** (side-by-side on xl).
+
+**Migration:** `0007_identity_merge_and_fragment_events.py`
 
 ---
 

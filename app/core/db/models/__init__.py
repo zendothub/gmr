@@ -24,6 +24,7 @@ from app.core.db.models.store import Store, StoreStatus
 from app.core.db.models.store_lookup import StoreCategory, StoreLevel, StoreZone, StoreTerminal
 from app.core.db.models.device_session import DeviceSession
 from app.core.db.models.stream_viewer import StreamViewerSession
+from app.core.db.models.audit import IdentityMergeEvent, FragmentedTrackEvent
 
 __all__ = [
     "User",
@@ -59,4 +60,6 @@ __all__ = [
     "StoreTerminal",
     "DeviceSession",
     "StreamViewerSession",
+    "IdentityMergeEvent",
+    "FragmentedTrackEvent",
 ]
