@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** August 3, 2026 (Debug audit tables: identity merges + fragmented track billing events)  
+> **Last updated:** August 4, 2026 (Dedup same-cam lookback 48h + min 10s; force_merge staff split 69f37→3fc4)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -100,7 +100,9 @@ Frame (2880×1620)
 | `STAFF_REATTACH_REQUIRE_FACE` | `True` | Staff reattach | Faceless tracks never reattach on body alone |
 | `STAFF_REATTACH_AMBIGUITY` | `0.03` | Staff reattach | Reject if top-2 staff body medians within this gap |
 | `ENABLE_SAME_CAMERA_OVERLAP_GATE` | `True` | Live match + dedup | Reject identity match/merge if candidate has concurrent track on same camera (cross-cam OK). |
-| `SAME_CAMERA_OVERLAP_MIN_SECONDS` | `1.0` | Live match + dedup | Min overlap seconds to reject (ignore 1-frame glitches). |
+| `SAME_CAMERA_OVERLAP_MIN_SECONDS` | `1.0` | Live match only | Min overlap seconds to reject (ignore 1-frame glitches). |
+| `DEDUP_SAME_CAMERA_OVERLAP_LOOKBACK_HOURS` | `48` | Dedup only | Only sessions ending within this lookback count for overlap block (0 = all history). Prevents permanent lock from old track-splits. |
+| `DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS` | `10.0` | Dedup only | Longer min than live — brief 4–9s dual-ID glitches no longer block face-similar merges. |
 | `ENABLE_CONTRADICTION_SAME_ID_BLOCK` | `True` | Live identity | Never rematch the same person_id after face contradiction (blocks self-rematch into mixed galleries). |
 | `ENABLE_FACE_MATCH_CLUSTER_MEDIAN` | `True` | Live face match | Require median sim to full face gallery when gallery ≥2 and cross-pairs ≥3. |
 | `FACE_MATCH_CLUSTER_MEDIAN_THRESHOLD` | `0.35` | Live face match | Median floor (= contamination thr); lucky best-pair into mixed ID rejected. |
@@ -226,6 +228,7 @@ Frame N+4 (window fires):
 | `danger/cleanup_mixed_identity_tracks.py` | Sequential mix cleanup: temporal primary cluster + duration-weighted gender majority + optional `--with-faces` cluster fit. Orphan only. |
 | `danger/merge_staff_reattach_duplicates.py` | Historical backfill for staff reattach: non-staff fragments → is_staff if within RECENT_WINDOW + body_median ≥ 0.55 + face_min 0.20. Dry-run default; `--apply` / `--ids` / `--staff-ids`. |
 | `danger/merge_recent_window_duplicates.py` | Historical backfill — merge same-visit duplicates within 5-min window (combined face/body rule, contamination-gated absorb). Dry-run-first. |
+| `danger/force_merge_persons.py` | Ops override: merge loser→winner with lock 1001 + contamination-gated absorb + last_seen update. Dry-run default; `--winner` / `--loser` / `--apply`. |
 | `danger/reset_tracking_data.py` | Full data reset (preserves config) |
 | `danger/test_mivolo.py` | Offline MiVOLO only (not used live) |
 | `danger/fix_demographics_oneshot.py` | Backfill IF median age all + known gender F→M list |

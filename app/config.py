@@ -143,10 +143,14 @@ class Settings(BaseSettings):
     # ── Same-camera temporal overlap gate (2026-07-13) ─────────────────
     # Two track sessions on the SAME camera that overlap in time cannot be the
     # same physical person. Cross-camera overlap (entry + counter) is allowed.
-    # Applied in live decide_identity (face/body/staff reattach) and periodic
-    # dedup before merging. ε ignores 1-frame ByteTrack glitches.
+    # Live decide_identity uses full history + MIN_SECONDS (1.0). Dedup uses a
+    # recent lookback + longer min so short track-splits of the *same* person
+    # (false dual IDs) do not permanently block face-similar merges.
     ENABLE_SAME_CAMERA_OVERLAP_GATE: bool = True
     SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 1.0
+    # Dedup-only overrides (live path unchanged)
+    DEDUP_SAME_CAMERA_OVERLAP_LOOKBACK_HOURS: float = 48.0  # 0 = all history (legacy)
+    DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 10.0     # ignore brief split glitches
 
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase

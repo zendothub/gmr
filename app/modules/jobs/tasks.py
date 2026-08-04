@@ -228,21 +228,46 @@ async def deduplicate_persons():
 
             logger.info(f"Dedup job: found {len(pairs)} duplicate pair(s) — merging...")
 
-            # ── Same-camera temporal overlap gate ──────────────────────────
-            # Drop face-similar pairs whose tracks already overlap on the same
+            # ── Same-camera temporal overlap gate (dedup) ─────────────────
+            # Drop face-similar pairs whose RECENT tracks overlap on the same
             # camera — those cannot be the same physical person.
+            # Lookback + longer min_sec avoid permanent lock from brief
+            # ByteTrack splits of one person into two IDs (historical 4–9s
+            # overlaps used to block forever). Live decide_identity still uses
+            # full history + SAME_CAMERA_OVERLAP_MIN_SECONDS.
             if settings.ENABLE_SAME_CAMERA_OVERLAP_GATE and pairs:
-                min_sec = float(settings.SAME_CAMERA_OVERLAP_MIN_SECONDS)
+                min_sec = float(
+                    getattr(
+                        settings,
+                        "DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS",
+                        settings.SAME_CAMERA_OVERLAP_MIN_SECONDS,
+                    )
+                )
+                lookback_h = float(
+                    getattr(settings, "DEDUP_SAME_CAMERA_OVERLAP_LOOKBACK_HOURS", 48.0)
+                )
                 pair_list = [(str(r[0]), str(r[1]), float(r[2])) for r in pairs]
                 all_pair_ids = list({p for a, b, _ in pair_list for p in (a, b)})
-                win_result = await db.execute(text("""
-                    SELECT person_identity_id::text, camera_id::text,
-                           started_at, COALESCE(ended_at, last_seen_at) AS ended
-                    FROM track_sessions
-                    WHERE person_identity_id::text = ANY(:ids)
-                      AND started_at IS NOT NULL
-                      AND COALESCE(ended_at, last_seen_at) IS NOT NULL
-                """), {"ids": all_pair_ids})
+                if lookback_h > 0:
+                    win_result = await db.execute(text("""
+                        SELECT person_identity_id::text, camera_id::text,
+                               started_at, COALESCE(ended_at, last_seen_at) AS ended
+                        FROM track_sessions
+                        WHERE person_identity_id::text = ANY(:ids)
+                          AND started_at IS NOT NULL
+                          AND COALESCE(ended_at, last_seen_at) IS NOT NULL
+                          AND COALESCE(ended_at, last_seen_at) >= NOW()
+                              - make_interval(hours => :lb)
+                    """), {"ids": all_pair_ids, "lb": int(lookback_h)})
+                else:
+                    win_result = await db.execute(text("""
+                        SELECT person_identity_id::text, camera_id::text,
+                               started_at, COALESCE(ended_at, last_seen_at) AS ended
+                        FROM track_sessions
+                        WHERE person_identity_id::text = ANY(:ids)
+                          AND started_at IS NOT NULL
+                          AND COALESCE(ended_at, last_seen_at) IS NOT NULL
+                    """), {"ids": all_pair_ids})
                 by_pid: dict[str, list] = {}
                 for pid, cam, start, end in win_result.fetchall():
                     by_pid.setdefault(pid, []).append((cam, start, end))
@@ -265,14 +290,16 @@ async def deduplicate_persons():
                         dropped += 1
                         logger.info(
                             f"Dedup: drop pair {a[:8]}↔{b[:8]} sim={sim:.3f} "
-                            f"(same-camera track overlap)"
+                            f"(same-camera track overlap, "
+                            f"lookback={lookback_h}h min={min_sec}s)"
                         )
                         continue
                     kept.append((a, b, sim))
                 if dropped:
                     logger.info(
                         f"Dedup: dropped {dropped}/{len(pair_list)} pair(s) "
-                        f"due to same-camera track overlap; {len(kept)} remain"
+                        f"due to same-camera track overlap "
+                        f"(lookback={lookback_h}h min={min_sec}s); {len(kept)} remain"
                     )
                 pairs = kept  # list of (a,b,sim) tuples
                 if not pairs:
@@ -316,7 +343,8 @@ async def deduplicate_persons():
                 # Fetch identity metadata to pick the best winner per component
                 id_list = list(all_ids)
                 meta_result = await db.execute(text("""
-                    SELECT id::text, best_face_score, first_seen_at, visit_count, face_crop_path
+                    SELECT id::text, best_face_score, first_seen_at, last_seen_at,
+                           visit_count, face_crop_path
                     FROM   person_identities
                     WHERE  id::text = ANY(:ids)
                 """), {"ids": id_list})
@@ -324,8 +352,9 @@ async def deduplicate_persons():
                     r[0]: {
                         "score": r[1] or 0.0,
                         "first_seen": r[2],
-                        "visits": r[3] or 0,
-                        "face_crop": r[4],
+                        "last_seen": r[3],
+                        "visits": r[4] or 0,
+                        "face_crop": r[5],
                     }
                     for r in meta_result.fetchall()
                 }
@@ -401,6 +430,12 @@ async def deduplicate_persons():
                                 if loser_first and winner_first and loser_first < winner_first:
                                     update_parts.append("first_seen_at = :loser_first")
                                     params["loser_first"] = loser_first
+
+                                loser_last = loser_meta.get("last_seen")
+                                winner_last = winner_meta.get("last_seen")
+                                if loser_last and (winner_last is None or loser_last > winner_last):
+                                    update_parts.append("last_seen_at = :loser_last")
+                                    params["loser_last"] = loser_last
 
                                 await db.execute(text(
                                     f"UPDATE person_identities SET {', '.join(update_parts)} WHERE id::text = :winner"
