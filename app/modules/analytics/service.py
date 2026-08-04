@@ -1713,21 +1713,20 @@ class AnalyticsService:
 
         # ── AGE GROUPS ─────────────────────────────────────────────────
         if metric == "age_groups":
-            person_subq2 = (
-                select(TrackSession.person_identity_id)
-                .where(
-                    TrackSession.started_at >= start,
-                    TrackSession.started_at <= end,
-                    TrackSession.person_identity_id.isnot(None),
-                ).distinct()
+            # Distinct persons in range — mirrors footfall/gender: PersonIdentity.last_seen_at
+            # so total_identified (+ unidentified) == footfall total_visitors.
+            age_demo_q = select(PersonIdentity.id, PersonIdentity.estimated_age).where(
+                PersonIdentity.last_seen_at >= start,
+                PersonIdentity.last_seen_at <= end,
             )
             if cam_ids:
-                person_subq2 = person_subq2.where(TrackSession.camera_id.in_(cam_ids))
-            person_subq2 = person_subq2.subquery()
-            age_demo = (await db.execute(
-                select(PersonIdentity.id, PersonIdentity.estimated_age)
-                .where(PersonIdentity.id.in_(select(person_subq2.c.person_identity_id)))
-            )).all()
+                age_demo_q = age_demo_q.where(
+                    PersonIdentity.id.in_(
+                        select(PersonEmbedding.person_identity_id)
+                        .where(PersonEmbedding.camera_id.in_(cam_ids))
+                    )
+                )
+            age_demo = (await db.execute(age_demo_q)).all()
 
             age_cnt2: dict = {k: 0 for k, *_ in cls._V2_AGE_BINS}
             age_cnt2["unidentified"] = 0
