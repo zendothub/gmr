@@ -196,6 +196,12 @@ Frame N+5 (ReID window fires):
 | [TIMEZONE_FIX.md](TIMEZONE_FIX.md) | Dashboard crash caused by `Asia/Calcutta` → `Asia/Kolkata` timezone fix for PostgreSQL/asyncpg. |
 | [../DATABASE_CORRUPTION_FIX.md](../DATABASE_CORRUPTION_FIX.md) | Recovery guide for corrupted DB: Alembic version tracking out of sync with missing tables. |
 
+### 5. Capacity & Cost
+
+| Document | Description |
+|---|---|
+| [HOST_CAPACITY_AND_CAMERA_COST.md](HOST_CAPACITY_AND_CAMERA_COST.md) | Live host RAM/CPU/GPU/storage present vs used, how many cameras can be added, ₹/cam economics (₹17k OpEx). |
+
 ---
 
 ## Data Flow Diagrams

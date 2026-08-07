@@ -6,6 +6,9 @@ FastAPI (Python 3.10) + PostgreSQL/pgvector + MinIO + RTX 4070 Ti GPU.
 For architecture, pipeline, identity matching, and detailed documentation,
 see **[docs/README.md](docs/README.md)**.
 
+**Host capacity, live resource use, and ₹/camera cost:**  
+see **[docs/HOST_CAPACITY_AND_CAMERA_COST.md](docs/HOST_CAPACITY_AND_CAMERA_COST.md)**.
+
 ---
 
 ## Requirements
