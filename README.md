@@ -9,6 +9,9 @@ see **[docs/README.md](docs/README.md)**.
 **Host capacity, live resource use, and ₹/camera cost:**  
 see **[docs/HOST_CAPACITY_AND_CAMERA_COST.md](docs/HOST_CAPACITY_AND_CAMERA_COST.md)**.
 
+**Disk present / used / daily write rate / optimize:**  
+see **[docs/HOST_DISK_USAGE_AND_OPTIMIZATION.md](docs/HOST_DISK_USAGE_AND_OPTIMIZATION.md)**.
+
 ---
 
 ## Requirements

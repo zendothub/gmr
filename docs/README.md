@@ -201,6 +201,7 @@ Frame N+5 (ReID window fires):
 | Document | Description |
 |---|---|
 | [HOST_CAPACITY_AND_CAMERA_COST.md](HOST_CAPACITY_AND_CAMERA_COST.md) | Live host RAM/CPU/GPU/storage present vs used, how many cameras can be added, ₹/cam economics (₹17k OpEx). |
+| [HOST_DISK_USAGE_AND_OPTIMIZATION.md](HOST_DISK_USAGE_AND_OPTIMIZATION.md) | Disk present vs used (process/MinIO breakdown), ~daily write rate, retention math, optimize steps (snapshots vs crops, move MinIO off SSD). |
 
 ---
 
