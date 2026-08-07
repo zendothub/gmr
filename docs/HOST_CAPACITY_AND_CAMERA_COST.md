@@ -221,12 +221,82 @@ Economics look fine; **technical SLA does not** on current pipeline without batc
 
 ---
 
-## 8. Bottom line
+## 8. How to optimize with current resources
+
+No new hardware. Goal: free NVENC/GPU/CPU headroom and fit more cameras on this 4070 Ti box. Live baseline at doc time: **2 cams**, full burn-in **2880×1620 @ 15 fps**, AI often **`fps_target=5`**, GPU util ~**8–12%**.
+
+### 8.1 P0 — free the most headroom (do first)
+
+| Action | Effect |
+|---|---|
+| **Burn-in only when viewing** | Set `burnin_enabled=false` on cams not watched → drop ~**0.3 GB GPU** + **1 NVENC slot** each |
+| **Cap concurrent full streams ≤2–3** | Do not leave every cam on full NVENC 2880×1620 @15 if unused |
+| **Stream mode `copy` when no burn-in** | `STREAM_PUBLISH_MODE=copy` — remux only, cheaper than `lowlatency` re-encode |
+| **Lower burn-in cost if stream must stay on** | Downscale feed and/or `STREAM_BURNIN_FPS` **15→8** → less NVENC + CPU |
+
+### 8.2 P1 — more cameras on the same box
+
+| Action | Effect |
+|---|---|
+| Keep AI **`fps_target=5`** on busy cams (entry / counter) | Preserve tracking + identity quality |
+| Quiet / aisle cams **`fps_target=3`** | Cuts pipeline load ~**40%** on those cams |
+| Add new cams **with burn-in off** by default | Path to total **4–6** without NVENC wall |
+| Do **not** raise multi-cam AI to 10 FPS | Config default may be 10 for light N; multi-cam stay **5** (or 3) |
+
+### 8.3 P2 — use idle CPU/GPU better (stability / quality)
+
+| Action | Effect |
+|---|---|
+| Keep **single** uvicorn `--workers 1` | Mandatory (in-process camera state) |
+| Keep inference pool **`MAX_WORKERS` ~10–12** | Avoid one cam’s ReID starving another’s YOLO |
+| Per-camera YOLO + ByteTrack | Do not share YOLO instances (tracker corruption) |
+| Mount extra disks for MinIO when needed | Ops only — not a compute unlock |
+
+### 8.4 P3 — later (real scale, engineering)
+
+| Action | Effect |
+|---|---|
+| Shared **batch** inference (weights once; ByteTrack state per cam) | Unlocks 10s of cams on ~3 GB VRAM floor |
+| Face cadence **≠** YOLO cadence (face less often) | Primary GPU-time lever |
+| No default per-cam NVENC; ≤**5** full WebRTC viewers | Removes encode wall |
+| Dynamic FPS on idle cameras | Night / empty-floor headroom |
+
+Path after P3: SLA **~24** / plan **~40** (see §4). Not a config toggle today.
+
+### 8.5 Practical target on this box
+
+```text
+Now:     2 cams + burn-in ON              → fine, GPU util ~10%
+Better:  burn-in OFF by default           → free NVENC + ~0.6 GB GPU @2 cams
+Scale:   +2–4 cams @5 FPS, burn-in on demand → total 4–6
+Avoid:   10 cams all burn-in @15 FPS full res
+```
+
+**Biggest win today:** stop always-on full-res burn-in; stream on demand. That unlocks the next cameras more than “CPU is only 30% / GPU 10%.”
+
+### 8.6 Config knobs (reference)
+
+| Knob | Where | Typical optimize value |
+|---|---|---|
+| `burnin_enabled` | per camera | `false` unless someone is watching |
+| `fps_target` | per camera | **5** busy · **3** quiet |
+| `STREAM_PUBLISH_MODE` | env / config | `copy` without burn-in; `lowlatency` if re-encode needed |
+| `STREAM_BURNIN_FPS` | env / config | **8–15** (lower = cheaper encode) |
+| `STREAM_BITRATE` | env / config | e.g. `1200k` — do not raise without need |
+| `MAX_WORKERS` | env / config | **10–12** inference threads |
+| uvicorn `--workers` | systemd | **1** only |
+
+Restart after env changes: `sudo systemctl restart retail-ai.service`.
+
+---
+
+## 9. Bottom line
 
 | Question | Answer |
 |---|---|
 | Headroom now? | CPU/GPU **util** free; **NVENC + decode + AI time + architecture** limit cams first |
 | What does each extra cam need? | Decode CPU + YOLO/ByteTrack + **N×5 FPS** shared GPU work; **+0.3/0.3 only if burn-in ON** |
+| Optimize first? | **Burn-in off by default** · stream on demand · quiet cams `fps_target=3` · `STREAM_PUBLISH_MODE=copy` |
 | Add safely today? | **+1** → total **3** → **~₹5,667/cam/mo** |
 | Best near-term density? | Total **4–6** (limit burn-in) → **₹4,250–₹2,833/cam/mo** |
 | +10 cams (total 12)? | **Bottleneck:** NVENC (if on) → GPU AI time → CPU decode → single process — **not** free VRAM ÷ 0.3 |
