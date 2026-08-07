@@ -47,7 +47,7 @@
 | `ffmpeg` h264_nvenc cam 1 | ~310 MiB |
 | `ffmpeg` h264_nvenc cam 2 | ~310 MiB |
 
-**Note:** Most model VRAM is a **fixed cost per AI process**, not linear per camera. YOLO+ByteTrack is **per camera**. NVENC burn-in is **~0.3 GB GPU + ~0.3 GB RAM per camera**.
+**Note:** Most model VRAM is a **fixed cost per AI process**, not linear per camera. YOLO+ByteTrack is **per camera**. NVENC burn-in is **~0.3 GB GPU + ~0.3 GB RAM per camera** (encoder only — see §6–7 for full per-cam CPU/GPU-time cost and +10 bottlenecks).
 
 ### Storage
 
@@ -134,24 +134,102 @@ Optional light add-ons (order-of-magnitude): bandwidth ~₹2k + storage ~₹0.5k
 
 ---
 
-## 6. Marginal resource cost per extra camera
+## 6. Resources needed for each extra camera
 
-| Item | Approx cost |
+Do **not** treat “~0.3 GB GPU + ~0.3 GB RAM” as the full cost of one camera. That number is **only the optional NVENC burn-in stream**.
+
+### 6.1 Fixed vs per-camera (already loaded @ 2 cams)
+
+| Cost type | What | GPU VRAM | Host RAM | CPU / GPU time |
+|---|---|---:|---:|---|
+| **Fixed (once)** | InsightFace, SigLIP2, OSNet, YOLO-Pose, Torch CUDA context | ~**3.0–3.2 GB** | ~**4 GB** in uvicorn | shared |
+| **Fixed (jobs)** | `app.worker` (dedup etc.) | ~**0.7 GB** | ~**2.5–2.7 GB** | low |
+| **Per camera (required)** | YOLO + ByteTrack instance | ~**0.05–0.15 GB** (weights/state order) | tracker + frame buffers (100s MB class) | **every AI frame** |
+| **Per camera (required)** | RTSP decode (OpenCV / FFmpeg pull) | 0 | decode buffers | **CPU** linear in N × resolution |
+| **Per camera (required)** | AI pipeline @ `fps_target` (default **5**) | 0 extra weights | small | **GPU time**: YOLO + full-frame face + ReID + identity |
+| **Per camera (optional)** | NVENC burn-in 2880×1620 @ 15 fps | **~0.3 GB** | **~0.3 GB** | NVENC session + some CPU feed |
+
+```text
+Full stack (models)     ≈ fixed once the process is up
++ each camera           ≈ decode CPU + YOLO/ByteTrack + (N × 5) AI frames/s of shared GPU work
++ each burn-in stream   ≈ +0.3 GB GPU + +0.3 GB RAM   ← only this is the “0.3 / 0.3” line
+```
+
+### 6.2 Why free VRAM ÷ 0.3 ≠ max cameras
+
+| Naïve math | Why it fails |
 |---|---|
-| NVENC burn-in (2880×1620 @ 15 fps) | **~0.3 GB GPU + ~0.3 GB RAM** |
-| YOLO + ByteTrack instance | small VRAM + tracker state |
-| Shared models (IF / SigLIP2 / OSNet) | **0** extra if already loaded |
-| AI pipeline time | ~`fps_target` frames/s of YOLO + full-frame face + ReID + identity |
+| Free ~6.9 GB VRAM ÷ 0.3 ≈ “23 cams” | 0.3 is **encoder only**; does not pay for decode or AI frames |
+| GPU util ~10% at 2 cams → “room for 10×” | Util is **idle time**, not free camera slots; work ≈ **N × fps** |
+| RAM free ~17 GB ÷ 0.3 ≈ “many cams” | Same — burn-in RAM only; decode + tracks + DB still grow |
+
+### 6.3 Rough marginal budget per extra camera (RAM / GPU / CPU only)
+
+| Item | Burn-in **ON** | Burn-in **OFF** |
+|---|---|---|
+| GPU VRAM | ~**0.3 GB** (NVENC) + small YOLO | small YOLO only |
+| Host RAM | ~**0.3 GB** (ffmpeg) + buffers/tracks | buffers/tracks only |
+| CPU | decode + feed encoder + pipeline | decode + pipeline |
+| GPU compute | +`fps_target` frames/s on shared GPU | same |
+| NVENC slots | **1 session** (desktop ~**3** concurrent hard limit) | 0 |
+
+AI default: **`fps_target = 5`**.  
+Total AI pressure ≈ **N × 5** frames/s (e.g. 12 cams → ~**60** pipeline frames/s through one process / one GPU).
 
 ---
 
-## 7. Bottom line
+## 7. Bottleneck if you add **+10 cameras** (total **12**)
+
+Baseline today: **2 cams**. Scenario: add **10 more** → **12** total, still current architecture (single uvicorn, per-cam YOLO+ByteTrack, shared IF/SigLIP/OSNet), **`fps_target=5`**. Disk/MinIO ignored.
+
+### 7.1 Ordered bottlenecks (what breaks first)
+
+| Order | Bottleneck | What happens at total ~12 |
+|---:|---|---|
+| **1** | **NVENC burn-in (if left ON)** | Desktop 4070 Ti ~**3** concurrent full h264_nvenc sessions. Cams 4–12 cannot all keep full 2880×1620 burn-in even if VRAM still has free MiB. |
+| **2** | **GPU compute time (AI path)** | 12 × 5 = **~60 AI frames/s** of YOLO + full-frame SCRFD + ReID + identity on **one** GPU. Util jumps; **p95 FPS drops below 5** under people; latency/jitter before OOM. |
+| **3** | **CPU RTSP decode** | 12 full-res pulls. Load avg leaves the “~20–30% of 24 threads” comfort zone; threads fight decode vs pipeline. |
+| **4** | **Single-process architecture** | All `CameraWorker`s in one `--workers 1` process: GIL, thread count, shared identity path, DB lock contention. |
+| **5** | **Per-cam YOLO + ByteTrack memory/state** | Extra VRAM/RAM beyond 0.3; grows with N but usually **after** (1)–(3). |
+| **6** | **VRAM OOM** | Unlikely as the *first* wall if burn-in is capped; free ~6.9 GB is mostly unused **weights budget**, not free **compute**. |
+| **7** | **Identity / DB quality** | More tracks → more creates/merges/advisory lock time; product truth degrades even if process stays up. |
+
+### 7.2 With burn-in ON vs OFF at +10
+
+| Mode | Total N | Expected outcome |
+|---|---:|---|
+| Burn-in **ON** every cam | 12 | **Fails early** on NVENC sessions (~3). Not a VRAM-arithmetic problem. |
+| Burn-in **OFF** (or ≤2–3 full streams) | 12 | VRAM/RAM may still fit; **GPU time + CPU decode** are the walls. Expect FPS shortfall and identity lag on busy floor — **stretch / not SLA**. |
+| Honest current-arch band | **4–6** (burn-in limited) | Sustainable without re-arch |
+| +10 without re-arch | **12** | **Not recommended** as sold capacity |
+
+### 7.3 What is *not* the bottleneck for +10
+
+| Not the first wall | Why |
+|---|---|
+| “Only 0.3 GB free needed × 10” | Misreads burn-in line as full cam cost |
+| Empty VRAM slots alone | Compute and NVENC saturate first |
+| Disk / MinIO (if ops deletes/shifts data) | Out of scope for this RAM/GPU/CPU analysis |
+
+### 7.4 Cost at total 12 (server-only, if it ran)
+
+| N | ₹/cam/mo (₹17k / N) |
+|---:|---:|
+| 12 | **≈ ₹1,417** |
+
+Economics look fine; **technical SLA does not** on current pipeline without batching + stream caps.
+
+---
+
+## 8. Bottom line
 
 | Question | Answer |
 |---|---|
-| Headroom now? | CPU/GPU **util** free; **NVENC + architecture** limit cams first |
+| Headroom now? | CPU/GPU **util** free; **NVENC + decode + AI time + architecture** limit cams first |
+| What does each extra cam need? | Decode CPU + YOLO/ByteTrack + **N×5 FPS** shared GPU work; **+0.3/0.3 only if burn-in ON** |
 | Add safely today? | **+1** → total **3** → **~₹5,667/cam/mo** |
 | Best near-term density? | Total **4–6** (limit burn-in) → **₹4,250–₹2,833/cam/mo** |
+| +10 cams (total 12)? | **Bottleneck:** NVENC (if on) → GPU AI time → CPU decode → single process — **not** free VRAM ÷ 0.3 |
 | Path to 24–40? | Shared batch inference, cap full streams ≤5, drop default per-cam NVENC |
 
 ---
