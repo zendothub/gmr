@@ -76,7 +76,83 @@ event_<camera_id>_<YYYYMMDD>_<HHMMSS>_<…>.jpg
 
 Observed object date span at measurement: **~2026-07-10 → 2026-08-07** (~4 weeks of continuous write).
 
-### 2.3 App / host (secondary)
+### 2.3 Why snapshots are ~330 GB — what / when / why
+
+#### What is stored
+
+| | |
+|---|---|
+| **Object** | Full camera **frame** encoded as JPEG |
+| **Typical size** | ~**1.2 MB** per file |
+| **MinIO key** | `retaileye/snapshots/event_<camera_id>_<YYYYMMDD>_<HHMMSS>_<us>_<uuid8>.jpg` |
+| **DB link** | `events.snapshot_path` (event list / debug UI evidence image) |
+| **Not this prefix** | ReID face/body crops → `retaileye/crops/` (~8 GB only) |
+
+Upload helper: `save_image` / `save_image_async` → MinIO PUT (`app/utils/image_utils.py`).
+
+#### When it is written (code path)
+
+Snapshots are **not** written every AI frame. They are written only when the camera worker persists **rule or zone events** for that frame batch:
+
+```text
+AI loop (fps_target)
+  → ZoneEventDetector.detect()  +  RuleEvaluator.evaluate()
+  → if rule_events or zone_events:
+       _persist_events(db, frame, …)
+         → save_image_async(frame, SNAPSHOT_DIR="snapshots", prefix=f"event_{camera_id}")
+         → Event.snapshot_path = that key  (same path shared by all events in the batch)
+```
+
+Source: `CameraWorker._persist_events` in `app/modules/ai_runtime/camera_worker.py`:
+
+```python
+snapshot_path = await save_image_async(
+    frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}"
+)
+```
+
+| Trigger | Event type(s) | Full-frame snapshot? |
+|---|---|---|
+| Person walks into a zone | `zone_enter` | **Yes** |
+| Person leaves a zone | `zone_exit` | **Yes** |
+| Dwell hits 30s / 60s / 120s in a zone | `zone_dwell_milestone` | **Yes** |
+| Rule fires (billing dwell, line cross, purchase, …) | rule `event_type` | **Yes** |
+| New ByteTrack session | `person_entered_view` | **No** — uses **crop** path only |
+| Track ends | `person_left_view` | **No** snapshot field |
+
+Zone auto-events come from `ZoneEventDetector` (`zone_enter` / `zone_exit` / milestones **30, 60, 120**).  
+Billing / line-crossing come from `RuleEvaluator`.
+
+One `_persist_events` call → **one** JPEG upload; multiple events in the same batch **reuse** that path.
+
+#### Why so much volume (~330 GB)
+
+| Factor | Effect |
+|---|---|
+| **~270k objects × ~1.2 MB** | ≈ **310–330 GB** arithmetic |
+| **2 busy cameras** + counter/entry zones | Frequent enter/exit as people and **staff** move |
+| **Track fragmentation** | ByteTrack splits → many short sessions → many zone_enter/exit again |
+| **Dwell milestones** | Extra snapshots at 30/60/120s while still in zone |
+| **Billing / rules** | Additional events on long counter stays |
+| **~11–12 GB/day** write rate | Fills a 444 GB SSD in weeks if retention ≥ ~30d |
+| **Purpose of file** | UI/debug **evidence** for events — **not** required for face/body ReID |
+
+```text
+Disk crisis driver = snapshots (MB-class, event evidence)
+Identity pipeline   = crops     (KB-class, ReID)  ← keep; not the 330 GB problem
+```
+
+#### Purpose (product)
+
+| Need | Uses snapshots? |
+|---|---|
+| Event timeline / “what did the camera see when rule/zone fired” | **Yes** |
+| Face match, body ReID, identity create/merge | **No** (uses `crops/`) |
+| Purchase count analytics | **No** (uses `billing_interactions` + person ids) |
+
+So MinIO is large because the pipeline **always attaches a full-frame JPEG to every zone/rule event batch**, and those events fire often on live retail CCTV.
+
+### 2.4 App / host (secondary)
 
 | Path | ~Size | Notes |
 |---|---:|---|
@@ -99,7 +175,7 @@ Observed object date span at measurement: **~2026-07-10 → 2026-08-07** (~4 wee
 
 App loguru retention is often **7 days** (`app/main.py` / `logging_config.py`); **systemd/error redirects may not rotate the same way** — watch `retail-ai-error.log`.
 
-### 2.4 What is *not* filling the disk
+### 2.5 What is *not* filling the disk
 
 | Component | Disk footprint |
 |---|---|
@@ -267,6 +343,8 @@ lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL
 | How much disk is present? | **~444 GB** live SSD; **+2×1.8 TB** unused (BitLocker, unmounted) |
 | How much used? | **~370 GB (88%)** |
 | Who uses it? | **MinIO ~335 GB** (snapshots ~310 GB, crops ~8 GB) |
+| Why snapshots ~330 GB? | Full-frame JPEG on every **zone/rule event** batch (`_persist_events`); ~1.2 MB × ~270k; not used for ReID |
+| When written? | `zone_enter` / `zone_exit` / dwell 30·60·120 / billing+rules — **not** every frame; enter/leave view use crops or no snap |
 | Daily use now? | **~12 GB/day** MinIO (almost all event snapshots) @ 2 cams |
 | Why “too full”? | Snapshots on small root SSD; HDDs not in play; 30d retention ≈ full disk |
 | Optimize first? | **Shorter snapshot retention + fix cleanup + rotate error log**; then **move MinIO to HDD**; then reduce snapshot write rate |
