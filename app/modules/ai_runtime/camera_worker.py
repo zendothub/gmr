@@ -132,7 +132,7 @@ class CameraWorker:
             camera_id=self.camera_id,
             width=width,
             height=height,
-            fps=self.settings.STREAM_BURNIN_FPS,
+            fps=self.settings.STREAM_LD_FPS or self.settings.STREAM_BURNIN_FPS,
         )
         # Share the *same* list object so updates in _process_frame are visible
         # to the broadcaster without any copy.  Use .clear() + extend() to

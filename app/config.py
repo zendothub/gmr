@@ -242,10 +242,25 @@ class Settings(BaseSettings):
     # requires H.264). Use "lowlatency" to re-encode for browser-friendly output.
     STREAM_PUBLISH_MODE: str = "lowlatency"  # copy | lowlatency
     # Target video bitrate for the browser overlay stream (burn-in) and
-    # lowlatency republish step.  1200k is plenty for annotated 1080p CCTV.
+    # lowlatency republish step.  Used as fallback when LD/HD bitrates unset.
     # Without this, FFmpeg defaults to CRF-based quality encoding which
     # produces 5-8 Mbps — 4-6× heavier than necessary.
     STREAM_BITRATE: str = "1200k"
+    # Dual-quality browser streams (burn-in path → MediaMTX → WebRTC):
+    #   LD — dashboard / multi-cam grid (default webrtc_url)
+    #   HD — fullscreen / single-cam detail (webrtc_url_hd)
+    STREAM_LD_WIDTH: int = 1280
+    STREAM_LD_HEIGHT: int = 720
+    STREAM_LD_FPS: int = 15
+    STREAM_LD_BITRATE: str = "600k"
+    # "1024p" = 1024 height; width is derived from source aspect at encode time
+    # (capped by STREAM_HD_MAX_WIDTH). Default targets ~1820×1024 @ 24fps.
+    STREAM_HD_HEIGHT: int = 1024
+    STREAM_HD_MAX_WIDTH: int = 1920
+    STREAM_HD_FPS: int = 24
+    STREAM_HD_BITRATE: str = "2500k"
+    # When False, only LD is published (webrtc_url_hd omitted / falls back to LD).
+    STREAM_PUBLISH_HD: bool = True
     # Auto-stop a published stream after this many seconds with no viewers.
     STREAM_IDLE_TIMEOUT_SECONDS: int = 120
     # Snapshot (single JPEG frame) settings for the zone-drawing canvas.
@@ -254,7 +269,7 @@ class Settings(BaseSettings):
     # Whether to write FFmpeg stream pipeline output to logs/stream_pipeline.log (otherwise devnull)
     STREAM_PIPELINE_LOG: bool = False
     # FPS for the burn-in annotated stream (bounding boxes + person count).
-    # This is the output FPS fed to FFmpeg stdin; the AI pipeline runs independently.
+    # Legacy alias — LD path uses STREAM_LD_FPS; kept for backward-compatible env.
     STREAM_BURNIN_FPS: int = 15
 
 

@@ -165,6 +165,9 @@ class StreamManager:
                     "webrtc_url": endpoints.webrtc_url,
                     "hls_url": endpoints.hls_url,
                     "rtsp_url": endpoints.rtsp_url,
+                    "webrtc_url_hd": endpoints.webrtc_url_hd,
+                    "hls_url_hd": endpoints.hls_url_hd,
+                    "rtsp_url_hd": endpoints.rtsp_url_hd,
                 },
             }
 

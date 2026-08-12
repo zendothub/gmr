@@ -67,11 +67,15 @@ class CameraResponse(BaseModel):
     zone_name: Optional[str] = None
     status: str
     is_active: bool
-    # MediaMTX path the backend republishes into.
+    # MediaMTX path the backend republishes into (LD default).
     stream_path: Optional[str] = None
     # Browser-playable feed URLs (served by MediaMTX, derived from stream_path).
+    # webrtc_url / hls_url = LD (dashboard grid). *_hd = fullscreen quality.
     webrtc_url: Optional[str] = None
     hls_url: Optional[str] = None
+    stream_path_hd: Optional[str] = None
+    webrtc_url_hd: Optional[str] = None
+    hls_url_hd: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -200,10 +204,13 @@ class CameraFeedResponse(BaseModel):
     status: str                                    # active | inactive | error | maintenance
     status_display: str                            # LIVE | OFFLINE | RECONNECTING | MAINTENANCE
 
-    # Stream
+    # Stream — LD (grid/dashboard) + HD (fullscreen)
     stream_path: Optional[str] = None
     webrtc_url: Optional[str] = None
     hls_url: Optional[str] = None
+    stream_path_hd: Optional[str] = None
+    webrtc_url_hd: Optional[str] = None
+    hls_url_hd: Optional[str] = None
 
     # Detection zones on this camera
     zones: List[CameraFeedZoneSummary] = []
@@ -311,9 +318,13 @@ class CameraPolygonEditorResponse(BaseModel):
     store_zone_gate: Optional[str] = None
     status: str
     # Stream feed URLs — browser plays this from MediaMTX
+    # LD = default grid; HD = fullscreen detail
     stream_path: Optional[str] = None
     webrtc_url: Optional[str] = None
     hls_url: Optional[str] = None
+    stream_path_hd: Optional[str] = None
+    webrtc_url_hd: Optional[str] = None
+    hls_url_hd: Optional[str] = None
     # Existing detection zones (drawn polygons)
     zones: List[DetectionZoneResponse] = []
     # Available event types for the zone-type dropdown

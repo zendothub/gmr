@@ -1,24 +1,24 @@
-"""Stream broadcaster with YOLO bounding box burn-in.
+"""Stream broadcaster with YOLO bounding box burn-in (dual quality).
 
 Takes frames from the shared LatestFrameBuffer (same single RTSP capture thread
 used by the AI loop), draws cached bounding boxes + zone overlays + person count,
-and pipes the annotated frames to an FFmpeg subprocess that encodes and pushes
-into MediaMTX.
+and pipes the annotated frames to FFmpeg subprocesses that encode and push into
+MediaMTX.
 
-This means the browser sees the annotated stream natively via WebRTC/HLS, with
-no frontend overlay required.
+Dual quality (bandwidth-aware):
+  - LD  ``cam_<uuid>``     — 720p @ 15fps  (dashboard / multi-cam grid)
+  - HD  ``cam_<uuid>_hd``  — ~1024p @ 24fps (fullscreen)
 
 Architecture:
   LatestFrameBuffer (background capture thread, full camera FPS)
        │
        ├── _run_loop (AI, 5-10fps) → updates latest_tracks[] in-place
        │
-       └── StreamBroadcaster (daemon thread, STREAM_BURNIN_FPS)
+       └── StreamBroadcaster (daemon thread, max(LD_FPS, HD_FPS))
               ├─ get_latest() raw frame
-              ├─ resize to FFmpeg dimensions if needed
-              ├─ draw zone overlays (semi-transparent blue fill + green border)
-              ├─ draw cached bboxes + "Persons: N" counter
-              └─ pipe to ffmpeg stdin → libx264 → rtsp://mediamtx:8554/cam_<uuid>
+              ├─ draw zone overlays + bboxes + person count (source res)
+              ├─ resize → LD ffmpeg  → rtsp://mediamtx/.../cam_<uuid>
+              └─ resize → HD ffmpeg  → rtsp://mediamtx/.../cam_<uuid>_hd
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import cv2
@@ -39,8 +40,28 @@ from app.modules.streaming.mediamtx import camera_path
 from app.utils.geometry import polygon_from_json
 
 
+@dataclass
+class _QualityPipe:
+    """One FFmpeg encode path (LD or HD)."""
+    name: str  # "ld" | "hd"
+    width: int
+    height: int
+    fps: int
+    bitrate: str
+    path: str
+    proc: Optional[subprocess.Popen] = None
+    log_file: object = None
+    last_write_ts: float = 0.0
+    consecutive_failures: int = 0
+    successful_writes: int = 0
+    first_frame_sent: threading.Event = field(default_factory=threading.Event)
+
+
 class StreamBroadcaster:
-    """Pipes annotated frames (zones + boxes + person count) into MediaMTX via FFmpeg."""
+    """Pipes annotated frames (zones + boxes + person count) into MediaMTX via FFmpeg.
+
+    Publishes LD always; HD when ``STREAM_PUBLISH_HD`` is enabled.
+    """
 
     def __init__(
         self,
@@ -54,8 +75,10 @@ class StreamBroadcaster:
         self.settings = get_settings()
         self.frame_buffer = frame_buffer
         self.camera_id = camera_id
+        # Source-frame dimensions (updated if RTSP resolution changes)
         self.width = width
         self.height = height
+        # Legacy single-fps field kept for callers / logs; loop runs at max quality FPS
         self.fps = fps
         self.max_restart_attempts = max_restart_attempts
 
@@ -68,14 +91,80 @@ class StreamBroadcaster:
         # Format: [{"name": str, "polygon": <json>}, ...]
         self.latest_zones: List[dict] = []
 
-        self._proc: Optional[subprocess.Popen] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[str] = None
         self._first_frame_sent = threading.Event()
-        self._consecutive_failures = 0
         self._fatal_error = False
-        self._successful_writes = 0  # Track consecutive successful writes
+
+        self._pipes: List[_QualityPipe] = []
+        self._build_pipes()
+
+    # ------------------------------------------------------------------
+    # Quality pipe setup
+    # ------------------------------------------------------------------
+
+    def _build_pipes(self) -> None:
+        s = self.settings
+        ld_w = max(2, int(s.STREAM_LD_WIDTH) // 2 * 2)
+        ld_h = max(2, int(s.STREAM_LD_HEIGHT) // 2 * 2)
+        ld_fps = max(1, int(s.STREAM_LD_FPS or s.STREAM_BURNIN_FPS or 15))
+        self._pipes = [
+            _QualityPipe(
+                name="ld",
+                width=ld_w,
+                height=ld_h,
+                fps=ld_fps,
+                bitrate=s.STREAM_LD_BITRATE or s.STREAM_BITRATE,
+                path=camera_path(self.camera_id, quality="ld"),
+            )
+        ]
+        if s.STREAM_PUBLISH_HD:
+            hd_w, hd_h = self._compute_hd_size(self.width, self.height)
+            hd_fps = max(1, int(s.STREAM_HD_FPS or 24))
+            self._pipes.append(
+                _QualityPipe(
+                    name="hd",
+                    width=hd_w,
+                    height=hd_h,
+                    fps=hd_fps,
+                    bitrate=s.STREAM_HD_BITRATE or s.STREAM_BITRATE,
+                    path=camera_path(self.camera_id, quality="hd"),
+                )
+            )
+        self.fps = max(p.fps for p in self._pipes)
+
+    def _compute_hd_size(self, src_w: int, src_h: int) -> tuple[int, int]:
+        """Scale source to STREAM_HD_HEIGHT, capped by STREAM_HD_MAX_WIDTH (even dims)."""
+        s = self.settings
+        target_h = max(2, int(s.STREAM_HD_HEIGHT))
+        max_w = max(2, int(s.STREAM_HD_MAX_WIDTH))
+        if src_h <= 0 or src_w <= 0:
+            src_w, src_h = 1920, 1080
+        scale = target_h / float(src_h)
+        out_w = int(round(src_w * scale))
+        out_h = target_h
+        if out_w > max_w:
+            scale = max_w / float(src_w)
+            out_w = max_w
+            out_h = int(round(src_h * scale))
+        # H.264 needs even dimensions
+        out_w = max(2, out_w // 2 * 2)
+        out_h = max(2, out_h // 2 * 2)
+        return out_w, out_h
+
+    def _refresh_hd_size_from_source(self) -> None:
+        for pipe in self._pipes:
+            if pipe.name == "hd":
+                nw, nh = self._compute_hd_size(self.width, self.height)
+                if nw != pipe.width or nh != pipe.height:
+                    logger.info(
+                        f"StreamBroadcaster HD size update camera={self.camera_id}: "
+                        f"{pipe.width}x{pipe.height} → {nw}x{nh}"
+                    )
+                    pipe.width, pipe.height = nw, nh
+                    self._kill_pipe(pipe)
+                    self._spawn_pipe(pipe)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -86,25 +175,29 @@ class StreamBroadcaster:
             return
         self._stop_event.clear()
         self._error = None
-        self._spawn_ffmpeg()
+        self._fatal_error = False
+        for pipe in self._pipes:
+            self._spawn_pipe(pipe)
         self._thread = threading.Thread(target=self._broadcast_loop, daemon=True)
         self._thread.start()
-        logger.info(
-            f"StreamBroadcaster started: camera={self.camera_id} "
-            f"{self.width}x{self.height} @ {self.fps}fps"
-        )
+        desc = ", ".join(f"{p.name}={p.width}x{p.height}@{p.fps}fps/{p.bitrate}" for p in self._pipes)
+        logger.info(f"StreamBroadcaster started: camera={self.camera_id} [{desc}]")
 
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5.0)
             self._thread = None
-        self._kill_ffmpeg()
+        for pipe in self._pipes:
+            self._kill_pipe(pipe)
         logger.info(f"StreamBroadcaster stopped: camera={self.camera_id}")
 
     def is_alive(self) -> bool:
-        proc = self._proc
-        return bool(proc and proc.poll() is None)
+        """True if at least the LD pipe is running."""
+        for pipe in self._pipes:
+            if pipe.name == "ld":
+                return bool(pipe.proc and pipe.proc.poll() is None)
+        return any(p.proc and p.proc.poll() is None for p in self._pipes)
 
     def has_fatal_error(self) -> bool:
         """Check if the broadcaster has encountered a fatal error and stopped trying."""
@@ -129,21 +222,19 @@ class StreamBroadcaster:
         return self.is_alive()
 
     # ------------------------------------------------------------------
-    # FFmpeg subprocess
+    # FFmpeg subprocess (per quality)
     # ------------------------------------------------------------------
 
-    def _ingest_url(self) -> str:
-        """MediaMTX RTSP ingest URL for this camera's path."""
-        path = camera_path(self.camera_id)
+    def _ingest_url(self, path: str) -> str:
         return (
             f"rtsp://{self.settings.MEDIAMTX_HOST}:"
             f"{self.settings.MEDIAMTX_RTSP_PORT}/{path}"
         )
 
-    def _build_command(self) -> List[str]:
+    def _build_command(self, pipe: _QualityPipe) -> List[str]:
         s = self.settings
         from app.utils.device import get_ffmpeg_video_codec_args
-        video_codec_args = get_ffmpeg_video_codec_args(s.FFMPEG_BINARY)
+        video_codec_args = get_ffmpeg_video_codec_args(s.FFMPEG_BINARY, bitrate=pipe.bitrate)
         return [
             s.FFMPEG_BINARY,
             "-nostdin",
@@ -151,172 +242,210 @@ class StreamBroadcaster:
             # Raw BGR frames piped in via stdin
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
-            "-s", f"{self.width}x{self.height}",
-            "-r", str(self.fps),
+            "-s", f"{pipe.width}x{pipe.height}",
+            "-r", str(pipe.fps),
             "-i", "-",
             # Encode to H.264 using the best available hardware (no audio).
-            # Encoder is resolved once at startup: h264_nvenc > h264_videotoolbox > libx264
             "-an",
             *video_codec_args,
-            "-g", str(self.fps * 2),  # keyframe interval ~2 seconds
+            "-g", str(pipe.fps * 2),  # keyframe interval ~2 seconds
             # Push to MediaMTX
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
-            self._ingest_url(),
+            self._ingest_url(pipe.path),
         ]
 
-    def _spawn_ffmpeg(self) -> None:
-        cmd = self._build_command()
-        logger.debug(f"StreamBroadcaster spawning ffmpeg: {' '.join(cmd)}")
+    def _spawn_pipe(self, pipe: _QualityPipe) -> None:
+        cmd = self._build_command(pipe)
+        logger.debug(f"StreamBroadcaster spawning ffmpeg ({pipe.name}): {' '.join(cmd)}")
         if self.settings.STREAM_PIPELINE_LOG:
             import os
             os.makedirs("logs", exist_ok=True)
-            self._log_file = open("logs/stream_pipeline.log", "a", encoding="utf-8")
-            stderr_dest = self._log_file
+            pipe.log_file = open("logs/stream_pipeline.log", "a", encoding="utf-8")
+            stderr_dest = pipe.log_file
         else:
-            self._log_file = None
+            pipe.log_file = None
             stderr_dest = subprocess.DEVNULL
-        self._proc = subprocess.Popen(
+        pipe.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=stderr_dest,
         )
+        pipe.successful_writes = 0
 
-    def _kill_ffmpeg(self) -> None:
-        proc = self._proc
-        self._proc = None
+    def _kill_pipe(self, pipe: _QualityPipe) -> None:
+        proc = pipe.proc
+        pipe.proc = None
         if proc and proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if pipe.log_file:
+            try:
+                pipe.log_file.close()
+            except Exception:
+                pass
+            pipe.log_file = None
+
+    def _ensure_pipe_alive(self, pipe: _QualityPipe) -> bool:
+        """Respawn pipe if dead. Returns False if fatal (gave up)."""
+        if pipe.proc is not None and pipe.proc.poll() is None:
+            return True
+
+        pipe.consecutive_failures += 1
+        pipe.successful_writes = 0
+        if pipe.proc is not None:
+            exit_code = pipe.proc.returncode
+            logger.warning(
+                f"StreamBroadcaster ffmpeg ({pipe.name}) died (code={exit_code}) "
+                f"for camera {self.camera_id} "
+                f"(attempt {pipe.consecutive_failures}/{self.max_restart_attempts})"
+            )
+            if exit_code == 224:
+                logger.error(
+                    f"StreamBroadcaster cannot connect to MediaMTX at "
+                    f"{self._ingest_url(pipe.path)} for camera {self.camera_id}."
+                )
+
+        if pipe.consecutive_failures >= self.max_restart_attempts:
+            # LD fatal stops the broadcaster; HD-only failure is non-fatal
+            if pipe.name == "ld":
+                self._fatal_error = True
+                self._error = (
+                    f"FFmpeg LD failed {pipe.consecutive_failures} times. Giving up."
+                )
+                logger.error(
+                    f"StreamBroadcaster for camera {self.camera_id} exceeded max "
+                    f"restart attempts on LD. Stopping. Error: {self._error}"
+                )
+            else:
+                logger.error(
+                    f"StreamBroadcaster HD pipe gave up for camera {self.camera_id}; "
+                    f"LD continues."
+                )
+            return False
+
+        wait_time = min(0.5 * (2 ** (pipe.consecutive_failures - 1)), 30.0)
+        logger.info(
+            f"StreamBroadcaster ({pipe.name}) waiting {wait_time:.1f}s before retry..."
+        )
+        self._stop_event.wait(wait_time)
+        if self._stop_event.is_set():
+            return False
+        self._spawn_pipe(pipe)
+        return True
 
     # ------------------------------------------------------------------
     # Broadcast loop
     # ------------------------------------------------------------------
 
     def _broadcast_loop(self) -> None:
-        """Continuously read raw frames, draw overlays, pipe to FFmpeg."""
-        interval = 1.0 / self.fps
+        """Continuously read raw frames, draw overlays, pipe to LD/HD FFmpeg."""
+        loop_fps = max(p.fps for p in self._pipes)
+        interval = 1.0 / loop_fps
         last_frame_ts = 0.0
-        backoff = 0.5
 
         while not self._stop_event.is_set():
+            if self._fatal_error:
+                break
+
             loop_start = time.time()
 
-            # Get latest frame from shared buffer (same capture thread as AI)
             frame, frame_ts = self.frame_buffer.get_latest()
-
             if frame is None or frame_ts <= last_frame_ts:
-                # No new frame yet — wait a bit
                 self._stop_event.wait(interval / 4)
                 continue
 
-            # ----------------------------------------------------------------
-            # Detect resolution mismatch on the very first real frame.
-            # If the RTSP stream resolution differs from what FFmpeg was told,
-            # restart FFmpeg with the correct dimensions to avoid the tiling
-            # mosaic effect.
-            # ----------------------------------------------------------------
             actual_h, actual_w = frame.shape[:2]
             if actual_w != self.width or actual_h != self.height:
                 logger.info(
-                    f"StreamBroadcaster resolution mismatch for camera {self.camera_id}: "
-                    f"expected {self.width}x{self.height}, got {actual_w}x{actual_h}. "
-                    f"Restarting FFmpeg with correct dimensions."
+                    f"StreamBroadcaster source resolution change camera={self.camera_id}: "
+                    f"{self.width}x{self.height} → {actual_w}x{actual_h}"
                 )
-                self._kill_ffmpeg()
                 self.width = actual_w
                 self.height = actual_h
-                self._spawn_ffmpeg()
-                last_frame_ts = 0.0
-                continue
+                self._refresh_hd_size_from_source()
 
-            # Check if FFmpeg died; respawn with backoff and retry limit
-            if self._proc is None or self._proc.poll() is not None:
-                self._consecutive_failures += 1
-                self._successful_writes = 0  # Reset on failure
-                
-                if self._proc is not None:
-                    exit_code = self._proc.returncode
-                    logger.warning(
-                        f"StreamBroadcaster ffmpeg died (code={exit_code}) "
-                        f"for camera {self.camera_id} (attempt {self._consecutive_failures}/{self.max_restart_attempts})"
-                    )
-                    
-                    # Exit code 224 typically means connection refused to MediaMTX
-                    if exit_code == 224:
-                        logger.error(
-                            f"StreamBroadcaster cannot connect to MediaMTX at {self._ingest_url()} "
-                            f"for camera {self.camera_id}. Check MediaMTX service and network connectivity."
-                        )
-                
-                # Check if we've exceeded max restart attempts
-                if self._consecutive_failures >= self.max_restart_attempts:
-                    self._fatal_error = True
-                    self._error = f"FFmpeg failed {self._consecutive_failures} times. Giving up."
-                    logger.error(
-                        f"StreamBroadcaster for camera {self.camera_id} exceeded max restart attempts "
-                        f"({self.max_restart_attempts}). Stopping broadcast. Error: {self._error}"
-                    )
-                    break
-                
-                # Wait with exponential backoff before retrying
-                wait_time = min(backoff * (2 ** (self._consecutive_failures - 1)), 30.0)
-                logger.info(f"StreamBroadcaster waiting {wait_time:.1f}s before retry...")
-                self._stop_event.wait(wait_time)
-                
-                if self._stop_event.is_set():
-                    break
-                
-                self._spawn_ffmpeg()
-                # Reset frame ts to force a fresh frame after respawn
-                last_frame_ts = 0.0
-                continue
-
-            # FFmpeg is alive - try to write frame
             last_frame_ts = frame_ts
+            now = time.time()
 
             try:
                 annotated = self._draw_overlays(frame)
-                self._proc.stdin.write(annotated.tobytes())
-                self._proc.stdin.flush()  # Ensure data is sent
-                
-                # Increment successful writes counter
-                self._successful_writes += 1
-                
-                # Only reset failure counter after 3+ consecutive successful writes
-                # This prevents premature "recovered" messages when FFmpeg dies immediately
-                if self._consecutive_failures > 0 and self._successful_writes >= 3:
-                    logger.info(
-                        f"StreamBroadcaster for camera {self.camera_id} recovered after "
-                        f"{self._consecutive_failures} failures ({self._successful_writes} successful writes)"
-                    )
-                    self._consecutive_failures = 0
-                    backoff = 0.5
-                
-                if not self._first_frame_sent.is_set():
-                    self._first_frame_sent.set()
-                    logger.info(
-                        f"StreamBroadcaster first frame sent for camera {self.camera_id} "
-                        f"({actual_w}x{actual_h})"
-                    )
-            except (BrokenPipeError, OSError) as e:
-                # Reset successful writes counter on pipe error
-                self._successful_writes = 0
-                # Don't log as warning - this is expected when FFmpeg dies
-                # The next loop iteration will detect the dead process and handle it
-                pass
             except Exception as e:
-                self._successful_writes = 0
-                logger.error(f"StreamBroadcaster error for camera {self.camera_id}: {e}")
+                logger.error(f"StreamBroadcaster draw error for camera {self.camera_id}: {e}")
+                self._stop_event.wait(interval)
+                continue
 
-            # Maintain target FPS
+            any_written = False
+            for pipe in self._pipes:
+                # Per-pipe FPS throttle
+                min_interval = 1.0 / pipe.fps
+                if pipe.last_write_ts and (now - pipe.last_write_ts) < (min_interval * 0.85):
+                    continue
+
+                # HD may have given up — skip without killing LD
+                if pipe.consecutive_failures >= self.max_restart_attempts:
+                    continue
+
+                if not self._ensure_pipe_alive(pipe):
+                    if pipe.name == "ld" and self._fatal_error:
+                        break
+                    continue
+
+                try:
+                    out = self._resize_for_pipe(annotated, pipe)
+                    pipe.proc.stdin.write(out.tobytes())
+                    pipe.proc.stdin.flush()
+                    pipe.last_write_ts = now
+                    pipe.successful_writes += 1
+                    any_written = True
+
+                    if pipe.consecutive_failures > 0 and pipe.successful_writes >= 3:
+                        logger.info(
+                            f"StreamBroadcaster ({pipe.name}) for camera {self.camera_id} "
+                            f"recovered after {pipe.consecutive_failures} failures"
+                        )
+                        pipe.consecutive_failures = 0
+
+                    if not pipe.first_frame_sent.is_set():
+                        pipe.first_frame_sent.set()
+                        logger.info(
+                            f"StreamBroadcaster first {pipe.name} frame sent for "
+                            f"camera {self.camera_id} ({pipe.width}x{pipe.height}@{pipe.fps}fps)"
+                        )
+                except (BrokenPipeError, OSError):
+                    pipe.successful_writes = 0
+                except Exception as e:
+                    pipe.successful_writes = 0
+                    logger.error(
+                        f"StreamBroadcaster ({pipe.name}) write error "
+                        f"for camera {self.camera_id}: {e}"
+                    )
+
+            if any_written and not self._first_frame_sent.is_set():
+                self._first_frame_sent.set()
+
+            if self._fatal_error:
+                break
+
             elapsed = time.time() - loop_start
             sleep_sec = max(0.001, interval - elapsed)
             self._stop_event.wait(sleep_sec)
+
+    @staticmethod
+    def _resize_for_pipe(frame: np.ndarray, pipe: _QualityPipe) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if w == pipe.width and h == pipe.height:
+            return frame
+        return cv2.resize(frame, (pipe.width, pipe.height), interpolation=cv2.INTER_AREA)
 
     # ------------------------------------------------------------------
     # Drawing
@@ -443,17 +572,17 @@ class StreamBroadcaster:
                     fy1 = int(face_bbox["y1"])
                     fx2 = int(face_bbox["x2"])
                     fy2 = int(face_bbox["y2"])
-                    
+
                     # Draw fine border for face
                     cv2.rectangle(display, (fx1, fy1), (fx2, fy2), (0, 165, 255), 1)
-                    
+
                     # Mini label under face bbox viz, e.g. "F:0.89"
                     flabel = f"F:{face_score:.2f}"
                     ffont = cv2.FONT_HERSHEY_SIMPLEX
                     ffont_scale = 0.32
                     fthickness = 1
                     (flbl_w, flbl_h), fbaseline = cv2.getTextSize(flabel, ffont, ffont_scale, fthickness)
-                    
+
                     # Highlight background behind face tag
                     f_overlay = display.copy()
                     cv2.rectangle(
@@ -464,7 +593,7 @@ class StreamBroadcaster:
                         -1,
                     )
                     cv2.addWeighted(f_overlay, 0.5, display, 0.5, 0, display)
-                    
+
                     # White text for face score
                     cv2.putText(
                         display,

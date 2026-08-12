@@ -163,7 +163,10 @@ def get_insightface_providers() -> list:
     return ["CPUExecutionProvider"]
 
 
-def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
+def get_ffmpeg_video_codec_args(
+    ffmpeg_binary: str = "ffmpeg",
+    bitrate: str | None = None,
+) -> list:
     """Return the FFmpeg video codec CLI argument list for the current device.
 
     Priority:
@@ -171,9 +174,10 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
       2. MPS   → h264_videotoolbox  (Apple VideoToolbox hardware encoder)
       3. CPU   → libx264  (software, veryfast + zerolatency)
 
-    All paths include explicit bitrate control (STREAM_BITRATE) because FFmpeg
-    defaults to CRF-based quality encoding without -b:v, producing 5-8 Mbps for
-    1080p surveillance — 4-6× heavier than the ~1.2 Mbps this pipeline targets.
+    All paths include explicit bitrate control because FFmpeg defaults to
+    CRF-based quality encoding without -b:v, producing 5-8 Mbps for 1080p
+    surveillance. Pass ``bitrate`` (e.g. ``"600k"``) for dual-quality streams;
+    otherwise ``STREAM_BITRATE`` is used.
 
     The returned list is ready to splice into an ffmpeg command, e.g.::
 
@@ -181,27 +185,29 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
     """
     from app.config import get_settings
     settings = get_settings()
-    bitrate = settings.STREAM_BITRATE
+    bitrate = bitrate or settings.STREAM_BITRATE
+    br_num = int("".join(ch for ch in bitrate if ch.isdigit()) or "1200")
+    bufsize = f"{br_num * 2}k"
 
     device = get_device()
 
     if device == "cuda":
         if _NVENC_AVAILABLE or _probe_nvenc(ffmpeg_binary):
-            logger.debug("FFmpeg encoder: h264_nvenc (CUDA)")
+            logger.debug(f"FFmpeg encoder: h264_nvenc (CUDA) bitrate={bitrate}")
             return [
                 "-c:v", "h264_nvenc",
                 "-preset", "p4",       # NVENC balanced preset (good quality / speed)
                 "-tune", "ll",         # low-latency tune
                 "-b:v", bitrate,
                 "-maxrate", bitrate,
-                "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",
+                "-bufsize", bufsize,
                 "-pix_fmt", "yuv420p",
             ]
         # CUDA GPU found but ffmpeg was built without NVENC — fall through to libx264
         logger.warning("CUDA GPU detected but h264_nvenc not available in ffmpeg — falling back to libx264")
 
     if device == "mps":
-        logger.debug("FFmpeg encoder: h264_videotoolbox (MPS/Apple Silicon)")
+        logger.debug(f"FFmpeg encoder: h264_videotoolbox (MPS/Apple Silicon) bitrate={bitrate}")
         return [
             "-c:v", "h264_videotoolbox",
             "-b:v", bitrate,
@@ -210,14 +216,14 @@ def get_ffmpeg_video_codec_args(ffmpeg_binary: str = "ffmpeg") -> list:
         ]
 
     # CPU (or CUDA without NVENC)
-    logger.debug("FFmpeg encoder: libx264 (CPU software)")
+    logger.debug(f"FFmpeg encoder: libx264 (CPU software) bitrate={bitrate}")
     return [
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
         "-b:v", bitrate,
         "-maxrate", bitrate,
-        "-bufsize", str(int(bitrate.rstrip("k")) * 2) + "k",
+        "-bufsize", bufsize,
         "-pix_fmt", "yuv420p",
     ]
 

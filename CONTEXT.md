@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** August 4, 2026 (Dedup same-cam lookback 48h + min 10s; force_merge staff split 69f37→3fc4)  
+> **Last updated:** August 12, 2026 (Dual-quality browser streams: LD 720p@15 for grid, HD ~1024p@24 for fullscreen)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -37,7 +37,9 @@ Frame (2880×1620)
     → Face embeddings L2-normalized at store time (norm=1.0)
     → Body contamination gate (median sim to existing cluster, ≥3 prior, 0.50 threshold)
   → Rule engine (zone dwell, line crossing, billing)
-  → Stream broadcaster (annotated 15fps → FFmpeg NVENC → MediaMTX → WebRTC)
+  → Stream broadcaster (dual quality → FFmpeg NVENC → MediaMTX → WebRTC)
+       LD: 720p@15fps (dashboard grid, webrtc_url)
+       HD: ~1024p@24fps (fullscreen, webrtc_url_hd)
 ```
 
 ---
@@ -201,7 +203,7 @@ Frame N+4 (window fires):
 | MinIO sweep | `jobs/tasks.py` (_sweep_orphaned_crops) |
 | Crop helpers | `image_utils.py` |
 | Config/Thresholds | `config.py` |
-| Stream broadcaster | `stream_broadcaster.py` |
+| Stream broadcaster | `stream_broadcaster.py` (dual LD/HD → MediaMTX) |
 | Inference pool | `inference_pool.py` |
 | YOLO detector | `yolo_detector.py` |
 
@@ -614,6 +616,20 @@ Steps:
 **Migration:** `0007_identity_merge_and_fragment_events.py`
 
 ---
+
+## Dual-quality browser streams (2026-08-12)
+
+Dashboard multi-cam grids were pulling full native-resolution burn-in feeds and saturating bandwidth.
+
+| Variant | Path | Default | Use |
+|---------|------|---------|-----|
+| **LD** | `cam_<uuid>` | 1280×720 @ 15fps, ~600k | `webrtc_url` — dashboard / live-feeds grid |
+| **HD** | `cam_<uuid>_hd` | height 1024 (aspect-preserved, max w 1920) @ 24fps, ~2500k | `webrtc_url_hd` — fullscreen |
+
+- Config: `STREAM_LD_*`, `STREAM_HD_*`, `STREAM_PUBLISH_HD` in `app/config.py`
+- Broadcaster draws overlays once at source res, then resizes into two FFmpeg pipes
+- Frontend: grid/dashboard → `webrtc_url`; fullscreen → `webrtc_url_hd || webrtc_url`
+- Non-burnin `FFmpegPublisher` lowlatency mode also scales to LD
 
 ## Decision log — identity & analytics (must not be lost)
 
