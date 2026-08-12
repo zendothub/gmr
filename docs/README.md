@@ -401,7 +401,7 @@ DB references (protected from deletion):
 | Analytics queries | `app/modules/analytics/service.py` |
 | Background jobs (dedup, staff) | `app/modules/jobs/tasks.py` |
 | Config / thresholds | `app/config.py` |
-| Stream broadcaster | `app/modules/ai_runtime/stream_broadcaster.py` |
+| Stream broadcaster | `app/modules/ai_runtime/stream_broadcaster.py` (dual LD/HD — see [DUAL_STREAM_QUALITY.md](./DUAL_STREAM_QUALITY.md)) |
 | YOLO detector | `app/modules/detection/yolo_detector.py` |
 | Inference pool | `app/modules/ai_runtime/inference_pool.py` |
 | Crop helpers | `app/utils/image_utils.py` |
