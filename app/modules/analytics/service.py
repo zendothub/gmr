@@ -19,11 +19,12 @@ from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.person import PersonIdentity, PersonEmbedding
 
-# ── Shared staff exclusion subquery ──────────────────────────────────────
-# Used by all purchase/billing count queries so employees (who generate
-# hundreds of billing events per shift) don't inflate analytics.  Staff
+# ── Shared staff exclusion ───────────────────────────────────────────────
+# Used by V2 dashboard + metrics (footfall, gender, age, purchase) and
+# billing counts so employees don't inflate customer analytics.  Staff
 # classification runs every 10 min in the dedup job.
 _STAFF_IDS = select(PersonIdentity.id).where(PersonIdentity.is_staff.is_(True))
+_NOT_STAFF = PersonIdentity.is_staff.is_(False)
 from app.core.db.models.store import Store
 from collections import defaultdict
 from app.modules.analytics.schemas import (
@@ -874,11 +875,12 @@ class AnalyticsService:
         total_cameras = (await db.execute(cam_base)).scalar() or 0
         active_cameras = (await db.execute(active_base)).scalar() or 0
 
-        # ── 3. Footfall (Unique persons based on PersonIdentity.last_seen_at) ─────────────────
+        # ── 3. Footfall (unique non-staff persons by last_seen_at) ────────
         def _ff_q(s, e):
             q = select(func.count(PersonIdentity.id)).where(
                 PersonIdentity.last_seen_at >= s,
                 PersonIdentity.last_seen_at <= e,
+                _NOT_STAFF,
             )
             if cam_ids:
                 # Filter by persons who have embeddings from cameras in cam_ids
@@ -893,11 +895,12 @@ class AnalyticsService:
         total_visitors = (await db.execute(_ff_q(start, end))).scalar() or 0
         prev_visitors  = (await db.execute(_ff_q(prev_start, prev_end))).scalar() or 0
 
-        # ── 4. Fetch demographics (distinct persons in range) ─────────────
+        # ── 4. Fetch demographics (distinct non-staff persons in range) ───
         # Query persons directly by last_seen_at to include orphaned persons
         demo_q = select(PersonIdentity.id, PersonIdentity.gender, PersonIdentity.estimated_age).where(
             PersonIdentity.last_seen_at >= start,
             PersonIdentity.last_seen_at <= end,
+            _NOT_STAFF,
         )
         if cam_ids:
             # Filter by persons who have embeddings from cameras in cam_ids
@@ -960,7 +963,7 @@ class AnalyticsService:
         # Truncate in IST timezone to get proper IST hour buckets (0:00 IST, 1:00 IST, etc.)
         bucket_expr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
         
-        # Subquery: Get distinct person_identity_id per bucket
+        # Subquery: distinct non-staff person_identity_id per bucket
         distinct_persons_subq = (
             select(
                 bucket_expr.label("bucket"),
@@ -970,6 +973,7 @@ class AnalyticsService:
                 TrackSession.started_at >= start,
                 TrackSession.started_at <= end,
                 TrackSession.person_identity_id.isnot(None),
+                TrackSession.person_identity_id.notin_(_STAFF_IDS),
             )
             .distinct()
         )
@@ -981,6 +985,7 @@ class AnalyticsService:
             TrackSession.started_at >= start,
             TrackSession.started_at <= end,
             TrackSession.person_identity_id.isnot(None),
+            TrackSession.person_identity_id.notin_(_STAFF_IDS),
         ).limit(5)
         debug_ts_rows = (await db.execute(debug_ts_query)).all()
         logger.info(f"🔍 DEBUG: Query range: {start} to {end}")
@@ -1004,6 +1009,7 @@ class AnalyticsService:
                 TrackSession.started_at >= start,
                 TrackSession.started_at <= end,
                 TrackSession.person_identity_id.isnot(None),
+                TrackSession.person_identity_id.notin_(_STAFF_IDS),
             )
             .distinct()
         )
@@ -1054,8 +1060,7 @@ class AnalyticsService:
             ))
             slot = next_slot
 
-        # ── 7. Gender Trend (unique persons by gender per time bucket) ─────────────────────────
-        # Subquery: Get distinct person_identity_id per bucket with gender
+        # ── 7. Gender Trend (unique non-staff persons by gender per bucket) ─
         distinct_gender_subq = (
             select(
                 bucket_expr.label("bucket"),
@@ -1067,6 +1072,7 @@ class AnalyticsService:
                 TrackSession.started_at >= start,
                 TrackSession.started_at <= end,
                 TrackSession.person_identity_id.isnot(None),
+                _NOT_STAFF,
             )
             .distinct()
         )
@@ -1259,10 +1265,11 @@ class AnalyticsService:
         # ── Shared helpers ─────────────────────────────────────────────
 
         def _unique_persons_q(s, e):
-            """Count unique persons by PersonIdentity.last_seen_at (includes orphaned persons)."""
+            """Count unique non-staff persons by last_seen_at (includes orphaned persons)."""
             q = select(func.count(PersonIdentity.id)).where(
                 PersonIdentity.last_seen_at >= s,
                 PersonIdentity.last_seen_at <= e,
+                _NOT_STAFF,
             )
             if cam_ids:
                 # Filter by persons who have embeddings from cameras in cam_ids
@@ -1341,7 +1348,7 @@ class AnalyticsService:
             # Count unique persons (distinct person_identity_id)
             total_visitors = (await db.execute(_unique_persons_q(start, end))).scalar() or 0
 
-            # Hourly map for peak hour (unique persons per hour) - use PersonIdentity.last_seen_at
+            # Hourly map for peak hour (unique non-staff persons per hour)
             h_bexpr = func.date_trunc("hour", func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
             hq = (
@@ -1352,6 +1359,7 @@ class AnalyticsService:
                 .where(
                     PersonIdentity.last_seen_at >= start,
                     PersonIdentity.last_seen_at <= end,
+                    _NOT_STAFF,
                 )
                 .group_by("b")
                 .order_by("b")
@@ -1374,7 +1382,7 @@ class AnalyticsService:
                     # Extract hour as integer for peak_hours_label
                     hourly_int[bucket_ist.hour] = r.c
 
-            # daily map for avg_daily + busiest_day (unique persons per day) - use PersonIdentity.last_seen_at
+            # daily map for avg_daily + busiest_day (unique non-staff persons per day)
             d_bexpr = func.date_trunc("day", func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
             dq = (
@@ -1385,6 +1393,7 @@ class AnalyticsService:
                 .where(
                     PersonIdentity.last_seen_at >= start,
                     PersonIdentity.last_seen_at <= end,
+                    _NOT_STAFF,
                 )
                 .group_by("b")
                 .order_by("b")
@@ -1413,7 +1422,7 @@ class AnalyticsService:
                 hours_so_far = max(1, int((end - start).total_seconds() // 3600) + 1)
                 avg_hourly = total_visitors // hours_so_far
 
-            # footfall_over_time (resolved granularity) - use PersonIdentity.last_seen_at
+            # footfall_over_time (resolved granularity) - unique non-staff persons
             slot_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', PersonIdentity.last_seen_at))
             
             ffq = (
@@ -1424,6 +1433,7 @@ class AnalyticsService:
                 .where(
                     PersonIdentity.last_seen_at >= start,
                     PersonIdentity.last_seen_at <= end,
+                    _NOT_STAFF,
                 )
                 .group_by("b")
                 .order_by("b")
@@ -1445,7 +1455,7 @@ class AnalyticsService:
             
             footfall_over_time = cls._build_ff_slots(start, end, resolved, ff_map)
             
-            # Period comparison - unique persons per slot for both periods
+            # Period comparison - unique non-staff persons per slot for both periods
             async def _footfall_period_comparison() -> List[PeriodComparisonPoint]:
                 # Current period
                 curr_map = ff_map  # Already computed above
@@ -1461,6 +1471,7 @@ class AnalyticsService:
                         TrackSession.started_at >= prev_start,
                         TrackSession.started_at <= prev_end,
                         TrackSession.person_identity_id.isnot(None),
+                        TrackSession.person_identity_id.notin_(_STAFF_IDS),
                     )
                     .distinct()
                 )
@@ -1501,7 +1512,7 @@ class AnalyticsService:
             
             period_comp = await _footfall_period_comparison()
             
-            # Per-camera breakdown - unique persons per camera
+            # Per-camera breakdown - unique non-staff persons per camera
             cam_q = (
                 select(
                     Camera.id,
@@ -1513,6 +1524,7 @@ class AnalyticsService:
                     TrackSession.started_at >= start,
                     TrackSession.started_at <= end,
                     TrackSession.person_identity_id.isnot(None),
+                    TrackSession.person_identity_id.notin_(_STAFF_IDS),
                 )
                 .group_by(Camera.id, Camera.name)
                 .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
@@ -1545,11 +1557,11 @@ class AnalyticsService:
 
         # ── GENDER ─────────────────────────────────────────────────────
         if metric == "gender":
-            # Distinct persons in range — mirrors footfall: use PersonIdentity.last_seen_at
-            # so that total_male + total_female + total_unidentified == footfall total_visitors.
+            # Distinct non-staff persons — mirrors footfall total_visitors.
             demo_q = select(PersonIdentity.id, PersonIdentity.gender).where(
                 PersonIdentity.last_seen_at >= start,
                 PersonIdentity.last_seen_at <= end,
+                _NOT_STAFF,
             )
             if cam_ids:
                 demo_q = demo_q.where(
@@ -1568,7 +1580,7 @@ class AnalyticsService:
                 gcnt[cls._v2_gender(raw)] += 1
             total_g = sum(gcnt.values()) or 1
 
-            # gender_trend - unique persons by gender per slot
+            # gender_trend - unique non-staff persons by gender per slot
             bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
             
             gt_subq = (
@@ -1582,6 +1594,7 @@ class AnalyticsService:
                     TrackSession.started_at >= start,
                     TrackSession.started_at <= end,
                     TrackSession.person_identity_id.isnot(None),
+                    _NOT_STAFF,
                 )
                 .distinct()
             )
@@ -1617,7 +1630,7 @@ class AnalyticsService:
                 ))
                 slot = nxt
 
-            # Period comparison and per-camera for gender use unique persons
+            # Period comparison and per-camera for gender use unique non-staff persons
             async def _gender_period_comparison() -> List[PeriodComparisonPoint]:
                 # Current already computed in gt_map, need to aggregate across genders
                 curr_totals: dict = {}
@@ -1635,6 +1648,7 @@ class AnalyticsService:
                         TrackSession.started_at >= prev_start,
                         TrackSession.started_at <= prev_end,
                         TrackSession.person_identity_id.isnot(None),
+                        TrackSession.person_identity_id.notin_(_STAFF_IDS),
                     )
                     .distinct()
                 )
@@ -1687,6 +1701,7 @@ class AnalyticsService:
                     TrackSession.started_at >= start,
                     TrackSession.started_at <= end,
                     TrackSession.person_identity_id.isnot(None),
+                    TrackSession.person_identity_id.notin_(_STAFF_IDS),
                 )
                 .group_by(Camera.id, Camera.name)
                 .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
@@ -1713,11 +1728,11 @@ class AnalyticsService:
 
         # ── AGE GROUPS ─────────────────────────────────────────────────
         if metric == "age_groups":
-            # Distinct persons in range — mirrors footfall/gender: PersonIdentity.last_seen_at
-            # so total_identified (+ unidentified) == footfall total_visitors.
+            # Distinct non-staff persons — mirrors footfall total_visitors.
             age_demo_q = select(PersonIdentity.id, PersonIdentity.estimated_age).where(
                 PersonIdentity.last_seen_at >= start,
                 PersonIdentity.last_seen_at <= end,
+                _NOT_STAFF,
             )
             if cam_ids:
                 age_demo_q = age_demo_q.where(
@@ -1753,9 +1768,9 @@ class AnalyticsService:
                 key="unidentified", label="Unidentified", count=age_cnt2["unidentified"]
             )]
 
-            # Period comparison and per-camera for age groups
+            # Period comparison and per-camera for age groups (non-staff)
             async def _age_period_comparison() -> List[PeriodComparisonPoint]:
-                # Current period - aggregate total unique persons per slot
+                # Current period - aggregate total unique non-staff persons per slot
                 curr_bexpr = func.date_trunc(resolved, func.timezone('Asia/Kolkata', TrackSession.started_at))
                 curr_subq = (
                     select(
@@ -1766,6 +1781,7 @@ class AnalyticsService:
                         TrackSession.started_at >= start,
                         TrackSession.started_at <= end,
                         TrackSession.person_identity_id.isnot(None),
+                        TrackSession.person_identity_id.notin_(_STAFF_IDS),
                     )
                     .distinct()
                 )
@@ -1800,6 +1816,7 @@ class AnalyticsService:
                         TrackSession.started_at >= prev_start,
                         TrackSession.started_at <= prev_end,
                         TrackSession.person_identity_id.isnot(None),
+                        TrackSession.person_identity_id.notin_(_STAFF_IDS),
                     )
                     .distinct()
                 )
@@ -1852,6 +1869,7 @@ class AnalyticsService:
                     TrackSession.started_at >= start,
                     TrackSession.started_at <= end,
                     TrackSession.person_identity_id.isnot(None),
+                    TrackSession.person_identity_id.notin_(_STAFF_IDS),
                 )
                 .group_by(Camera.id, Camera.name)
                 .order_by(func.count(func.distinct(TrackSession.person_identity_id)).desc())
