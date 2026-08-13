@@ -406,6 +406,9 @@ async def list_camera_feeds(
                 stream_path=stream_path,
                 webrtc_url=endpoints.webrtc_url,
                 hls_url=endpoints.hls_url,
+                stream_path_hd=endpoints.path_hd,
+                webrtc_url_hd=endpoints.webrtc_url_hd,
+                hls_url_hd=endpoints.hls_url_hd,
                 zones=zone_summaries,
                 zone_count=len(zone_summaries),
             )
@@ -583,6 +586,9 @@ async def get_polygon_editor(
         stream_path=stream_path,
         webrtc_url=webrtc_url,
         hls_url=hls_url,
+        stream_path_hd=endpoints.path_hd,
+        webrtc_url_hd=endpoints.webrtc_url_hd,
+        hls_url_hd=endpoints.hls_url_hd,
         zones=[_build_detection_zone_response(z) for z in zones],
         available_event_types=_available_event_types(),
     )

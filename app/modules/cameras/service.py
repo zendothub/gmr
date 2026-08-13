@@ -38,6 +38,9 @@ class CameraService:
         resp.stream_path = camera.stream_path or endpoints.path
         resp.webrtc_url = endpoints.webrtc_url
         resp.hls_url = endpoints.hls_url
+        resp.stream_path_hd = endpoints.path_hd
+        resp.webrtc_url_hd = endpoints.webrtc_url_hd
+        resp.hls_url_hd = endpoints.hls_url_hd
         # Populate store-derived fields if a store is linked
         if camera.store:
             resp.store_name = camera.store.name

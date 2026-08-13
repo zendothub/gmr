@@ -63,10 +63,20 @@ class FFmpegPublisher(StreamPublisher):
         ]
 
         if self.mode == "lowlatency":
-            # Re-encode video to H.264, drop audio.
+            # Re-encode video to H.264 at LD resolution, drop audio.
             # Encoder is selected at startup: h264_nvenc (CUDA) > h264_videotoolbox (MPS) > libx264 (CPU)
             from app.utils.device import get_ffmpeg_video_codec_args
-            cmd += ["-an"] + get_ffmpeg_video_codec_args(s.FFMPEG_BINARY) + ["-g", "30"]
+            ld_w = max(2, int(s.STREAM_LD_WIDTH) // 2 * 2)
+            ld_h = max(2, int(s.STREAM_LD_HEIGHT) // 2 * 2)
+            ld_fps = max(1, int(s.STREAM_LD_FPS or s.STREAM_BURNIN_FPS or 15))
+            ld_br = s.STREAM_LD_BITRATE or s.STREAM_BITRATE
+            cmd += [
+                "-an",
+                "-vf", f"scale={ld_w}:{ld_h}:force_original_aspect_ratio=decrease,pad={ld_w}:{ld_h}:(ow-iw)/2:(oh-ih)/2",
+                "-r", str(ld_fps),
+            ] + get_ffmpeg_video_codec_args(s.FFMPEG_BINARY, bitrate=ld_br) + [
+                "-g", str(ld_fps * 2),
+            ]
         else:
             # Remux only - no re-encode.  Drop audio — surveillance cameras
             # don't need it, and an audio-only track would break WebRTC.

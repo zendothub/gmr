@@ -83,6 +83,10 @@ class StreamingService:
             webrtc_url=endpoints.webrtc_url,
             hls_url=endpoints.hls_url,
             rtsp_url=endpoints.rtsp_url,
+            path_hd=endpoints.path_hd,
+            webrtc_url_hd=endpoints.webrtc_url_hd,
+            hls_url_hd=endpoints.hls_url_hd,
+            rtsp_url_hd=endpoints.rtsp_url_hd,
         )
 
     @staticmethod
@@ -139,6 +143,9 @@ class StreamingService:
                 webrtc_url=ep["webrtc_url"],
                 hls_url=ep["hls_url"],
                 rtsp_url=ep["rtsp_url"],
+                webrtc_url_hd=ep.get("webrtc_url_hd"),
+                hls_url_hd=ep.get("hls_url_hd"),
+                rtsp_url_hd=ep.get("rtsp_url_hd"),
             )
         # Not running yet - still surface the URLs it WILL have.
         endpoints = MediaMTXManager().endpoints(camera.id, public_host=public_host)
@@ -150,6 +157,9 @@ class StreamingService:
             webrtc_url=endpoints.webrtc_url,
             hls_url=endpoints.hls_url,
             rtsp_url=endpoints.rtsp_url,
+            webrtc_url_hd=endpoints.webrtc_url_hd,
+            hls_url_hd=endpoints.hls_url_hd,
+            rtsp_url_hd=endpoints.rtsp_url_hd,
         )
 
     @staticmethod
