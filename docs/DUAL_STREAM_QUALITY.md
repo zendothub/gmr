@@ -15,11 +15,11 @@ unnecessarily.
 
 | Variant | MediaMTX path     | Default encode        | Bitrate | API field        | Intended use              |
 |---------|-------------------|-----------------------|---------|------------------|---------------------------|
-| **LD**  | `cam_<uuid>`      | 1280×720 @ 15 fps     | ~600k   | `webrtc_url`     | Dashboard / grid tiles    |
-| **HD**  | `cam_<uuid>_hd`   | height 1024 @ 24 fps* | ~2500k  | `webrtc_url_hd`  | Fullscreen / single cam   |
+| **LD**  | `cam_<uuid>`      | 640×360 @ 15 fps      | ~350k   | `webrtc_url`     | Dashboard / grid tiles    |
+| **HD**  | `cam_<uuid>_hd`   | height 720 @ 24 fps*  | ~1200k  | `webrtc_url_hd`  | Fullscreen / single cam   |
 
-\* HD width is aspect-preserved from the source, capped by `STREAM_HD_MAX_WIDTH` (1920).  
-  Example from 2880×1620 → ~1820×1024.
+\* HD width is aspect-preserved from the source, capped by `STREAM_HD_MAX_WIDTH` (1280).  
+  Example from 2880×1620 → 1280×720.
 
 `webrtc_url` / `hls_url` stay **LD** for backward compatibility.  
 HD is additive (`webrtc_url_hd`, `hls_url_hd`, `path_hd`).
@@ -44,14 +44,14 @@ single republish to **LD** dimensions as well.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `STREAM_LD_WIDTH` | `1280` | LD width |
-| `STREAM_LD_HEIGHT` | `720` | LD height |
+| `STREAM_LD_WIDTH` | `640` | LD width |
+| `STREAM_LD_HEIGHT` | `360` | LD height |
 | `STREAM_LD_FPS` | `15` | LD frame rate |
-| `STREAM_LD_BITRATE` | `600k` | LD H.264 bitrate |
-| `STREAM_HD_HEIGHT` | `1024` | HD target height (“1024p”) |
-| `STREAM_HD_MAX_WIDTH` | `1920` | HD max width |
+| `STREAM_LD_BITRATE` | `350k` | LD H.264 bitrate |
+| `STREAM_HD_HEIGHT` | `720` | HD target height (720p) |
+| `STREAM_HD_MAX_WIDTH` | `1280` | HD max width |
 | `STREAM_HD_FPS` | `24` | HD frame rate |
-| `STREAM_HD_BITRATE` | `2500k` | HD H.264 bitrate |
+| `STREAM_HD_BITRATE` | `1200k` | HD H.264 bitrate |
 | `STREAM_PUBLISH_HD` | `True` | Set `False` to publish LD only |
 | `STREAM_BURNIN_FPS` | `15` | Legacy alias; LD uses `STREAM_LD_FPS` |
 | `STREAM_BITRATE` | `1200k` | Fallback bitrate |

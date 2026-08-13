@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** August 12, 2026 (Dual-quality browser streams: LD 720p@15 for grid, HD ~1024p@24 for fullscreen)  
+> **Last updated:** August 13, 2026 (Stream defaults: LD 640×360@15/350k, HD 1280×720@24/1200k)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -38,8 +38,8 @@ Frame (2880×1620)
     → Body contamination gate (median sim to existing cluster, ≥3 prior, 0.50 threshold)
   → Rule engine (zone dwell, line crossing, billing)
   → Stream broadcaster (dual quality → FFmpeg NVENC → MediaMTX → WebRTC)
-       LD: 720p@15fps (dashboard grid, webrtc_url)
-       HD: ~1024p@24fps (fullscreen, webrtc_url_hd)
+       LD: 640×360@15fps/350k (dashboard grid, webrtc_url)
+       HD: 1280×720@24fps/1200k (fullscreen, webrtc_url_hd)
 ```
 
 ---
@@ -623,8 +623,8 @@ Dashboard multi-cam grids were pulling full native-resolution burn-in feeds and 
 
 | Variant | Path | Default | Use |
 |---------|------|---------|-----|
-| **LD** | `cam_<uuid>` | 1280×720 @ 15fps, ~600k | `webrtc_url` — dashboard / live-feeds grid |
-| **HD** | `cam_<uuid>_hd` | height 1024 (aspect-preserved, max w 1920) @ 24fps, ~2500k | `webrtc_url_hd` — fullscreen |
+| **LD** | `cam_<uuid>` | 640×360 @ 15fps, ~350k | `webrtc_url` — dashboard / live-feeds grid |
+| **HD** | `cam_<uuid>_hd` | height 720 (aspect-preserved, max w 1280) @ 24fps, ~1200k | `webrtc_url_hd` — fullscreen |
 
 - Config: `STREAM_LD_*`, `STREAM_HD_*`, `STREAM_PUBLISH_HD` in `app/config.py`
 - Broadcaster draws overlays once at source res, then resizes into two FFmpeg pipes

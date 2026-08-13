@@ -249,16 +249,16 @@ class Settings(BaseSettings):
     # Dual-quality browser streams (burn-in path → MediaMTX → WebRTC):
     #   LD — dashboard / multi-cam grid (default webrtc_url)
     #   HD — fullscreen / single-cam detail (webrtc_url_hd)
-    STREAM_LD_WIDTH: int = 1280
-    STREAM_LD_HEIGHT: int = 720
+    STREAM_LD_WIDTH: int = 640
+    STREAM_LD_HEIGHT: int = 360
     STREAM_LD_FPS: int = 15
-    STREAM_LD_BITRATE: str = "600k"
-    # "1024p" = 1024 height; width is derived from source aspect at encode time
-    # (capped by STREAM_HD_MAX_WIDTH). Default targets ~1820×1024 @ 24fps.
-    STREAM_HD_HEIGHT: int = 1024
-    STREAM_HD_MAX_WIDTH: int = 1920
+    STREAM_LD_BITRATE: str = "350k"
+    # HD height; width is derived from source aspect at encode time
+    # (capped by STREAM_HD_MAX_WIDTH). Default targets 1280×720 @ 24fps.
+    STREAM_HD_HEIGHT: int = 720
+    STREAM_HD_MAX_WIDTH: int = 1280
     STREAM_HD_FPS: int = 24
-    STREAM_HD_BITRATE: str = "2500k"
+    STREAM_HD_BITRATE: str = "1200k"
     # When False, only LD is published (webrtc_url_hd omitted / falls back to LD).
     STREAM_PUBLISH_HD: bool = True
     # Auto-stop a published stream after this many seconds with no viewers.

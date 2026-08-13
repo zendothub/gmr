@@ -12,7 +12,7 @@ see **[docs/HOST_CAPACITY_AND_CAMERA_COST.md](docs/HOST_CAPACITY_AND_CAMERA_COST
 **Disk present / used / daily write rate / optimize:**  
 see **[docs/HOST_DISK_USAGE_AND_OPTIMIZATION.md](docs/HOST_DISK_USAGE_AND_OPTIMIZATION.md)**.
 
-**Dual-quality browser streams (LD 720p grid / HD 1024p fullscreen):**  
+**Dual-quality browser streams (LD 360p grid / HD 720p fullscreen):**  
 see **[docs/DUAL_STREAM_QUALITY.md](docs/DUAL_STREAM_QUALITY.md)**.
 
 ---

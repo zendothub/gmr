@@ -6,8 +6,8 @@ and pipes the annotated frames to FFmpeg subprocesses that encode and push into
 MediaMTX.
 
 Dual quality (bandwidth-aware):
-  - LD  ``cam_<uuid>``     — 720p @ 15fps  (dashboard / multi-cam grid)
-  - HD  ``cam_<uuid>_hd``  — ~1024p @ 24fps (fullscreen)
+  - LD  ``cam_<uuid>``     — 640×360 @ 15fps  (dashboard / multi-cam grid)
+  - HD  ``cam_<uuid>_hd``  — 1280×720 @ 24fps (fullscreen)
 
 Architecture:
   LatestFrameBuffer (background capture thread, full camera FPS)

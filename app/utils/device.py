@@ -176,7 +176,7 @@ def get_ffmpeg_video_codec_args(
 
     All paths include explicit bitrate control because FFmpeg defaults to
     CRF-based quality encoding without -b:v, producing 5-8 Mbps for 1080p
-    surveillance. Pass ``bitrate`` (e.g. ``"600k"``) for dual-quality streams;
+    surveillance. Pass ``bitrate`` (e.g. ``"350k"``) for dual-quality streams;
     otherwise ``STREAM_BITRATE`` is used.
 
     The returned list is ready to splice into an ffmpeg command, e.g.::
