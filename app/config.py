@@ -272,6 +272,27 @@ class Settings(BaseSettings):
     # Legacy alias — LD path uses STREAM_LD_FPS; kept for backward-compatible env.
     STREAM_BURNIN_FPS: int = 15
 
+    # ------------------------------------------------------------------
+    # Continuous full-res camera recording (filesystem only — no DB rows)
+    # ------------------------------------------------------------------
+    # When True, each ACTIVE camera gets a parallel FFmpeg recorder (copy
+    # codec, native resolution). Independent of YOLO / burn-in workers.
+    ENABLE_CAMERA_RECORDING: bool = True
+    # Chunk length in hours (wall-clock aligned from local midnight).
+    RECORDING_CHUNK_HOURS: float = 3.0
+    # Preferred root directory that already ends with (or is) video_record.
+    # Empty → auto: mounted HDD then Desktop fallback.
+    RECORDING_ROOT: str = ""
+    # Expected HDD mount point (see scripts/mount_recording_hdd.sh).
+    RECORDING_HDD_MOUNT: str = "/mnt/video_hdd"
+    # Fallback when HDD is not mounted (expanded ~).
+    RECORDING_FALLBACK_ROOT: str = "~/Desktop/video_record"
+    # Container folder name under root (always created).
+    RECORDING_ROOT_FOLDER_NAME: str = "video_record"
+    # How often (seconds) the supervisor reloads ACTIVE cameras from DB.
+    RECORDING_CAMERA_REFRESH_SECONDS: int = 60
+    # Seconds to wait before restarting a failed ffmpeg chunk.
+    RECORDING_RESTART_DELAY_SECONDS: float = 5.0
 
     # Logging
     LOG_LEVEL: str = "INFO"
