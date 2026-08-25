@@ -32,6 +32,7 @@ from app.modules.storage.router import router as storage_router
 from app.modules.feature_requests.router import router as feature_requests_router
 from app.modules.stores.router import router as stores_router
 from app.modules.debug.router import router as debug_router
+from app.modules.recording.router import router as recording_router
 
 settings = get_settings()
 
@@ -114,6 +115,7 @@ app.include_router(storage_router)
 app.include_router(feature_requests_router)
 app.include_router(stores_router)
 app.include_router(debug_router)
+app.include_router(recording_router)
 
 
 # ----------------------------------------------------------------------

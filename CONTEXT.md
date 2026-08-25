@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** August 13, 2026 (Stream defaults: LD 640×360@15/350k, HD 1280×720@24/1200k)  
+> **Last updated:** August 25, 2026 (camera full-res recording to Desktop/HDD; event snapshots off)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -11,6 +11,21 @@
 **Deployment:** Bare-metal Linux, 2× camera (Apolo counter + Apolo entry), RTX 4070 Ti GPU.  
 **Backend:** FastAPI (Python 3.10, single uvicorn worker), PostgreSQL + pgvector, MinIO.  
 **Frontend:** React 19 + TanStack Start + Recharts + Tailwind v4.
+
+---
+
+## Continuous camera recording (filesystem only)
+
+- **Module:** `app/modules/recording/` — independent of YOLO workers (does not share frame buffer).
+- **Enable:** `ENABLE_CAMERA_RECORDING=true` (env). Chunk length: `RECORDING_CHUNK_HOURS` default **3**.
+- **Codec:** FFmpeg `-c:v copy` full native RTSP resolution (no re-encode; does not steal NVENC from burn-in).
+- **Layout:** `{root}/video_record/{counter_camera|entry_camera}/dd_mm_yy_startAMPM_endAMPM.mp4`
+  - Folder from camera name (`Apollo counter` → `counter_camera`, `Apollo entry` → `entry_camera`).
+  - Example file: `12_08_26_12AM_3AM.mp4` (wall-clock slots from local midnight).
+- **Root priority:** `RECORDING_ROOT` → mounted `RECORDING_HDD_MOUNT` → `~/Desktop/video_record`.
+- **HDD:** `scripts/mount_recording_hdd.sh` — current sda/sdb are BitLocker; unlock before mount.
+- **No DB tables** for recordings. Status: `GET /api/recording/status`.
+- Failures must never block AI lifecycle (try/except in `lifecycle.py`).
 
 ---
 
