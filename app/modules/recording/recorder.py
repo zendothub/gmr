@@ -124,7 +124,8 @@ class CameraRecorder:
         start: datetime,
         end: datetime,
     ) -> None:
-        partial = out_path.with_suffix(out_path.suffix + ".partial")
+        # Must end with .mp4 so FFmpeg can pick the muxer (.mp4.partial fails).
+        partial = out_path.with_name(out_path.stem + ".partial.mp4")
         if partial.exists():
             try:
                 partial.unlink()
@@ -195,18 +196,21 @@ class CameraRecorder:
         ff = self.settings.FFMPEG_BINARY or "ffmpeg"
         # Cap duration slightly under slot end so next chunk can start cleanly
         dur = max(1.0, float(duration_sec) - 0.5)
+        # Note: do not pass -rw_timeout as a global flag — this host's FFmpeg
+        # rejects it before -i ("Option rw_timeout not found"). RTSP TCP is enough.
         return [
             ff,
             "-nostdin",
             "-hide_banner",
             "-loglevel", "warning",
             "-rtsp_transport", "tcp",
-            "-rw_timeout", "15000000",
+            "-fflags", "+genpts",
             "-i", self.rtsp_url,
             "-t", f"{dur:.1f}",
             "-map", "0:v:0",
             "-c:v", "copy",
             "-an",
+            "-f", "mp4",
             "-movflags", "+faststart",
             "-y",
             str(out_path),
