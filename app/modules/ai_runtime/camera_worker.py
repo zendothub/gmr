@@ -732,7 +732,7 @@ class CameraWorker:
                 self._refresh_event_person_ids(rule_events, zone_events)
 
                 if rule_events or zone_events:
-                    await self._persist_events(db, frame, rule_events, zone_events)
+                    await self._persist_events(db, rule_events, zone_events)
 
                 if observations:
                     await self._persist_observations(db, observations)
@@ -795,7 +795,7 @@ class CameraWorker:
             event_type="person_entered_view",
             severity=EventSeverity.LOW,
             description="Person entered view.",
-            snapshot_path=crop_path,
+            snapshot_path=None,
             metadata_json={"local_track_id": track.local_track_id},
             occurred_at=track.started_at
         )
@@ -1749,13 +1749,14 @@ class CameraWorker:
             logger.error(f"ReID failed for track {track.local_track_id}: {e}")
 
 
-    async def _persist_events(self, db, frame, rule_events: List[RuleEvent], zone_events: List[ZoneEvent]):
-        """Persist rule engine events and automatic zone events to PostgreSQL."""
+    async def _persist_events(self, db, rule_events: List[RuleEvent], zone_events: List[ZoneEvent]):
+        """Persist rule engine events and automatic zone events to PostgreSQL.
+
+        Event snapshot_path is always NULL — full-frame snapshots are not stored in MinIO.
+        """
         from sqlalchemy import select
         from app.core.db.models.event import Event, EventSeverity
         from app.core.db.models.billing import BillingInteraction
-
-        snapshot_path = await save_image_async(frame, self.settings.SNAPSHOT_DIR, prefix=f"event_{self.camera_id}")
 
         for ev in rule_events:
             try:
@@ -1771,7 +1772,7 @@ class CameraWorker:
                     severity=severity,
                     description=ev.description,
                     metadata_json=ev.metadata,
-                    snapshot_path=snapshot_path,
+                    snapshot_path=None,
                     occurred_at=utc_now(),
                 )
                 db.add(event)
@@ -1819,7 +1820,7 @@ class CameraWorker:
                     severity=EventSeverity.LOW,
                     description=ev.description,
                     metadata_json=ev.metadata,
-                    snapshot_path=snapshot_path,
+                    snapshot_path=None,
                     occurred_at=utc_now(),
                 )
                 db.add(event)
