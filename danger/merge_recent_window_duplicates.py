@@ -205,19 +205,29 @@ def _tracks_overlap_same_camera(a_windows, b_windows) -> bool:
     return False
 
 
-async def run(apply_fix: bool, ids_filter: list[str] | None):
+async def run(
+    apply_fix: bool,
+    ids_filter: list[str] | None,
+    since_days: float | None = None,
+):
     settings = get_settings()
     max_faces = settings.MAX_FACE_EMBEDDINGS_PER_PERSON  # 5
     max_bodies = 10
     max_gap = timedelta(minutes=RECENT_WINDOW_MINUTES)
 
     async with AsyncSessionLocal() as db:
-        # Load all persons
-        where = ""
+        # Load persons (optionally limited by ids / last_seen lookback)
+        clauses: list[str] = []
         params: dict = {}
         if ids_filter:
-            where = "WHERE id::text = ANY(:ids)"
+            clauses.append("id::text = ANY(:ids)")
             params["ids"] = list(ids_filter)
+        if since_days is not None and since_days > 0:
+            clauses.append(
+                "last_seen_at >= NOW() - make_interval(hours => :since_h)"
+            )
+            params["since_h"] = int(float(since_days) * 24)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         r = await db.execute(text(f"""
             SELECT id::text, first_seen_at, last_seen_at, best_face_score, visit_count
@@ -231,6 +241,8 @@ async def run(apply_fix: bool, ids_filter: list[str] | None):
         print(f"  Recent-window duplicate merge — {'APPLY' if apply_fix else 'DRY RUN'}")
         print(f"  Window: {RECENT_WINDOW_MINUTES} min | face_max ≥ {FACE_MATCH_THRESHOLD_RECENT} "
               f"| body_median ≥ {RECENT_BODY_SINGLE_MATCH_THRESHOLD} (≥{MIN_BODIES_PER_SIDE} bodies/side)")
+        if since_days:
+            print(f"  Scope: last_seen within {since_days} day(s)")
         print(f"  Persons scanned: {len(persons)}")
         print(f"{'='*80}\n")
 
@@ -441,5 +453,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Historical recent-window duplicate merge (backfill)")
     parser.add_argument("--apply", action="store_true", help="Apply merges (default: dry run)")
     parser.add_argument("--ids", nargs="*", default=None, help="Limit to specific person identity UUIDs")
+    parser.add_argument(
+        "--since-days",
+        type=float,
+        default=None,
+        help="Only persons with last_seen_at within this many days (e.g. 2 = today+yesterday)",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.apply, args.ids))
+    asyncio.run(run(args.apply, args.ids, args.since_days))

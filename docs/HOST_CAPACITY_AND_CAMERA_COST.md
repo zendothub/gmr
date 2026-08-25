@@ -1,8 +1,8 @@
 # Host Capacity & Camera Cost
 
 > **Host:** GMR Retail Eye on-prem box  
-> **Measured:** 2026-08-07  
-> **Server OpEx used for ₹ tables:** ₹17,000 / month  
+> **Measured:** 2026-08-10 (storage refreshed; compute baseline 2026-08-07)  
+> **Server OpEx used for ₹ tables:** ₹17,000 / month (see §3.1 — why ₹17k)  
 > **Live cameras at measurement:** 2 (full NVENC burn-in @ 2880×1620)
 
 ---
@@ -49,14 +49,15 @@
 
 **Note:** Most model VRAM is a **fixed cost per AI process**, not linear per camera. YOLO+ByteTrack is **per camera**. NVENC burn-in is **~0.3 GB GPU + ~0.3 GB RAM per camera** (encoder only — see §6–7 for full per-cam CPU/GPU-time cost and +10 bottlenecks).
 
-### Storage
+### Storage (disks)
 
-| Volume | Present | Used | Free |
-|---|---:|---:|---:|
-| OS `/` (`sdc2`) | ~444 GB | ~368 GB (88%) | ~53 GB |
-| Extra disks `sda` / `sdb` | 2× 1.8 TB | not mounted | unused |
+| Device | Type | Model | Present | Used | Free |
+|--------|------|-------|--------:|-----:|-----:|
+| **sdc** | **SSD** | ESSENCORE SATA SSD | 476.9 GB | ~80 GB (19% on `/` 444 GB) | ~342 GB on `/` |
+| **sda** | HDD | WDC WD20EZRZ-22Z5HB0 | 1.8 TB | — | unused (BitLocker partition, unmounted) |
+| **sdb** | HDD | WDC WD20EZRZ-00Z5HB0 | 1.8 TB | — | unused (BitLocker partition, unmounted) |
 
-Root disk is tight for unbounded MinIO growth — monitor crop lifecycle / cleanup jobs.
+OS + app + MinIO live on **sdc** only. HDDs are present capacity, not in the live path until mounted/unlocked. Monitor crop lifecycle / cleanup so `/` does not fill.
 
 ---
 
@@ -84,11 +85,98 @@ GPU util is often low at 2 cams → **underused compute**, not VRAM-starved. Fut
 | Shared AI stack | ~3.1 GB GPU + ~4.3 GB RAM |
 | Per-cam burn-in | ~0.3 GB GPU + ~0.3 GB RAM each |
 
-Formula:
+### 3.1 How ₹17,000 is built (host setup + wifi — **no cameras**)
+
+₹17k/mo is **infra only**: amortize this box’s hardware + run power + wifi/ISP.  
+**Cameras, lenses, PoE, NVR ports are excluded.**
+
+#### A) Host setup (one-time CAPEX → monthly)
+
+Hardware present on this GMR box (India street-price order-of-magnitude; replace with PO when available):
+
+| Part | Spec (this host) | Est. one-time ₹ |
+|---|---|---:|
+| CPU | Intel i9-10920X (12c/24t) | ~45,000 |
+| GPU | RTX 4070 Ti 12 GB | ~80,000 |
+| RAM | ~32 GB | ~10,000 |
+| SSD | ESSENCORE ~477 GB (OS/app) | ~4,000 |
+| HDD | 2× WD 1.8 TB (present; optional data) | ~12,000 |
+| Mobo + PSU + case + cabling | X299-class build | ~30,000 |
+| **Host CAPEX total** | | **~₹1,81,000** |
 
 ```text
-₹/cam/mo = 17000 / N
+Host amort / mo  =  CAPEX / months
+                 =  181000 / 36     ≈  ₹5,030 / mo   (3-year life)
 ```
+
+| Life | Monthly host amort |
+|---|---:|
+| 24 months | ~₹7,540 |
+| **36 months (used here)** | **~₹5,030** |
+| 48 months | ~₹3,770 |
+
+#### B) Monthly run cost (no cameras)
+
+| Line | What | Est. ₹/mo | Notes |
+|---|---|---:|---|
+| **Host amort** | §A, 36-mo | **~5,000** | depreciation of box only |
+| **Power** | CPU+GPU+disks 24×7 | **~3,000** | ~350–450 W avg × ~₹8–10/kWh × 720 h |
+| **Wifi / ISP** | store uplink for RTSP + dashboard | **~2,000** | broadband / wifi bill class |
+| **Spares / UPS share / minor IT** | PSU fan, disk risk, small UPS share | **~2,000** | keep box online |
+| **Site / rack / ops buffer** | floor space, remote hands buffer | **~5,000** | on-prem overhead (not cam install) |
+| **Total ≈** | | **~₹17,000** | |
+
+```text
+₹17,000 / mo  ≈  host amort (~5k)
+              +  power (~3k)
+              +  wifi/ISP (~2k)
+              +  spares/UPS (~2k)
+              +  site/ops buffer (~5k)
+
+NO camera BOM in this total.
+```
+
+#### C) Explicitly **out** of ₹17k
+
+- IP cameras, lenses, mounts  
+- PoE switch / camera cabling  
+- Per-camera licenses sold as product SKU  
+- NOC staff salary, multi-site cloud  
+
+#### D) If you only want “box + wifi” (tighter)
+
+| Scope | ₹/mo |
+|---|---:|
+| Host amort + power + wifi only | ~5k + 3k + 2k = **~₹10,000** |
+| **Full infra planning (doc default)** | **~₹17,000** |
+
+Use **₹10k** numerator if finance rejects site/spares buffer; all ₹/cam rows scale by `10000/17000`.
+
+### 3.2 How ₹/cam is calculated
+
+```text
+monthly_opex          = 17000          # from §3.1 (or 10000 tight)
+₹/cam/mo (full host)  = monthly_opex / N
+₹/cam/mo (70% sold)   = monthly_opex / (0.70 × N)
+```
+
+| Symbol | Meaning |
+|---|---|
+| `monthly_opex` | Host+wifi(+buffer) — **fixed**; does not grow with N |
+| `N` | Cameras the host can honestly run (capacity band) |
+| full host | Split entire opex across all N cams |
+| 70% billable | Cost on sold cams only |
+
+**Examples (₹17k opex, no camera hardware in numerator):**
+
+| N | Full ₹/cam/mo | @70% billable |
+|---:|---:|---:|
+| 2 (live now) | 17000/2 = **₹8,500** | — |
+| 3 (safe + burn-in) | 17000/3 = **₹5,667** | ₹8,095 |
+| 40 (plan after re-arch) | 17000/40 = **₹425** | ₹607 |
+| 96 (report — rejected) | 17000/96 = **₹177** | cheap only if N is real |
+
+Replace any line in §3.1 with real invoices; keep the same formulas.
 
 ---
 

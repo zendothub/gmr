@@ -148,6 +148,7 @@ async def run(
     apply_fix: bool,
     ids_filter: list[str] | None,
     staff_ids_filter: list[str] | None,
+    since_days: float | None = None,
 ) -> None:
     settings = get_settings()
     window_min = settings.RECENT_WINDOW_MINUTES
@@ -161,13 +162,19 @@ async def run(
     max_gap = timedelta(minutes=window_min)
 
     async with AsyncSessionLocal() as db:
+        since_clause = ""
+        since_params: dict = {}
+        if since_days is not None and since_days > 0:
+            since_clause = " AND last_seen_at >= NOW() - make_interval(hours => :since_h)"
+            since_params["since_h"] = int(float(since_days) * 24)
+
         # Staff
         staff_sql = """
             SELECT id::text, first_seen_at, last_seen_at, best_face_score, visit_count
             FROM person_identities
             WHERE is_staff = TRUE
-        """
-        staff_params: dict = {}
+        """ + since_clause
+        staff_params: dict = dict(since_params)
         if staff_ids_filter:
             staff_sql += " AND id::text = ANY(:sids)"
             staff_params["sids"] = list(staff_ids_filter)
@@ -180,8 +187,8 @@ async def run(
             SELECT id::text, first_seen_at, last_seen_at, best_face_score, visit_count
             FROM person_identities
             WHERE is_staff = FALSE
-        """
-        frag_params: dict = {}
+        """ + since_clause
+        frag_params: dict = dict(since_params)
         if ids_filter:
             frag_sql += " AND id::text = ANY(:fids)"
             frag_params["fids"] = list(ids_filter)
@@ -194,6 +201,8 @@ async def run(
         print(f"  Recent window: {window_min} min | body_median ≥ {body_thr} | "
               f"staff bodies ≥ {min_staff_bodies} | face_min ≥ {face_min} | "
               f"require_face={require_face}")
+        if since_days:
+            print(f"  Scope: last_seen within {since_days} day(s)")
         print(f"  Staff: {len(staff_rows)}  Fragments (non-staff): {len(frag_rows)}")
         print(f"{'=' * 88}\n")
 
@@ -409,8 +418,14 @@ def main() -> None:
         default=None,
         help="Limit staff person UUIDs",
     )
+    parser.add_argument(
+        "--since-days",
+        type=float,
+        default=None,
+        help="Only persons with last_seen_at within this many days (e.g. 2 = today+yesterday)",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.apply, args.ids, args.staff_ids))
+    asyncio.run(run(args.apply, args.ids, args.staff_ids, args.since_days))
 
 
 if __name__ == "__main__":
