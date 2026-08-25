@@ -124,7 +124,8 @@ class CameraRecorder:
         start: datetime,
         end: datetime,
     ) -> None:
-        partial = out_path.with_suffix(out_path.suffix + ".partial")
+        # Must end with .mp4 so FFmpeg can pick the muxer (.mp4.partial fails).
+        partial = out_path.with_name(out_path.stem + ".partial.mp4")
         if partial.exists():
             try:
                 partial.unlink()
@@ -209,6 +210,7 @@ class CameraRecorder:
             "-map", "0:v:0",
             "-c:v", "copy",
             "-an",
+            "-f", "mp4",
             "-movflags", "+faststart",
             "-y",
             str(out_path),
