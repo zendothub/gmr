@@ -23,7 +23,7 @@
   - Folder from camera name (`Apollo counter` → `counter_camera`, `Apollo entry` → `entry_camera`).
   - Example file: `12_08_26_12AM_3AM.mp4` (wall-clock slots from local midnight).
 - **Root priority:** `RECORDING_ROOT` → mounted `RECORDING_HDD_MOUNT` → `~/Desktop/video_record`.
-- **HDD:** `scripts/mount_recording_hdd.sh` — current sda/sdb are BitLocker; unlock before mount.
+- **HDD (2026-08-31):** BitLocker wiped. `sda1`→`/mnt/hdd1` (1.8T ext4, **primary recordings**), `sdb1`→`/mnt/hdd2` (1.8T spare). `/mnt/video_hdd` bind→`/mnt/hdd1`. `RECORDING_ROOT=/mnt/video_hdd/video_record`. Desktop `~/Desktop/video_record` → symlink to `/mnt/hdd1/video_record` (both cameras). SSD `/` not used for continuous video.
 - **No DB tables** for recordings. Status: `GET /api/recording/status`.
 - Failures must never block AI lifecycle (try/except in `lifecycle.py`).
 

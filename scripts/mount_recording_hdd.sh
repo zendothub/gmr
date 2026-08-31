@@ -9,9 +9,9 @@
 #   sudo bash scripts/mount_recording_hdd.sh /dev/sda1
 #
 # Notes:
-#   - sda/sdb on this host are currently BitLocker (Windows). Unlock first
-#     (dislocker + recovery key) or replace with an unlocked ext4/ntfs volume.
-#   - App prefers RECORDING_HDD_MOUNT when it is a live mount; else Desktop.
+#   - Host layout (2026-08-31): /dev/sda1 → /mnt/hdd1 (ext4, primary recordings),
+#     /dev/sdb1 → /mnt/hdd2 (ext4, spare). /mnt/video_hdd is bind-mounted to /mnt/hdd1.
+#   - App prefers RECORDING_ROOT, then RECORDING_HDD_MOUNT, else Desktop symlink.
 
 set -euo pipefail
 
