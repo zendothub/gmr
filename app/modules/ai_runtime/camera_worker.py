@@ -35,6 +35,7 @@ from app.utils.image_utils import extract_crop, save_image, save_image_async, re
 
 from app.utils.time_utils import utc_now
 from app.utils.geometry import polygon_from_json, bbox_iou, face_area_in_body_frac
+from app.modules.employees.attendance_service import record_employee_detection
 
 # How often to sample a track_observation row per track
 OBS_SAMPLE_SECONDS = 2.0
@@ -900,6 +901,13 @@ class CameraWorker:
                     close_resolved = True
                     if is_new:
                         self.temporary_person_ids.add(person_id)
+                    # ── Attendance hook (fire-and-forget) ─────────────────
+                    _att_pid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(str(person_id))
+                    asyncio.ensure_future(record_employee_detection(
+                        person_identity_id=_att_pid,
+                        camera_id=self.camera_id,
+                        detected_at=utc_now(),
+                    ))
 
                     # Store ALL accumulated good faces (skip the best, already stored by decide_identity)
                     person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
@@ -1647,6 +1655,15 @@ class CameraWorker:
                 track.reid_confident = is_confident
                 track.reid_resolved = True
                 track.reid_attempted = True
+
+                # ── Attendance hook (fire-and-forget) ─────────────────────
+                if person_id:
+                    _att_pid2 = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(str(person_id))
+                    asyncio.ensure_future(record_employee_detection(
+                        person_identity_id=_att_pid2,
+                        camera_id=self.camera_id,
+                        detected_at=utc_now(),
+                    ))
 
                 # Store ALL accumulated good faces (different angles) once identity is resolved.
                 # decide_identity already stored the best face, so skip the one that matches it
