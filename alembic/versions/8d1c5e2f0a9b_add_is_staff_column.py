@@ -20,12 +20,15 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column(
-        'person_identities',
-        sa.Column('is_staff', sa.Boolean(), nullable=False, server_default=sa.text('FALSE'))
+    # Use IF NOT EXISTS so this migration is idempotent when is_staff was
+    # already included in 0001_initial (happens on fresh DB from updated initial schema).
+    op.execute(
+        "ALTER TABLE person_identities ADD COLUMN IF NOT EXISTS "
+        "is_staff BOOLEAN NOT NULL DEFAULT FALSE"
     )
-    op.create_index(
-        'idx_person_identities_is_staff', 'person_identities', ['is_staff']
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS idx_person_identities_is_staff "
+        "ON person_identities (is_staff)"
     )
 
 

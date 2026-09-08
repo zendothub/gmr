@@ -81,25 +81,32 @@ pip install -r requirements.txt
 
 ---
 
-## Step 5 — Run All Migrations (Creates Every Table)
+## Step 5 — Create All Tables (Fresh DB)
+
+For a **fresh client database**, skip the migration chain and create all tables directly from the SQLAlchemy models in one shot, then stamp Alembic so it knows migrations are at `head`:
 
 ```bash
-alembic upgrade head
+python -c "
+from app.core.db.base import Base
+from app.core.db.session import sync_engine
+import app.core.db.models
+Base.metadata.create_all(sync_engine)
+print('All tables created successfully')
+"
+
+alembic stamp head
 ```
 
-This runs migrations **0001 → 0009** in sequence, creating all tables:
+> **Why not `alembic upgrade head`?** The migration files have accumulated over time and some intermediate migrations overlap with the initial schema (causing `DuplicateColumn` / `DuplicateTable` errors on a fresh DB). The `create_all` approach reads the current SQLAlchemy models and creates all tables correctly in one step.
 
-| Migration | Tables Created |
-|-----------|----------------|
-| 0001 | stores, cameras, zones, users, person_identities, tracks, … (core schema) |
-| 0002 | person_debug |
-| 0003 | person_debug camera nullable |
-| 0004 | body_crop_path column |
-| 0005 | face_embedding index |
-| 0006 | device_sessions, stream_viewer_sessions |
-| 0007 | identity_merge_events, fragmented_track_events |
-| 0008 | audit_job_run columns |
-| **0009** | **shift_slots, employees, attendance_records** (employee attendance) |
+All tables created in one step:
+
+| Module | Tables |
+|--------|--------|
+| Core schema | stores, cameras, zones, users, roles, person_identities, tracks, track_sessions, billing_interactions, events, … |
+| Device tracking (0006) | device_sessions, stream_viewer_sessions |
+| Identity events (0007) | identity_merge_events, fragmented_track_events |
+| **Employee attendance (0009)** | **shift_slots, employees, attendance_records** |
 
 Verify:
 
@@ -156,7 +163,8 @@ git clone git@github.com:zendothub/gmr.git retail-ai-platform && cd retail-ai-pl
 cp .env.example .env          # Edit DATABASE_URL, MINIO_*, SECRET_KEY
 docker compose up -d
 pip install -r requirements.txt
-alembic upgrade head          # Creates ALL tables including shift_slots, employees, attendance_records
+python -c "from app.core.db.base import Base; from app.core.db.session import sync_engine; import app.core.db.models; Base.metadata.create_all(sync_engine)"
+alembic stamp head            # Mark all migrations as applied
 python -m app.seed            # Creates default admin user
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
@@ -174,8 +182,9 @@ docker compose down -v
 # Restart fresh infrastructure
 docker compose up -d
 
-# Re-run migrations
-alembic upgrade head
+# Re-create all tables from models
+python -c "from app.core.db.base import Base; from app.core.db.session import sync_engine; import app.core.db.models; Base.metadata.create_all(sync_engine)"
+alembic stamp head
 
 # Re-seed admin
 python -m app.seed
@@ -234,7 +243,8 @@ Daily attendance records upserted by the camera worker on each detection.
 
 | Problem | Solution |
 |---------|----------|
-| `alembic upgrade head` fails with "relation does not exist" | Postgres not healthy yet — wait 10s and retry |
+| `create_all` fails with "role does not exist" | Postgres not healthy yet — wait 10s and retry |
+| `alembic upgrade head` fails with `DuplicateColumn` / `DuplicateTable` | Use `create_all + stamp head` approach above (migration chain has drift) |
 | `pgvector extension not found` | The `pgvector/pgvector:pg16` image includes it; ensure `./database/init.sql` runs on first start |
 | Port 5433 already in use | Change `"5433:5432"` to `"5434:5432"` in docker-compose.yml and update `DATABASE_URL` |
 | MinIO connection refused | Run `docker compose ps` — minio container must be healthy first |
