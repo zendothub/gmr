@@ -134,14 +134,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not restore active cameras on startup: {e}")
 
-    # Full-res continuous recording (filesystem only). Failures here must never
-    # block AI workers / streaming.
-    try:
-        from app.modules.recording.service import RecordingSupervisor
-
-        await RecordingSupervisor.get_instance().start()
-    except Exception as e:
-        logger.warning(f"Camera recording supervisor failed to start: {e}")
+    # Full-res continuous recording — DISABLED (not needed for this deployment).
+    # Uncomment to re-enable:
+    # try:
+    #     from app.modules.recording.service import RecordingSupervisor
+    #     await RecordingSupervisor.get_instance().start()
+    # except Exception as e:
+    #     logger.warning(f"Camera recording supervisor failed to start: {e}")
 
     logger.info("Application startup complete")
 
@@ -153,12 +152,12 @@ async def lifespan(app: FastAPI):
     # Background job scheduler is in a separate process (retail-ai-worker.service).
     # It is not stopped here — it manages its own lifecycle via systemd.
 
-    try:
-        from app.modules.recording.service import RecordingSupervisor
-
-        await RecordingSupervisor.get_instance().stop()
-    except Exception as e:
-        logger.warning(f"Error stopping camera recording: {e}")
+    # Recording shutdown — DISABLED (not needed for this deployment).
+    # try:
+    #     from app.modules.recording.service import RecordingSupervisor
+    #     await RecordingSupervisor.get_instance().stop()
+    # except Exception as e:
+    #     logger.warning(f"Error stopping camera recording: {e}")
 
     # Stop AI runtime workers if running
     try:
