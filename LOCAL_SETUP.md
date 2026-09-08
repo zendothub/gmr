@@ -36,15 +36,15 @@ Open `.env` and set **at minimum** these values:
 SECRET_KEY=your-super-secret-key-change-this
 
 # Database — points to the Dockerised Postgres on port 5433
-DATABASE_URL=postgresql+asyncpg://retail_user:retail_pass@localhost:5433/retail_ai_db
-DATABASE_SYNC_URL=postgresql://retail_user:retail_pass@localhost:5433/retail_ai_db
+DATABASE_URL=postgresql+asyncpg://coal_mine_user:coal_mine_pass@localhost:5433/coal_mine_db
+DATABASE_SYNC_URL=postgresql://coal_mine_user:coal_mine_pass@localhost:5433/coal_mine_db
 
 # MinIO — local Docker instance
 MINIO_ENDPOINT=localhost:9000
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin
 MINIO_SECURE=false
-MINIO_BUCKET_PREFIX=retail
+MINIO_BUCKET_PREFIX=coal-mine
 ```
 
 > All other values have sensible defaults in `.env.example`.
@@ -65,7 +65,7 @@ This starts:
 Wait for Postgres to be healthy:
 
 ```bash
-docker compose ps        # STATUS should show "(healthy)" for retail_ai_postgres
+docker compose ps        # STATUS should show "(healthy)" for coal_mine_postgres
 ```
 
 ---

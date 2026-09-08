@@ -2,7 +2,7 @@ services:
   # MinIO — S3-compatible object storage for snapshots, crops, clips, reports.
   minio:
     image: minio/minio:latest
-    container_name: retail_ai_minio
+    container_name: coal_mine_minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -21,18 +21,18 @@ services:
 
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: retail_ai_postgres
+    container_name: coal_mine_postgres
     environment:
-      POSTGRES_USER: retail_user
-      POSTGRES_PASSWORD: retail_pass
-      POSTGRES_DB: retail_ai_db
+      POSTGRES_USER: coal_mine_user
+      POSTGRES_PASSWORD: coal_mine_pass
+      POSTGRES_DB: coal_mine_db
     ports:
       - "5433:5432"  # host 5433 -> container 5432 (avoids clashing with a local PostgreSQL)
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U retail_user -d retail_ai_db"]
+      test: ["CMD-SHELL", "pg_isready -U coal_mine_user -d coal_mine_db"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -42,7 +42,7 @@ services:
   # serves it back to browsers as WebRTC (WHEP) / HLS for the zone-binding UI.
   mediamtx:
     image: bluenviron/mediamtx:latest
-    container_name: retail_ai_mediamtx
+    container_name: coal_mine_mediamtx
     environment:
       MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
       MTX_WEBRTCADDITIONALHOSTS: "192.168.1.104,127.0.0.1,3.110.196.52,feed-retaileye.bluecloudsoftech.com"
@@ -72,12 +72,12 @@ services:
   #   build:
   #     context: .
   #     dockerfile: Dockerfile
-  #   container_name: retail_ai_app
+  #   container_name: coal_mine_app
   #   env_file:
   #     - .env.example
   #   environment:
-  #     DATABASE_URL: postgresql+asyncpg://retail_user:retail_pass@postgres:5432/retail_ai_db
-  #     DATABASE_SYNC_URL: postgresql://retail_user:retail_pass@postgres:5432/retail_ai_db
+  #     DATABASE_URL: postgresql+asyncpg://coal_mine_user:coal_mine_pass@postgres:5432/coal_mine_db
+  #     DATABASE_SYNC_URL: postgresql://coal_mine_user:coal_mine_pass@postgres:5432/coal_mine_db
   #     # Backend talks to MediaMTX by its compose service name.
   #     MEDIAMTX_HOST: mediamtx
   #     # Browser reaches WebRTC/HLS via the host - override per deployment.

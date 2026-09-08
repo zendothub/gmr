@@ -8,7 +8,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     # Application
-    APP_NAME: str = "RetailAIPlatform"
+    APP_NAME: str = "CoalMineAIPlatform"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     SECRET_KEY: str = "change-me-in-production"
@@ -18,15 +18,15 @@ class Settings(BaseSettings):
 
 
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://retail_user:retail_pass@localhost:5433/retail_ai_db"
-    DATABASE_SYNC_URL: str = "postgresql://retail_user:retail_pass@localhost:5433/retail_ai_db"
+    DATABASE_URL: str = "postgresql+asyncpg://coal_mine_user:coal_mine_pass@localhost:5433/coal_mine_db"
+    DATABASE_SYNC_URL: str = "postgresql://coal_mine_user:coal_mine_pass@localhost:5433/coal_mine_db"
 
     # Storage — MinIO (S3-compatible object storage)
     MINIO_ENDPOINT: str = "minio:9000"
     MINIO_ACCESS_KEY: str = "minioadmin"
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
-    MINIO_BUCKET_PREFIX: str = "retail"
+    MINIO_BUCKET_PREFIX: str = "coal-mine"
     MINIO_PUBLIC_URL: str = ""
     MINIO_PUBLIC_ENDPOINT: str = ""
     MINIO_PUBLIC_SECURE: bool = True
