@@ -14,11 +14,12 @@ Attendance report:
   GET    /api/v1/employees/attendance/report
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db, get_current_user
@@ -34,6 +35,44 @@ from app.modules.employees.schemas import (
 )
 
 router = APIRouter(prefix="/api/v1/employees", tags=["Employees"])
+
+
+# ---------------------------------------------------------------------------
+# Internal helper — resolve face_crop_path → presigned MinIO URL
+# ---------------------------------------------------------------------------
+
+def _resolve_face_crop_url(path: Optional[str]) -> Optional[str]:
+    """
+    Given a raw MinIO object path (e.g. "crops/emp_face_20260908_...jpg"),
+    return a presigned GET URL valid for 1 hour.  Returns None on any error
+    or when path is None/empty.
+    """
+    if not path:
+        return None
+    try:
+        from app.modules.storage.minio_client import get_public_client, BUCKET_PREFIX
+        client = get_public_client()
+        clean = path.lstrip("/")
+        if clean.startswith(f"{BUCKET_PREFIX}/"):
+            object_name = clean[len(BUCKET_PREFIX) + 1:]
+        else:
+            object_name = clean
+        url = client.presigned_get_object(
+            bucket_name=BUCKET_PREFIX,
+            object_name=object_name,
+            expires=timedelta(hours=1),
+        )
+        return url
+    except Exception as exc:
+        logger.warning(f"_resolve_face_crop_url failed for path={path!r}: {exc}")
+        return None
+
+
+def _build_employee_response(emp, face_crop_url: Optional[str] = None) -> EmployeeResponse:
+    """Build an EmployeeResponse from an Employee ORM object, injecting the presigned URL."""
+    resp = EmployeeResponse.model_validate(emp)
+    resp.face_crop_url = face_crop_url if face_crop_url is not None else _resolve_face_crop_url(emp.face_crop_path)
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +115,15 @@ async def register_by_image(
     result = await emp_svc.register_by_image(
         db, image_bytes, emp_id=emp_id, name=name, shift_slot_id=shift_slot_id
     )
+    face_crop_url = result["face_crop_url"]
+    # Resolve to a presigned URL if the service returned a raw MinIO path
+    if face_crop_url and not face_crop_url.startswith("http"):
+        face_crop_url = _resolve_face_crop_url(face_crop_url)
+    emp_resp = _build_employee_response(result["employee"], face_crop_url=face_crop_url)
     return RegisterByImageResponse(
-        employee=EmployeeResponse.model_validate(result["employee"]),
+        employee=emp_resp,
         already_registered=result["already_registered"],
-        face_crop_url=result["face_crop_url"],
+        face_crop_url=face_crop_url,
         message=result["message"],
     )
 
@@ -88,7 +132,7 @@ async def register_by_image(
 # Registration — Way 2: camera-detected person
 # ---------------------------------------------------------------------------
 
-@router.put("/register/by-camera", response_model=EmployeeResponse, status_code=200)
+@router.put("/register/by-camera", response_model=RegisterByImageResponse, status_code=200)
 async def register_by_camera(
     payload: RegisterByCameraBody,
     db: AsyncSession = Depends(get_db),
@@ -101,12 +145,24 @@ async def register_by_camera(
     **Debug → Unique Persons** view and submits their `person_identity_id`
     together with the employee's `emp_id`, `name`, and optional `shift_slot_id`.
 
+    Returns the same `RegisterByImageResponse` shape as the image-upload endpoint
+    (`{ employee, already_registered, face_crop_url, message }`) so the frontend
+    can display the face crop immediately after linking.
+
     **Errors:**
     - `404` — `person_identity_id` not found in the database
     - `409` — identity already linked to another employee, or `emp_id` already used
     """
     employee = await emp_svc.register_by_camera(db, payload)
-    return EmployeeResponse.model_validate(employee)
+    emp_resp = _build_employee_response(employee)
+    return RegisterByImageResponse(
+        employee=emp_resp,
+        already_registered=False,
+        face_crop_url=emp_resp.face_crop_url,
+        message=(
+            f"Employee '{employee.name}' registered and linked to the existing identity."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +244,7 @@ async def list_employees(
         shift_slot_id=shift_slot_id, active_only=active_only,
     )
     return {
-        "items": [EmployeeResponse.model_validate(e) for e in result["items"]],
+        "items": [_build_employee_response(e) for e in result["items"]],
         "total": result["total"],
         "page": result["page"],
         "size": result["size"],
@@ -202,7 +258,7 @@ async def get_employee(
     current_user: User = Depends(get_current_user),
 ):
     """Get a single employee by employee ID."""
-    return EmployeeResponse.model_validate(await emp_svc.get_by_emp_id(db, emp_id))
+    return _build_employee_response(await emp_svc.get_by_emp_id(db, emp_id))
 
 
 @router.put("/{emp_id}", response_model=EmployeeResponse)
@@ -213,9 +269,7 @@ async def update_employee(
     current_user: User = Depends(get_current_user),
 ):
     """Update employee name, shift slot, or active status."""
-    return EmployeeResponse.model_validate(
-        await emp_svc.update_employee(db, emp_id, payload)
-    )
+    return _build_employee_response(await emp_svc.update_employee(db, emp_id, payload))
 
 
 @router.delete("/{emp_id}", status_code=204)

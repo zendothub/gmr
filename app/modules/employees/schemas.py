@@ -21,6 +21,7 @@ class EmployeeResponse(BaseModel):
     shift_slot_id: Optional[UUID] = None
     shift_slot: Optional[ShiftSlotResponse] = None
     face_crop_path: Optional[str] = None
+    face_crop_url: Optional[str] = None   # presigned MinIO URL, populated by router
     is_active: bool
     created_at: datetime
     updated_at: datetime

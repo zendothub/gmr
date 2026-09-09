@@ -17,6 +17,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from typing import Literal, Optional
+from urllib.parse import urlparse
 
 from app.config import get_settings
 from app.modules.streaming.base import PublishTarget
@@ -66,16 +67,29 @@ class MediaMTXManager:
         """Public base URL used by the browser.
 
         Resolution order:
-        1. ``MEDIAMTX_PUBLIC_URL`` static override (full base, ignores port).
+        1. ``MEDIAMTX_PUBLIC_URL`` static override.
+           - For ``https://`` URLs (cloud / nginx reverse-proxy): port is omitted —
+             nginx listens on 443 and proxies to MediaMTX internally.
+           - For ``http://`` URLs (local LAN, e.g. ``http://192.168.1.12``): the
+             MediaMTX port is appended automatically so the browser can reach the
+             correct port directly (WebRTC → :8889, HLS → :8888).
+           - If the URL already contains an explicit port it is left unchanged.
         2. ``public_host`` (e.g. derived from the incoming request) - so the feed
            is served on the same IP/host the browser used to reach the API.
         3. ``MEDIAMTX_HOST`` + the relevant port.
         """
         base = (self.settings.MEDIAMTX_PUBLIC_URL or "").rstrip("/")
         if base:
-            # If the user put e.g. "feed-retaileye.bluecloudsoftech.com", add public scheme
+            # Ensure scheme is present
             if "://" not in base:
-                return f"{scheme}://{base}"
+                base = f"{scheme}://{base}"
+            # For plain http:// (local LAN) append the MediaMTX port when not
+            # already specified — browsers must hit the correct port directly.
+            # For https:// (cloud) the port is intentionally omitted because a
+            # reverse-proxy (nginx) terminates TLS on 443 and forwards internally.
+            parsed = urlparse(base)
+            if parsed.scheme == "http" and not parsed.port:
+                base = f"{base}:{port}"
             return base
 
         if public_host:

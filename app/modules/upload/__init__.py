@@ -1,0 +1,1 @@
+"""Upload module — image quality assessment for identity suitability."""

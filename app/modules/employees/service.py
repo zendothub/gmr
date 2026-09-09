@@ -32,6 +32,7 @@ from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.core.db.models.attendance import Employee, ShiftSlot
@@ -173,7 +174,7 @@ async def _upload_face_crop(face_crop_bgr: np.ndarray, prefix: str = "emp_face")
         from app.modules.storage import service as storage_svc
 
         img_bytes = await storage_svc.save_image_bytes(
-            face_crop_bgr, StorageType.crop, prefix=prefix
+            face_crop_bgr, StorageType.CROP, prefix=prefix
         )
         if not img_bytes:
             return None
@@ -183,7 +184,7 @@ async def _upload_face_crop(face_crop_bgr: np.ndarray, prefix: str = "emp_face")
         ts = _dt.utcnow().strftime("%Y%m%d_%H%M%S_%f")
         obj_name = f"crops/{prefix}_{ts}_{_uuid.uuid4().hex[:8]}.jpg"
 
-        path = await storage_svc.upload_to_storage(img_bytes, StorageType.crop, obj_name)
+        path = await storage_svc.upload_to_storage(img_bytes, StorageType.CROP, obj_name)
         return path
     except Exception as e:
         logger.warning(f"Failed to upload face crop: {e}")
@@ -226,54 +227,107 @@ async def register_by_image(
     crop_path = await _upload_face_crop(face_crop_bgr, prefix="emp_face")
 
     if matched_person is not None:
-        # ── Already registered ──────────────────────────────────────────────
-        # Check whether an Employee row already exists for this person_identity
-        existing_employee: Optional[Employee] = (
+        # ── Already registered? ─────────────────────────────────────────────
+        # Check whether an ACTIVE Employee row already exists for this person_identity.
+        # A soft-deleted (is_active=False) employee is treated as gone — allow re-registration.
+        active_employee: Optional[Employee] = (
             await db.execute(
                 select(Employee).where(
-                    Employee.person_identity_id == matched_person.id
+                    Employee.person_identity_id == matched_person.id,
+                    Employee.is_active.is_(True),
                 )
             )
         ).scalar_one_or_none()
 
-        if existing_employee:
-            # Update the face crop path to the latest image
+        if active_employee:
+            # Genuinely still active — just refresh the face crop
             if crop_path:
-                existing_employee.face_crop_path = crop_path
+                active_employee.face_crop_path = crop_path
             await db.commit()
-            await db.refresh(existing_employee)
+            await db.refresh(active_employee)
+            await db.execute(
+                select(Employee)
+                .where(Employee.id == active_employee.id)
+                .options(selectinload(Employee.shift_slot))
+            )
             return {
-                "employee": existing_employee,
+                "employee": active_employee,
                 "already_registered": True,
                 "face_crop_url": crop_path,
                 "message": (
-                    f"Employee '{existing_employee.name}' (emp_id={existing_employee.emp_id}) "
+                    f"Employee '{active_employee.name}' (emp_id={active_employee.emp_id}) "
                     f"is already registered. Face crop updated."
                 ),
             }
-        else:
-            # Person exists in AI DB but hasn't been registered as employee yet.
-            # Create the Employee row linked to the existing PersonIdentity.
-            await _ensure_no_duplicate_emp_id(db, emp_id)
-            employee = Employee(
-                emp_id=emp_id,
-                name=name,
-                person_identity_id=matched_person.id,
-                shift_slot_id=shift_slot_id,
-                face_crop_path=crop_path,
+
+        # No active employee linked to this identity.
+        # There may be a soft-deleted employee row for the same person — reactivate it
+        # rather than creating a duplicate, to preserve attendance history.
+        inactive_employee: Optional[Employee] = (
+            await db.execute(
+                select(Employee).where(
+                    Employee.person_identity_id == matched_person.id,
+                    Employee.is_active.is_(False),
+                )
             )
-            db.add(employee)
+        ).scalar_one_or_none()
+
+        if inactive_employee:
+            # Before reactivating, make sure the new emp_id is not already
+            # taken by a different ACTIVE employee.
+            if inactive_employee.emp_id != emp_id:
+                await _ensure_no_duplicate_emp_id(db, emp_id)
+            # Reactivate the old record with the new registration details
+            inactive_employee.is_active = True
+            inactive_employee.emp_id = emp_id
+            inactive_employee.name = name
+            if shift_slot_id is not None:
+                inactive_employee.shift_slot_id = shift_slot_id
+            if crop_path:
+                inactive_employee.face_crop_path = crop_path
             await db.commit()
-            await db.refresh(employee)
+            await db.refresh(inactive_employee)
+            await db.execute(
+                select(Employee)
+                .where(Employee.id == inactive_employee.id)
+                .options(selectinload(Employee.shift_slot))
+            )
             return {
-                "employee": employee,
-                "already_registered": True,
+                "employee": inactive_employee,
+                "already_registered": False,
                 "face_crop_url": crop_path,
                 "message": (
-                    f"Face matched an existing identity. Employee '{name}' registered "
-                    f"and linked to the existing identity."
+                    f"Face matched an existing identity. Employee '{name}' re-registered "
+                    f"successfully (previous record reactivated)."
                 ),
             }
+
+        # Person exists in AI DB but has never been an employee — create one now.
+        await _ensure_no_duplicate_emp_id(db, emp_id)
+        employee = Employee(
+            emp_id=emp_id,
+            name=name,
+            person_identity_id=matched_person.id,
+            shift_slot_id=shift_slot_id,
+            face_crop_path=crop_path,
+        )
+        db.add(employee)
+        await db.commit()
+        await db.refresh(employee)
+        await db.execute(
+            select(Employee)
+            .where(Employee.id == employee.id)
+            .options(selectinload(Employee.shift_slot))
+        )
+        return {
+            "employee": employee,
+            "already_registered": False,
+            "face_crop_url": crop_path,
+            "message": (
+                f"Face matched an existing identity. Employee '{name}' registered "
+                f"and linked to the existing identity."
+            ),
+        }
     else:
         # ── New person — create PersonIdentity + embedding + Employee ───────
         await _ensure_no_duplicate_emp_id(db, emp_id)
@@ -312,6 +366,12 @@ async def register_by_image(
 
         await db.commit()
         await db.refresh(employee)
+        # Eagerly load shift_slot
+        await db.execute(
+            select(Employee)
+            .where(Employee.id == employee.id)
+            .options(selectinload(Employee.shift_slot))
+        )
 
         return {
             "employee": employee,
@@ -373,6 +433,12 @@ async def register_by_camera(
     db.add(employee)
     await db.commit()
     await db.refresh(employee)
+    # Eagerly load shift_slot
+    await db.execute(
+        select(Employee)
+        .where(Employee.id == employee.id)
+        .options(selectinload(Employee.shift_slot))
+    )
     return employee
 
 
@@ -403,7 +469,7 @@ async def list_employees(
     total_result = await db.execute(select(safunc.count()).select_from(q.subquery()))
     total = total_result.scalar() or 0
 
-    q = q.order_by(Employee.name).offset((page - 1) * size).limit(size)
+    q = q.options(selectinload(Employee.shift_slot)).order_by(Employee.name).offset((page - 1) * size).limit(size)
     employees = (await db.execute(q)).scalars().all()
 
     return {"items": employees, "total": total, "page": page, "size": size}
@@ -412,7 +478,9 @@ async def list_employees(
 async def get_by_emp_id(db: AsyncSession, emp_id: str) -> Employee:
     emp = (
         await db.execute(
-            select(Employee).where(Employee.emp_id == emp_id)
+            select(Employee)
+            .where(Employee.emp_id == emp_id)
+            .options(selectinload(Employee.shift_slot))
         )
     ).scalar_one_or_none()
     if not emp:
@@ -440,6 +508,12 @@ async def update_employee(
         emp.is_active = payload.is_active
     await db.commit()
     await db.refresh(emp)
+    # Eagerly load shift_slot
+    await db.execute(
+        select(Employee)
+        .where(Employee.id == emp.id)
+        .options(selectinload(Employee.shift_slot))
+    )
     return emp
 
 
@@ -455,8 +529,18 @@ async def deactivate_employee(db: AsyncSession, emp_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ensure_no_duplicate_emp_id(db: AsyncSession, emp_id: str) -> None:
+    """Raise 409 only when an ACTIVE employee already owns this emp_id.
+
+    Soft-deleted (is_active=False) records are ignored so the same emp_id
+    can be reused after an employee has been deactivated.
+    """
     existing = (
-        await db.execute(select(Employee).where(Employee.emp_id == emp_id))
+        await db.execute(
+            select(Employee).where(
+                Employee.emp_id == emp_id,
+                Employee.is_active.is_(True),
+            )
+        )
     ).scalar_one_or_none()
     if existing:
         raise HTTPException(
