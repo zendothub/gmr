@@ -30,6 +30,7 @@ from app.core.db.models.attendance import (
     Employee,
     AttendanceRecord,
     AttendanceStatus,
+    EmployeeCheckIn,
     ShiftSlot,
 )
 from app.core.db.session import AsyncSessionLocal
@@ -143,8 +144,25 @@ async def _upsert_attendance(
             check_out_camera_id=camera_id,
         )
         db.add(record)
+
+        # ── Create check-in event for the alert feed ─────────────────────
+        checkin_status = "late" if status == AttendanceStatus.late else "on_time"
+        checkin_event = EmployeeCheckIn(
+            employee_id=employee.id,
+            employee_name=employee.name,
+            emp_code=employee.emp_id,
+            checked_in_at=detected_at,
+            check_in_date=attendance_date,
+            shift_slot_id=employee.shift_slot_id,
+            shift_label=shift.label if shift else None,
+            camera_id=camera_id,
+            face_crop_path=employee.face_crop_path,
+            status=checkin_status,
+        )
+        db.add(checkin_event)
+
         logger.info(
-            f"[Attendance] NEW record: emp={employee.emp_id} date={attendance_date} "
+            f"[Attendance] NEW record + check-in event: emp={employee.emp_id} date={attendance_date} "
             f"first_seen={detected_at} status={status.value}"
         )
     else:

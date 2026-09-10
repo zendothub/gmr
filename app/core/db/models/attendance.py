@@ -127,6 +127,9 @@ class Employee(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     attendance_records: Mapped[List["AttendanceRecord"]] = relationship(
         "AttendanceRecord", back_populates="employee", cascade="all, delete-orphan"
     )
+    checkins: Mapped[List["EmployeeCheckIn"]] = relationship(
+        "EmployeeCheckIn", back_populates="employee", cascade="all, delete-orphan"
+    )
 
     def is_weekly_off(self, day: date) -> bool:
         """True if `day` falls on one of this employee's configured weekly-off days.
@@ -199,3 +202,55 @@ class AttendanceRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     shift_slot: Mapped[Optional["ShiftSlot"]] = relationship(
         "ShiftSlot", back_populates="attendance_records"
     )
+
+
+class EmployeeCheckIn(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """Records each employee check-in event for the alert/event feed.
+
+    Created once per (employee, attendance_date) — the first time an employee
+    is detected within their shift window on a given calendar date.  Carries
+    denormalised copies of employee name, shift label, and profile-image path
+    so the alert feed can be rendered without extra JOINs.
+    """
+
+    __tablename__ = "employee_checkins"
+
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Denormalized for fast feed rendering — no extra JOIN needed
+    employee_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    emp_code: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    checked_in_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    check_in_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # Shift context (denormalized snapshot at check-in time)
+    shift_slot_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("shift_slots.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    shift_label: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Camera that captured the check-in
+    camera_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Profile image — snapshot of employee's face_crop_path at check-in time
+    face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # on_time / late — derived from shift start vs checked_in_at
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="on_time")
+
+    employee: Mapped["Employee"] = relationship("Employee", back_populates="checkins")
+    shift_slot: Mapped[Optional["ShiftSlot"]] = relationship("ShiftSlot")

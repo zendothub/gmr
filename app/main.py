@@ -35,6 +35,7 @@ from app.modules.debug.router import router as debug_router
 # from app.modules.recording.router import router as recording_router  # DISABLED — recording not needed
 from app.modules.shift_slots.router import router as shift_slots_router
 from app.modules.employees.router import router as employees_router
+from app.modules.employees.checkin_router import router as checkins_router
 from app.modules.leaves.router import router as leaves_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.upload.router import router as upload_router
@@ -123,6 +124,7 @@ app.include_router(debug_router)
 # app.include_router(recording_router)  # DISABLED — recording not needed
 app.include_router(shift_slots_router)
 app.include_router(employees_router)
+app.include_router(checkins_router)
 app.include_router(leaves_router)
 app.include_router(dashboard_router)
 app.include_router(upload_router)
