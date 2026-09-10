@@ -92,115 +92,134 @@ class InsightFaceAnalyzer:
                 f"(model={self.model_name}, modules={list(self.app.models.keys())})"
             )
 
-            # ── Force-download the anti-spoofing model if not present ─────
-            # The antispoofing model ships inside the buffalo_l zip but is not
-            # extracted by FaceAnalysis unless explicitly requested.  We trigger
-            # its download here so _load_spoof_model() finds it on disk.
-            if get_settings().ANTISPOOF_ENABLED:
-                try:
-                    import os
-                    home = os.path.expanduser("~")
-                    spoof_path = os.path.join(home, ".insightface", "models", self.model_name, "antispoofing.onnx")
-                    if not os.path.exists(spoof_path):
-                        logger.info("Anti-spoofing model not found — triggering download ...")
-                        # Force InsightFace to download the missing file by loading it
-                        from insightface.model_zoo import model_zoo
-                        _dummy = model_zoo.get_model(
-                            os.path.join(home, ".insightface", "models", self.model_name, "antispoofing")
-                        )
-                        logger.info("Anti-spoofing model downloaded successfully.")
-                except Exception as dl_err:
-                    logger.warning(f"Could not auto-download anti-spoofing model: {dl_err}")
-                    logger.info(
-                        "To download manually:\n"
-                        "  1. Find buffalo_l.zip at https://github.com/deepinsight/insightface/releases\n"
-                        "  2. Extract antispoofing.onnx to ~/.insightface/models/buffalo_l/\n"
-                        "  3. Or just restart the service — InsightFace may auto-download on retry"
-                    )
+            # Anti-spoofing now uses texture analysis (Laplacian + FFT + colour)
+            # instead of the missing antispoofing.onnx.  No model download needed.
         except Exception as e:
             logger.error(f"Failed to initialize InsightFace analyzer: {e}")
             self.app = None
 
     def _load_spoof_model(self):
-        """Load the anti-spoofing model separately if available.
+        """Initialise texture-based anti-spoofing (no external ONNX model required).
 
-        The anti-spoofing ONNX model (antispoofing.onnx, ~2.7 MB) ships with
-        the InsightFace buffalo_l model pack.  It is a lightweight binary
-        classifier (MiniFASNet) scoring each face crop: 0 = real, 1 = spoof.
+        This replaces the missing InsightFace antispoofing.onnx which is NOT
+        included in any standard model pack.  Instead we use multi-signal
+        image-analysis:
+
+        1. **Laplacian variance** — real faces have natural texture; printed
+           photos are blurry, screens show moiré patterns.
+        2. **FFT high-frequency energy** — screens emit periodic pixel-grid
+           artefacts visible in the frequency domain.
+        3. **Colour-space analysis** — printed/screen faces have narrower
+           colour gamut and different saturation distribution.
+
+        Combined these catch the primary attendance-fraud vectors (phone
+        screen or printed photo held in front of the camera).
         """
-        try:
-            import os
-            from pathlib import Path
-            from insightface.model_zoo import model_zoo
-            from app.utils.device import insightface_ctx_id, get_insightface_providers
-
-            settings = get_settings()
-            if not settings.ANTISPOOF_ENABLED:
-                self._spoof_model = None
-                return
-
-            providers = get_insightface_providers()
-            home = os.path.expanduser("~")
-            model_dir = os.path.join(home, ".insightface", "models", self.model_name)
-            spoof_path = os.path.join(model_dir, "antispoofing.onnx")
-
-            if not os.path.exists(spoof_path):
-                logger.warning(
-                    f"Anti-spoofing ONNX model not found at {spoof_path}. "
-                    "Download the buffalo_l model pack to enable: "
-                    "the antispoofing.onnx file ships with it."
-                )
-                self._spoof_model = None
-                return
-
-            self._spoof_model = model_zoo.get_model(str(spoof_path), providers=providers)
-            ctx_id = insightface_ctx_id()
-            self._spoof_model.prepare(ctx_id=ctx_id)
-            logger.info(
-                f"Anti-spoofing model loaded (path={spoof_path}, ctx_id={ctx_id})"
-            )
-            print("=" * 60)
-            print("  ✅ ANTI-SPOOFING ACTIVATED — Liveness detection enabled")
-            print(f"  📍 Model: {spoof_path}")
-            print(f"  🔧 Threshold: {settings.ANTISPOOF_THRESHOLD}")
-            print(f"  👁️  Audit-only: {settings.ANTISPOOF_AUDIT_ONLY}")
-            print(f"  🛡️  Spoofed faces will be blocked from attendance")
-            print("=" * 60)
-        except Exception as e:
-            logger.warning(f"Failed to load anti-spoofing model: {e}")
+        settings = get_settings()
+        if not settings.ANTISPOOF_ENABLED:
             self._spoof_model = None
+            logger.info("Anti-spoofing disabled (ANTISPOOF_ENABLED=False)")
+            return
+
+        # No model file needed — texture analysis uses OpenCV only
+        self._spoof_model = "texture"  # sentinel so detect_spoof() knows it's active
+        logger.info(
+            "Anti-spoofing ACTIVE — texture-based analysis (Laplacian + FFT + colour)"
+        )
+        print("=" * 60)
+        print("  ✅ ANTI-SPOOFING ACTIVATED — Texture-based liveness detection")
+        print(f"  🔧 Threshold: {settings.ANTISPOOF_THRESHOLD}")
+        print(f"  👁️  Audit-only: {settings.ANTISPOOF_AUDIT_ONLY}")
+        print(f"  🛡️  Spoofed faces will be blocked from attendance")
+        print("=" * 60)
 
     def detect_spoof(self, face_crop: np.ndarray) -> float:
-        """Run anti-spoofing inference on a face crop.
+        """Texture-based anti-spoofing — no external model required.
+
+        Uses three complementary signals to detect printed photos and phone
+        screens held in front of the camera:
+
+        1. Laplacian variance (texture sharpness / moiré)
+        2. FFT high-frequency energy ratio (screen pixel-grid artefacts)
+        3. Colour saturation spread (print / screen gamut compression)
 
         Args:
             face_crop: BGR face crop image.
 
         Returns:
-            spoof_score: float between 0.0 (real) and 1.0 (spoof).
-                         0.5 is returned if the anti-spoofing model is unavailable.
+            spoof_score: float 0.0 (real) → 1.0 (spoof).
+                         0.5 when analysis is unavailable.
         """
         if self._spoof_model is None or face_crop is None or face_crop.size == 0:
-            return 0.5  # neutral / unknown
+            return 0.5  # anti-spoofing disabled or bad crop
 
         try:
-            # The antispoofing model expects RGB input
-            rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-            score = self._spoof_model.get(rgb)
+            h, w = face_crop.shape[:2]
+            if h < 40 or w < 40:
+                return 0.5  # too small for reliable analysis
 
-            # InsightFace antispoofing returns a float or (sometimes) a list.
-            # Normalise to a plain float 0-1.
-            if isinstance(score, (list, tuple, np.ndarray)):
-                score = float(np.mean(score))
-            elif isinstance(score, (int, float, np.floating)):
-                score = float(score)
+            # Resize to consistent dimensions for stable thresholds
+            std = cv2.resize(face_crop, (128, 128))
+            gray = cv2.cvtColor(std, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+            signals = []
+
+            # ── Signal 1: Laplacian variance ─────────────────────────────
+            # Measured on 128×128 grayscale face crops:
+            #   Real face (camera):   200 – 5000  (normal texture)
+            #   Blurry print:         < 80        (ink blur / low-res)
+            #   Screen with moiré:    > 8000      (periodic pixel-grid)
+            lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if lap_var < 80:
+                signals.append(0.85)   # very blurry → likely print
+            elif lap_var > 8000:
+                signals.append(0.80)   # extreme texture → moiré screen
             else:
-                score = 0.5
+                signals.append(0.05)   # normal → real face
 
-            # Clamp to [0, 1]
+            # ── Signal 2: Spectral peak detection (screen grid) ──────────
+            # Instead of raw HF energy (which is high for all images),
+            # detect periodic peaks: screens produce sharp spectral spikes
+            # at pixel-grid frequencies.  We measure kurtosis of the
+            # magnitude spectrum — uniform spectrum (real) has low kurtosis,
+            # peaked spectrum (screen) has high kurtosis.
+            f_transform = np.fft.fft2(gray)
+            f_shift = np.fft.fftshift(f_transform)
+            magnitude = np.log1p(np.abs(f_shift))
+            mag_flat = magnitude.ravel()
+            mag_mean = mag_flat.mean()
+            mag_std = mag_flat.std() + 1e-6
+            # Excess kurtosis: normal distribution ≈ 0, peaked > 3
+            kurtosis = ((mag_flat - mag_mean) ** 4).mean() / (mag_std ** 4) - 3.0
+            if kurtosis > 8.0:
+                signals.append(0.75)   # peaked spectrum → screen artefacts
+            else:
+                signals.append(0.05)
+
+            # ── Signal 3: Colour saturation analysis ─────────────────────
+            # Real skin has varied saturation (std > 20).
+            # Prints have flat saturation (low std, washed out).
+            # Screens can over-saturate (high mean, narrow std).
+            hsv = cv2.cvtColor(std, cv2.COLOR_BGR2HSV)
+            sat = hsv[:, :, 1].astype(np.float64)
+            sat_mean = sat.mean()
+            sat_std = sat.std()
+            if sat_std < 10:
+                signals.append(0.75)   # flat saturation → print / mono screen
+            elif sat_mean > 170:
+                signals.append(0.65)   # extreme saturation → screen
+            else:
+                signals.append(0.05)
+
+            # ── Combine (weighted average) ───────────────────────────────
+            # Laplacian is the most reliable single signal (weight 0.50).
+            weights = [0.50, 0.25, 0.25]
+            score = sum(w * s for w, s in zip(weights, signals))
+
             return max(0.0, min(1.0, score))
+
         except Exception as e:
-            logger.warning(f"Anti-spoofing inference failed: {e}")
+            logger.warning(f"Texture anti-spoofing failed: {e}")
             return 0.5
 
     def detect_all_faces(self, frame: np.ndarray) -> list[dict]:

@@ -298,6 +298,27 @@ class Settings(BaseSettings):
     # RECORDING_RESTART_DELAY_SECONDS: float = 5.0
     ENABLE_CAMERA_RECORDING: bool = False  # Disabled
 
+    # ── Attendance Mode ──────────────────────────────────────────────────
+    # When True the system operates as an employee attendance tracker.
+    #  • Camera pipeline NEVER creates new PersonIdentity rows for unknown
+    #    faces — only registered employees (linked via employees.person_identity_id)
+    #    are matched and trigger attendance records.
+    #  • Face matching is done immediately on the first good face (no 5-frame
+    #    body-accumulation delay), drastically reducing recognition latency
+    #    for cooperative subjects standing in front of the camera.
+    #  • Body ReID is skipped entirely (face-only matching).
+    #  • Employee registration (register_by_image / register_by_camera) still
+    #    creates PersonIdentity + embeddings as before.
+    ATTENDANCE_MODE: bool = True
+    # Minimum face quality to attempt an immediate attendance match.
+    # Lower than FACE_IDENTITY_MIN_SCORE because cooperative subjects produce
+    # better faces; we want speed over multi-angle accumulation.
+    ATTENDANCE_FACE_MIN_SCORE: float = 0.50
+    # Cooldown (seconds) per employee per camera: after a successful attendance
+    # match, skip re-matching the same employee on the same camera for this long.
+    # Prevents repeated DB writes while the person stands in front of camera.
+    ATTENDANCE_MATCH_COOLDOWN_SECONDS: float = 30.0
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

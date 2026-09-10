@@ -1532,6 +1532,63 @@ class CameraWorker:
                 logger.debug(f"Track {track.local_track_id}: quality too low ({quality:.2f}) and no valid frontal face. Skipping ReID accumulation.")
                 return
 
+            # ── ATTENDANCE MODE: immediate face-only matching ──────────────
+            # In attendance mode, as soon as we have a good face, we try to
+            # match it against employee face embeddings immediately — no 5-frame
+            # body accumulation delay.  Unknown faces are ignored (no new
+            # PersonIdentity creation). Body ReID is skipped entirely.
+            if self.settings.ATTENDANCE_MODE and face_embedding is not None and face_score >= self.settings.ATTENDANCE_FACE_MIN_SCORE:
+                if not track.reid_resolved:
+                    try:
+                        async with db.begin_nested():
+                            person_id = await self.identity_engine.decide_identity_attendance(
+                                db=db,
+                                face_embedding=face_embedding,
+                                camera_id=self.camera_id,
+                                face_score=face_score,
+                                face_crop_path=face_crop_path,
+                            )
+                    except Exception as e:
+                        logger.error(f"Track {track.local_track_id}: attendance match failed: {e}")
+                        person_id = None
+
+                    if person_id:
+                        track.person_identity_id = person_id
+                        track.reid_score = face_score
+                        track.reid_confident = True
+                        track.reid_resolved = True
+                        track.reid_attempted = True
+
+                        # Fire attendance record
+                        _att_pid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(str(person_id))
+                        asyncio.ensure_future(record_employee_detection(
+                            person_identity_id=_att_pid,
+                            camera_id=self.camera_id,
+                            detected_at=utc_now(),
+                        ))
+
+                        # Update track session
+                        if track.track_session_id:
+                            from sqlalchemy import update
+                            from app.core.db.models.tracking import TrackSession
+                            await db.execute(
+                                update(TrackSession)
+                                .where(TrackSession.id == track.track_session_id)
+                                .values(person_identity_id=person_id, last_seen_at=track.last_seen_at)
+                            )
+
+                        logger.info(
+                            f"[Attendance] Track {track.local_track_id}: matched employee "
+                            f"person={str(person_id)[:8]} score={face_score:.2f}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[Attendance] Track {track.local_track_id}: no employee match "
+                            f"(face_score={face_score:.2f}) — ignored"
+                        )
+                # In attendance mode, skip body accumulation entirely
+                return
+
             # Accumulate embedding
             accum_list = self.track_embeddings.setdefault(track.local_track_id, [])
             accum_list.append((body_embedding, quality, crop_path, face_embedding, face_score, face_crop_path))
