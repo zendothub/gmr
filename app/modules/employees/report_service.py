@@ -113,6 +113,7 @@ async def get_daily_report(
                 shift_label=shift_label,
                 status=AttendanceStatus.on_leave.value,
                 leave_type=leave.leave_type.value,
+                is_half_day=leave.is_half_day,
             )
             summary.on_leave += 1
         elif rec:
@@ -268,8 +269,11 @@ async def _aggregate_report(
             r.attendance_date for r in present_recs
             if r.attendance_date in working_days and r.attendance_date not in leave_days_set
         }
-        leave_days = len(leave_days_set)
-        absent_days = max(total_days - len(present_on_working_days) - leave_days, 0)
+        # A half-day leave still occupies the whole calendar day for
+        # present/absent bucketing (no time-of-day granularity in camera
+        # records) — only the leave_days metric itself is fractional.
+        leave_days = sum(_leave_day_value(leaves, d) for d in leave_days_set)
+        absent_days = max(total_days - len(present_on_working_days) - len(leave_days_set), 0)
         late_days = sum(
             1 for r in recs
             if r.status == AttendanceStatus.late and r.attendance_date not in leave_days_set
@@ -332,6 +336,14 @@ async def _earliest_attendance_date(db: AsyncSession, emp_ids: List[UUID]) -> Op
 def _date_covered_by_leaves(leaves: list[LeaveRequest], d: date) -> bool:
     """True if `d` falls within any of the given (non-overlapping) leave ranges."""
     return any(l.date_from <= d <= l.date_to for l in leaves)
+
+
+def _leave_day_value(leaves: list[LeaveRequest], d: date) -> float:
+    """0.5 if `d` is covered by a half-day leave, 1.0 for a full day, 0.0 if not covered."""
+    for l in leaves:
+        if l.date_from <= d <= l.date_to:
+            return 0.5 if l.is_half_day else 1.0
+    return 0.0
 
 
 def _working_days_in_range(emp: Employee, date_from: date, date_to: date) -> set:

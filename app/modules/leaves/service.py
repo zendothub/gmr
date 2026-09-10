@@ -60,7 +60,7 @@ def _working_days_count(emp: Employee, date_from: date, date_to: date) -> int:
 
 async def _year_used_days(
     db: AsyncSession, employee_id: UUID, year: int, exclude_id: Optional[UUID] = None
-) -> int:
+) -> float:
     """Sum of days_count for this employee's leave requests starting in `year`."""
     q = select(func.coalesce(func.sum(LeaveRequest.days_count), 0)).where(
         LeaveRequest.employee_id == employee_id,
@@ -68,7 +68,7 @@ async def _year_used_days(
     )
     if exclude_id is not None:
         q = q.where(LeaveRequest.id != exclude_id)
-    return (await db.execute(q)).scalar() or 0
+    return (await db.execute(q)).scalar() or 0.0
 
 
 async def _has_overlap(
@@ -88,7 +88,7 @@ async def _has_overlap(
     return (await db.execute(q)).first() is not None
 
 
-def _check_quota(used: int, requested: int, year: int) -> None:
+def _check_quota(used: float, requested: float, year: int) -> None:
     if used + requested > ANNUAL_LEAVE_QUOTA:
         raise HTTPException(
             status_code=422,
@@ -111,12 +111,13 @@ async def create_leave(db: AsyncSession, payload: LeaveCreate) -> LeaveRequest:
             status_code=409, detail="Overlaps an existing leave request for this employee."
         )
 
-    days_count = _working_days_count(emp, payload.date_from, payload.date_to)
-    if days_count == 0:
+    working_days = _working_days_count(emp, payload.date_from, payload.date_to)
+    if working_days == 0:
         raise HTTPException(
             status_code=422,
             detail="Leave range contains no working days (all fall on the employee's weekly-off).",
         )
+    days_count = working_days * (0.5 if payload.is_half_day else 1.0)
 
     used = await _year_used_days(db, emp.id, payload.date_from.year)
     _check_quota(used, days_count, payload.date_from.year)
@@ -126,6 +127,7 @@ async def create_leave(db: AsyncSession, payload: LeaveCreate) -> LeaveRequest:
         leave_type=LeaveType(payload.leave_type),
         date_from=payload.date_from,
         date_to=payload.date_to,
+        is_half_day=payload.is_half_day,
         days_count=days_count,
         reason=payload.reason,
     )
@@ -142,31 +144,44 @@ async def update_leave(db: AsyncSession, leave_id: UUID, payload: LeaveUpdate) -
 
     new_date_from = payload.date_from if payload.date_from is not None else leave.date_from
     new_date_to = payload.date_to if payload.date_to is not None else leave.date_to
+    new_is_half_day = payload.is_half_day if payload.is_half_day is not None else leave.is_half_day
+
     if new_date_to < new_date_from:
         raise HTTPException(status_code=422, detail="date_to cannot be before date_from")
     if new_date_from.year != new_date_to.year:
         raise HTTPException(
             status_code=422, detail="leave request must fall within a single calendar year"
         )
+    if new_is_half_day and new_date_from != new_date_to:
+        raise HTTPException(
+            status_code=422,
+            detail="is_half_day is only valid for a single-day leave (date_from == date_to)",
+        )
 
-    if new_date_from != leave.date_from or new_date_to != leave.date_to:
+    dates_changed = new_date_from != leave.date_from or new_date_to != leave.date_to
+    half_day_changed = new_is_half_day != leave.is_half_day
+
+    if dates_changed:
         if await _has_overlap(db, emp.id, new_date_from, new_date_to, exclude_id=leave.id):
             raise HTTPException(
                 status_code=409, detail="Overlaps an existing leave request for this employee."
             )
 
-        new_days_count = _working_days_count(emp, new_date_from, new_date_to)
-        if new_days_count == 0:
+    if dates_changed or half_day_changed:
+        working_days = _working_days_count(emp, new_date_from, new_date_to)
+        if working_days == 0:
             raise HTTPException(
                 status_code=422,
                 detail="Leave range contains no working days (all fall on the employee's weekly-off).",
             )
+        new_days_count = working_days * (0.5 if new_is_half_day else 1.0)
 
         used = await _year_used_days(db, emp.id, new_date_from.year, exclude_id=leave.id)
         _check_quota(used, new_days_count, new_date_from.year)
 
         leave.date_from = new_date_from
         leave.date_to = new_date_to
+        leave.is_half_day = new_is_half_day
         leave.days_count = new_days_count
 
     if payload.leave_type is not None:
@@ -210,6 +225,6 @@ async def list_leaves(
     return {"items": items, "total": total, "page": page, "size": size}
 
 
-async def get_balance_remaining(db: AsyncSession, employee_id: UUID, year: int) -> int:
+async def get_balance_remaining(db: AsyncSession, employee_id: UUID, year: int) -> float:
     used = await _year_used_days(db, employee_id, year)
     return max(ANNUAL_LEAVE_QUOTA - used, 0)
