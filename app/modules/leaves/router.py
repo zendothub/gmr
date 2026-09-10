@@ -32,6 +32,7 @@ async def _build_leave_response(db: AsyncSession, leave: LeaveRequest) -> LeaveR
         leave_type=leave.leave_type.value,
         date_from=leave.date_from,
         date_to=leave.date_to,
+        is_half_day=leave.is_half_day,
         days_count=leave.days_count,
         reason=leave.reason,
         balance_remaining=balance,
@@ -51,6 +52,7 @@ async def apply_leave(
 
     - **leave_type**: `CASUAL` or `SICK`
     - **date_from** / **date_to**: inclusive range, must fall within one calendar year
+    - **is_half_day**: consumes 0.5 day instead of 1 — only valid when date_from == date_to
     - **reason**: optional
 
     Casual + sick share one combined 12-day/calendar-year quota per employee.

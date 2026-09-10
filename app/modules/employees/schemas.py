@@ -173,13 +173,14 @@ class AttendanceReportEmployee(BaseModel):
     last_seen_at: Optional[datetime] = None
     total_hours: Optional[float] = None
     leave_type: Optional[str] = None        # CASUAL / SICK, only set when status=on_leave
+    is_half_day: Optional[bool] = None      # only set when status=on_leave
 
     # For weekly / monthly aggregates
     total_days: Optional[int] = None
     present_days: Optional[int] = None
     absent_days: Optional[int] = None
     late_days: Optional[int] = None
-    leave_days: Optional[int] = None
+    leave_days: Optional[float] = None      # fractional when a half-day leave falls in range
     avg_hours_per_day: Optional[float] = None
 
 
