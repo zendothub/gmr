@@ -36,6 +36,7 @@ from app.modules.debug.router import router as debug_router
 from app.modules.shift_slots.router import router as shift_slots_router
 from app.modules.employees.router import router as employees_router
 from app.modules.leaves.router import router as leaves_router
+from app.modules.dashboard.router import router as dashboard_router
 from app.modules.upload.router import router as upload_router
 
 settings = get_settings()
@@ -123,6 +124,7 @@ app.include_router(debug_router)
 app.include_router(shift_slots_router)
 app.include_router(employees_router)
 app.include_router(leaves_router)
+app.include_router(dashboard_router)
 app.include_router(upload_router)
 
 

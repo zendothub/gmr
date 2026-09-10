@@ -18,7 +18,7 @@ from datetime import date, timedelta, datetime, timezone
 from typing import Optional, List
 from uuid import UUID
 
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -352,11 +352,19 @@ async def _load_employees(
     shift_slot_id: Optional[UUID] = None,
     emp_id: Optional[str] = None,
 ) -> List[Employee]:
+    """`emp_id` is a single search box: partial, case-insensitive match
+    against either emp_id or name (e.g. "ak" matches emp_id "ak203" and
+    name "Akankshya")."""
     q = select(Employee).where(Employee.is_active.is_(True))
     if shift_slot_id:
         q = q.where(Employee.shift_slot_id == shift_slot_id)
     if emp_id:
-        q = q.where(Employee.emp_id == emp_id)
+        q = q.where(
+            or_(
+                Employee.emp_id.ilike(f"%{emp_id}%"),
+                Employee.name.ilike(f"%{emp_id}%"),
+            )
+        )
     q = q.order_by(Employee.name)
     return (await db.execute(q)).scalars().all()
 
