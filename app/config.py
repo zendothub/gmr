@@ -90,6 +90,18 @@ class Settings(BaseSettings):
                                                 # good margin on both sides. Previously 0.60 (too close to same-person
                                                 # p25=0.537, rejected valid cross-angle embeddings).
 
+    # ── Anti-spoofing (liveness detection) ─────────────────────────────────
+    # When enabled, InsightFace's MiniFASNet model scores each face crop:
+    # 0 = real live person, 1 = spoof/attack.
+    # Requires the antispoofing.onnx file which ships with the buffalo_l model pack.
+    # The model is loaded separately from the main FaceAnalysis app.
+    ANTISPOOF_ENABLED: bool = False            # Set True to enable liveness checks
+    ANTISPOOF_THRESHOLD: float = 0.70           # Faces with score > this are rejected as spoofs
+    ANTISPOOF_REQUIRE_FRAME_COUNT: int = 3      # Number of consecutive non-spoof frames required before accepting
+    # When True, a spoofed face rejection is logged but does NOT prevent identity
+    # matching / attendance marking (audit-only mode for calibration).
+    ANTISPOOF_AUDIT_ONLY: bool = False
+
     FACE_IDENTITY_MIN_SCORE: float = 0.60     # Minimum face quality score required to create a new PersonIdentity
     FACE_IDENTITY_MIN_DETECTIONS: int = 2     # Minimum good face detections across track lifetime required for identity creation
     MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5   # Maximum face embeddings stored per person identity (multi-angle)
@@ -155,7 +167,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Staff detection — auto-classifies frequent visitors so purchase
     # analytics exclude employees (who generate hundreds of billing events
-    # per shift).  Runs inside the periodic dedup job (every 6 min).
+    # per shift).  Runs inside the periodic dedup job (every 3 min).
     # ------------------------------------------------------------------
     STAFF_DURATION_THRESHOLD_SECONDS: int = 1800   # total visible time across all sessions (default 30 min)
     STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
@@ -285,6 +297,27 @@ class Settings(BaseSettings):
     # RECORDING_CAMERA_REFRESH_SECONDS: int = 60
     # RECORDING_RESTART_DELAY_SECONDS: float = 5.0
     ENABLE_CAMERA_RECORDING: bool = False  # Disabled
+
+    # ── Attendance Mode ──────────────────────────────────────────────────
+    # When True the system operates as an employee attendance tracker.
+    #  • Camera pipeline NEVER creates new PersonIdentity rows for unknown
+    #    faces — only registered employees (linked via employees.person_identity_id)
+    #    are matched and trigger attendance records.
+    #  • Face matching is done immediately on the first good face (no 5-frame
+    #    body-accumulation delay), drastically reducing recognition latency
+    #    for cooperative subjects standing in front of the camera.
+    #  • Body ReID is skipped entirely (face-only matching).
+    #  • Employee registration (register_by_image / register_by_camera) still
+    #    creates PersonIdentity + embeddings as before.
+    ATTENDANCE_MODE: bool = True
+    # Minimum face quality to attempt an immediate attendance match.
+    # Lower than FACE_IDENTITY_MIN_SCORE because cooperative subjects produce
+    # better faces; we want speed over multi-angle accumulation.
+    ATTENDANCE_FACE_MIN_SCORE: float = 0.50
+    # Cooldown (seconds) per employee per camera: after a successful attendance
+    # match, skip re-matching the same employee on the same camera for this long.
+    # Prevents repeated DB writes while the person stands in front of camera.
+    ATTENDANCE_MATCH_COOLDOWN_SECONDS: float = 30.0
 
     # Logging
     LOG_LEVEL: str = "INFO"

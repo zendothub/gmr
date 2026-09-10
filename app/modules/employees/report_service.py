@@ -14,7 +14,7 @@ background dedup jobs running between two report downloads.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from typing import Optional, List
 from uuid import UUID
 
@@ -35,6 +35,20 @@ from app.modules.employees.schemas import (
     AttendanceReportSummary,
 )
 from app.utils.time_utils import utc_now
+
+# IST timezone (UTC+5:30) — timestamps are stored in UTC in the DB,
+# but the frontend expects them in local time (IST).
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _utc_to_ist(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert a UTC datetime to IST for frontend display.
+    If naive, assume UTC and convert."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +122,8 @@ async def get_daily_report(
                 name=emp.name,
                 shift_label=shift_label,
                 status=status,
-                first_seen_at=rec.first_seen_at,
-                last_seen_at=rec.last_seen_at,
+                first_seen_at=_utc_to_ist(rec.first_seen_at),
+                last_seen_at=_utc_to_ist(rec.last_seen_at),
                 total_hours=rec.total_hours,
             )
             _increment_summary(summary, status)

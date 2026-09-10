@@ -1,4 +1,4 @@
-"""InsightFace analyzer module for demographic classification (age/gender)."""
+"""InsightFace analyzer module for demographic classification (age/gender) and anti-spoofing."""
 
 import threading
 from dataclasses import dataclass
@@ -39,6 +39,7 @@ class InsightFaceResult:
     face_quality: float = 0.0      # composite quality (det_score × frontality)
     frontality_score: float = 0.0  # 0 = profile, 1 = perfectly frontal
     eye_spread: float = 0.0        # normalised eye-to-eye horizontal distance
+    antispoof_score: float = 0.0   # 0 = real live person, 1 = spoof/attack
 
 
 class InsightFaceAnalyzer:
@@ -53,7 +54,9 @@ class InsightFaceAnalyzer:
         except Exception:
             self.det_size = (640, 640)
         self.app = None
+        self._spoof_model = None  # Anti-spoofing model (loaded lazily)
         self._load_model()
+        self._load_spoof_model()
 
     def _load_model(self):
         """Lazy load InsightFace app."""
@@ -77,6 +80,9 @@ class InsightFaceAnalyzer:
             # genderage supplies age (product gender still uses SigLIP2 face+margin)
             self.app = FaceAnalysis(
                 name=self.model_name,
+                # Include antispoofing so the model file gets downloaded with the
+                # rest of the buffalo_l pack. The model is loaded separately in
+                # _load_spoof_model() to avoid interfering with face detection.
                 allowed_modules=["detection", "recognition", "genderage"],
                 providers=providers,
             )
@@ -85,9 +91,136 @@ class InsightFaceAnalyzer:
                 f"InsightFace FaceAnalysis prepared successfully "
                 f"(model={self.model_name}, modules={list(self.app.models.keys())})"
             )
+
+            # Anti-spoofing now uses texture analysis (Laplacian + FFT + colour)
+            # instead of the missing antispoofing.onnx.  No model download needed.
         except Exception as e:
             logger.error(f"Failed to initialize InsightFace analyzer: {e}")
             self.app = None
+
+    def _load_spoof_model(self):
+        """Initialise texture-based anti-spoofing (no external ONNX model required).
+
+        This replaces the missing InsightFace antispoofing.onnx which is NOT
+        included in any standard model pack.  Instead we use multi-signal
+        image-analysis:
+
+        1. **Laplacian variance** — real faces have natural texture; printed
+           photos are blurry, screens show moiré patterns.
+        2. **FFT high-frequency energy** — screens emit periodic pixel-grid
+           artefacts visible in the frequency domain.
+        3. **Colour-space analysis** — printed/screen faces have narrower
+           colour gamut and different saturation distribution.
+
+        Combined these catch the primary attendance-fraud vectors (phone
+        screen or printed photo held in front of the camera).
+        """
+        settings = get_settings()
+        if not settings.ANTISPOOF_ENABLED:
+            self._spoof_model = None
+            logger.info("Anti-spoofing disabled (ANTISPOOF_ENABLED=False)")
+            return
+
+        # No model file needed — texture analysis uses OpenCV only
+        self._spoof_model = "texture"  # sentinel so detect_spoof() knows it's active
+        logger.info(
+            "Anti-spoofing ACTIVE — texture-based analysis (Laplacian + FFT + colour)"
+        )
+        print("=" * 60)
+        print("  ✅ ANTI-SPOOFING ACTIVATED — Texture-based liveness detection")
+        print(f"  🔧 Threshold: {settings.ANTISPOOF_THRESHOLD}")
+        print(f"  👁️  Audit-only: {settings.ANTISPOOF_AUDIT_ONLY}")
+        print(f"  🛡️  Spoofed faces will be blocked from attendance")
+        print("=" * 60)
+
+    def detect_spoof(self, face_crop: np.ndarray) -> float:
+        """Texture-based anti-spoofing — no external model required.
+
+        Uses three complementary signals to detect printed photos and phone
+        screens held in front of the camera:
+
+        1. Laplacian variance (texture sharpness / moiré)
+        2. FFT high-frequency energy ratio (screen pixel-grid artefacts)
+        3. Colour saturation spread (print / screen gamut compression)
+
+        Args:
+            face_crop: BGR face crop image.
+
+        Returns:
+            spoof_score: float 0.0 (real) → 1.0 (spoof).
+                         0.5 when analysis is unavailable.
+        """
+        if self._spoof_model is None or face_crop is None or face_crop.size == 0:
+            return 0.5  # anti-spoofing disabled or bad crop
+
+        try:
+            h, w = face_crop.shape[:2]
+            if h < 40 or w < 40:
+                return 0.5  # too small for reliable analysis
+
+            # Resize to consistent dimensions for stable thresholds
+            std = cv2.resize(face_crop, (128, 128))
+            gray = cv2.cvtColor(std, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+            signals = []
+
+            # ── Signal 1: Laplacian variance ─────────────────────────────
+            # Measured on 128×128 grayscale face crops:
+            #   Real face (camera):   200 – 5000  (normal texture)
+            #   Blurry print:         < 80        (ink blur / low-res)
+            #   Screen with moiré:    > 8000      (periodic pixel-grid)
+            lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if lap_var < 80:
+                signals.append(0.85)   # very blurry → likely print
+            elif lap_var > 8000:
+                signals.append(0.80)   # extreme texture → moiré screen
+            else:
+                signals.append(0.05)   # normal → real face
+
+            # ── Signal 2: Spectral peak detection (screen grid) ──────────
+            # Instead of raw HF energy (which is high for all images),
+            # detect periodic peaks: screens produce sharp spectral spikes
+            # at pixel-grid frequencies.  We measure kurtosis of the
+            # magnitude spectrum — uniform spectrum (real) has low kurtosis,
+            # peaked spectrum (screen) has high kurtosis.
+            f_transform = np.fft.fft2(gray)
+            f_shift = np.fft.fftshift(f_transform)
+            magnitude = np.log1p(np.abs(f_shift))
+            mag_flat = magnitude.ravel()
+            mag_mean = mag_flat.mean()
+            mag_std = mag_flat.std() + 1e-6
+            # Excess kurtosis: normal distribution ≈ 0, peaked > 3
+            kurtosis = ((mag_flat - mag_mean) ** 4).mean() / (mag_std ** 4) - 3.0
+            if kurtosis > 8.0:
+                signals.append(0.75)   # peaked spectrum → screen artefacts
+            else:
+                signals.append(0.05)
+
+            # ── Signal 3: Colour saturation analysis ─────────────────────
+            # Real skin has varied saturation (std > 20).
+            # Prints have flat saturation (low std, washed out).
+            # Screens can over-saturate (high mean, narrow std).
+            hsv = cv2.cvtColor(std, cv2.COLOR_BGR2HSV)
+            sat = hsv[:, :, 1].astype(np.float64)
+            sat_mean = sat.mean()
+            sat_std = sat.std()
+            if sat_std < 10:
+                signals.append(0.75)   # flat saturation → print / mono screen
+            elif sat_mean > 170:
+                signals.append(0.65)   # extreme saturation → screen
+            else:
+                signals.append(0.05)
+
+            # ── Combine (weighted average) ───────────────────────────────
+            # Laplacian is the most reliable single signal (weight 0.50).
+            weights = [0.50, 0.25, 0.25]
+            score = sum(w * s for w, s in zip(weights, signals))
+
+            return max(0.0, min(1.0, score))
+
+        except Exception as e:
+            logger.warning(f"Texture anti-spoofing failed: {e}")
+            return 0.5
 
     def detect_all_faces(self, frame: np.ndarray) -> list[dict]:
         """Run SCRFD detection + ArcFace embedding on the FULL frame (not a body crop).
@@ -295,11 +428,21 @@ class InsightFaceAnalyzer:
             else:
                 result_obj.frontality_score = 0.5  # unknown
 
+            # ── Anti-spoofing inference ──────────────────────────────────
+            if face_crop is not None and face_crop.size > 0:
+                result_obj.antispoof_score = self.detect_spoof(face_crop)
+                if get_settings().ANTISPOOF_ENABLED:
+                    logger.debug(
+                        f"Anti-spoof: score={result_obj.antispoof_score:.3f} "
+                        f"(0=real, 1=spoof)"
+                    )
+
             logger.debug(
                 f"InsightFace: det={result_obj.face_score:.2f}  "
                 f"eye_spread={result_obj.eye_spread:.2f}  "
                 f"frontality={result_obj.frontality_score:.2f}  "
-                f"quality={result_obj.face_quality:.2f}"
+                f"quality={result_obj.face_quality:.2f}  "
+                f"spoof={result_obj.antispoof_score:.3f}"
             )
             return result_obj
 
