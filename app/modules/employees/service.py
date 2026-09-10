@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
-from app.core.db.models.attendance import Employee, ShiftSlot
+from app.core.db.models.attendance import DEFAULT_WEEKENDS, Employee, Gender, ShiftSlot
 from app.core.db.models.person import PersonIdentity, PersonFaceEmbedding
 from app.modules.employees.schemas import (
     RegisterByCameraBody,
@@ -211,6 +211,8 @@ async def register_by_image(
     emp_id: str,
     name: str,
     shift_slot_id: Optional[UUID],
+    gender: Optional[str] = None,
+    weekends: Optional[List[str]] = None,
 ) -> dict:
     """
     Way 1 — register employee from a directly uploaded image.
@@ -283,6 +285,10 @@ async def register_by_image(
             inactive_employee.name = name
             if shift_slot_id is not None:
                 inactive_employee.shift_slot_id = shift_slot_id
+            if gender is not None:
+                inactive_employee.gender = Gender(gender)
+            if weekends is not None:
+                inactive_employee.weekends = weekends
             if crop_path:
                 inactive_employee.face_crop_path = crop_path
             await db.commit()
@@ -307,6 +313,8 @@ async def register_by_image(
         employee = Employee(
             emp_id=emp_id,
             name=name,
+            gender=Gender(gender) if gender is not None else None,
+            weekends=weekends if weekends is not None else list(DEFAULT_WEEKENDS),
             person_identity_id=matched_person.id,
             shift_slot_id=shift_slot_id,
             face_crop_path=crop_path,
@@ -358,6 +366,8 @@ async def register_by_image(
         employee = Employee(
             emp_id=emp_id,
             name=name,
+            gender=Gender(gender) if gender is not None else None,
+            weekends=weekends if weekends is not None else list(DEFAULT_WEEKENDS),
             person_identity_id=person.id,
             shift_slot_id=shift_slot_id,
             face_crop_path=crop_path,
@@ -426,6 +436,8 @@ async def register_by_camera(
     employee = Employee(
         emp_id=payload.emp_id,
         name=payload.name,
+        gender=Gender(payload.gender) if payload.gender is not None else None,
+        weekends=payload.weekends if payload.weekends is not None else list(DEFAULT_WEEKENDS),
         person_identity_id=payload.person_identity_id,
         shift_slot_id=payload.shift_slot_id,
         face_crop_path=face_crop_path,
@@ -494,6 +506,10 @@ async def update_employee(
     emp = await get_by_emp_id(db, emp_id)
     if payload.name is not None:
         emp.name = payload.name
+    if payload.gender is not None:
+        emp.gender = Gender(payload.gender)
+    if payload.weekends is not None:
+        emp.weekends = payload.weekends
     if payload.shift_slot_id is not None:
         # Validate shift_slot exists
         slot = (

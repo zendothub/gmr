@@ -5,7 +5,7 @@ from datetime import datetime, time, date
 from typing import Optional, List
 
 from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, Date, Time, func, Boolean, Enum as SAEnum
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
 
@@ -17,6 +17,41 @@ class AttendanceStatus(str, enum.Enum):
     absent = "absent"
     late = "late"
     half_day = "half_day"
+    on_leave = "on_leave"
+
+
+class Gender(str, enum.Enum):
+    MALE = "MALE"
+    FEMALE = "FEMALE"
+    OTHER = "OTHER"
+
+
+class Weekday(str, enum.Enum):
+    """Canonical weekday values used for employee-specific weekly-off config."""
+    MONDAY = "MONDAY"
+    TUESDAY = "TUESDAY"
+    WEDNESDAY = "WEDNESDAY"
+    THURSDAY = "THURSDAY"
+    FRIDAY = "FRIDAY"
+    SATURDAY = "SATURDAY"
+    SUNDAY = "SUNDAY"
+
+
+# date.weekday(): Monday=0 ... Sunday=6
+_WEEKDAY_BY_INDEX = [
+    Weekday.MONDAY.value,
+    Weekday.TUESDAY.value,
+    Weekday.WEDNESDAY.value,
+    Weekday.THURSDAY.value,
+    Weekday.FRIDAY.value,
+    Weekday.SATURDAY.value,
+    Weekday.SUNDAY.value,
+]
+
+# Default weekly-off for employees created before this field existed (see
+# migration 0010, which backfills existing rows to this same value) and for
+# new employees that don't specify one explicitly.
+DEFAULT_WEEKENDS = [Weekday.SATURDAY.value, Weekday.SUNDAY.value]
 
 
 class ShiftSlot(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -67,6 +102,23 @@ class Employee(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # Latest face crop path stored in MinIO (updated on each registration refresh).
     face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+    gender: Mapped[Optional[Gender]] = mapped_column(
+        SAEnum(
+            Gender,
+            name="employee_gender",
+            create_constraint=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=True,
+    )
+
+    # Employee-specific weekly-off days (canonical Weekday values, e.g.
+    # ["SATURDAY", "SUNDAY"]). Never a global setting — each employee can
+    # have a different configuration. See is_weekly_off().
+    weekends: Mapped[List[str]] = mapped_column(
+        ARRAY(String(9)), nullable=False, default=lambda: list(DEFAULT_WEEKENDS)
+    )
+
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     shift_slot: Mapped[Optional["ShiftSlot"]] = relationship(
@@ -75,6 +127,15 @@ class Employee(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     attendance_records: Mapped[List["AttendanceRecord"]] = relationship(
         "AttendanceRecord", back_populates="employee", cascade="all, delete-orphan"
     )
+
+    def is_weekly_off(self, day: date) -> bool:
+        """True if `day` falls on one of this employee's configured weekly-off days.
+
+        Never assumes Saturday/Sunday globally — always reads this employee's
+        own `weekends` list.
+        """
+        weekends = self.weekends or []
+        return _WEEKDAY_BY_INDEX[day.weekday()] in weekends
 
 
 class AttendanceRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
