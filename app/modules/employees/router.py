@@ -215,7 +215,11 @@ async def get_attendance_report(
     ),
     # filters
     shift_slot_id: Optional[UUID] = Query(None, description="Filter by shift slot"),
-    emp_id: Optional[str] = Query(None, description="Filter by a single employee ID"),
+    emp_id: Optional[str] = Query(
+        None,
+        description="Search box: partial, case-insensitive match against employee ID or name "
+                    "(e.g. 'ak' matches emp_id 'ak203' and name 'Akankshya')",
+    ),
     # sorting
     sort_by: Optional[str] = Query(
         None, pattern="^(present|absent|check_in|check_out)$",
@@ -247,7 +251,9 @@ async def get_attendance_report(
     - only start_date → `[start_date, today]`
     - only end_date   → `[earliest recorded attendance_date, end_date]`
 
-    **Optional filters:** `shift_slot_id`, `emp_id` — apply to both modes.
+    **Optional filters:** `shift_slot_id`, `emp_id` (partial, case-insensitive search against
+    employee ID or name — e.g. `emp_id=ak` matches emp_id "ak203" and name "Akankshya") —
+    apply to both modes.
 
     **Sorting:** `sort_by` (`present`, `absent`, `check_in`, `check_out`) + `sort_order`
     (`asc`/`desc`, default `asc`). `check_in`/`check_out` are only valid for
