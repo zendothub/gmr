@@ -26,6 +26,7 @@ from app.core.db.models.device_session import DeviceSession
 from app.core.db.models.stream_viewer import StreamViewerSession
 from app.core.db.models.audit import IdentityMergeEvent, FragmentedTrackEvent
 from app.core.db.models.attendance import ShiftSlot, Employee, AttendanceRecord, AttendanceStatus
+from app.core.db.models.leave import LeaveRequest, LeaveType
 
 __all__ = [
     "User",
@@ -67,4 +68,6 @@ __all__ = [
     "Employee",
     "AttendanceRecord",
     "AttendanceStatus",
+    "LeaveRequest",
+    "LeaveType",
 ]

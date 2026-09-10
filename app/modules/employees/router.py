@@ -14,8 +14,9 @@ Attendance report:
   GET    /api/v1/employees/attendance/report
 """
 
+import re
 from datetime import date, timedelta
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -32,6 +33,8 @@ from app.modules.employees.schemas import (
     RegisterByImageResponse,
     RegisterByCameraBody,
     AttendanceReportResponse,
+    GENDER_PATTERN,
+    validate_weekends,
 )
 
 router = APIRouter(prefix="/api/v1/employees", tags=["Employees"])
@@ -83,6 +86,14 @@ def _build_employee_response(emp, face_crop_url: Optional[str] = None) -> Employ
 async def register_by_image(
     emp_id: str = Form(..., description="Unique employee ID / badge number"),
     name: str = Form(..., description="Employee full name"),
+    # Plain (non-Optional) types + empty-value defaults here, not Optional[...] = Form(None):
+    # Swagger UI doesn't render an input box for multipart form fields whose schema is
+    # `anyOf [type, null]` (what Optional[...] produces under OpenAPI 3.1). Empty string /
+    # empty list defaults sidestep that while keeping the field genuinely optional.
+    gender: str = Form("", description="MALE, FEMALE, or OTHER — leave blank if unknown"),
+    weekends: List[str] = Form(
+        [], description="Employee-specific weekly-off days, e.g. SATURDAY, SUNDAY"
+    ),
     shift_slot_id: Optional[UUID] = Form(None, description="UUID of the assigned shift slot"),
     image: UploadFile = File(..., description="Clear face photo (JPEG or PNG)"),
     db: AsyncSession = Depends(get_db),
@@ -111,9 +122,22 @@ async def register_by_image(
             detail="Unsupported file type. Only JPEG and PNG are accepted.",
         )
 
+    gender_val: Optional[str] = gender.strip().upper() or None
+    if gender_val and not re.match(GENDER_PATTERN, gender_val):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid gender '{gender_val}'. Must be MALE, FEMALE, or OTHER.",
+        )
+
+    try:
+        weekends_val = validate_weekends(weekends) if weekends else None
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     image_bytes = await image.read()
     result = await emp_svc.register_by_image(
-        db, image_bytes, emp_id=emp_id, name=name, shift_slot_id=shift_slot_id
+        db, image_bytes, emp_id=emp_id, name=name, shift_slot_id=shift_slot_id,
+        gender=gender_val, weekends=weekends_val,
     )
     face_crop_url = result["face_crop_url"]
     # Resolve to a presigned URL if the service returned a raw MinIO path
@@ -171,7 +195,10 @@ async def register_by_camera(
 
 @router.get("/attendance/report", response_model=AttendanceReportResponse)
 async def get_attendance_report(
-    period: str = Query(..., pattern="^(daily|weekly|monthly)$", description="Report period"),
+    period: Optional[str] = Query(
+        None, pattern="^(daily|weekly|monthly)$",
+        description="Report period. Required unless start_date/end_date is used instead.",
+    ),
     # daily
     date: Optional[date] = Query(None, description="[daily] Target date (YYYY-MM-DD)"),
     # weekly
@@ -179,9 +206,24 @@ async def get_attendance_report(
     # monthly
     year: Optional[int] = Query(None, description="[monthly] Year e.g. 2026"),
     month: Optional[int] = Query(None, ge=1, le=12, description="[monthly] Month 1-12"),
+    # custom date range — alternative to period
+    start_date: Optional[date] = Query(
+        None, description="Custom range start (YYYY-MM-DD), inclusive. Alternative to `period`."
+    ),
+    end_date: Optional[date] = Query(
+        None, description="Custom range end (YYYY-MM-DD), inclusive. Alternative to `period`."
+    ),
     # filters
     shift_slot_id: Optional[UUID] = Query(None, description="Filter by shift slot"),
     emp_id: Optional[str] = Query(None, description="Filter by a single employee ID"),
+    # sorting
+    sort_by: Optional[str] = Query(
+        None, pattern="^(present|absent|check_in|check_out)$",
+        description="Sort field: present, absent, check_in, check_out",
+    ),
+    sort_order: str = Query(
+        "asc", pattern="^(asc|desc)$", description="Sort direction: asc or desc",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -198,30 +240,69 @@ async def get_attendance_report(
     | weekly  | `week_start`    |
     | monthly | `year`, `month` |
 
-    **Optional filters:** `shift_slot_id`, `emp_id`
+    **Custom date range** — pass `start_date` and/or `end_date` (YYYY-MM-DD) instead of
+    `period` to fetch attendance for an arbitrary inclusive range
+    (`start_date <= attendance_date <= end_date`):
+    - both given      → exact `[start_date, end_date]` window
+    - only start_date → `[start_date, today]`
+    - only end_date   → `[earliest recorded attendance_date, end_date]`
+
+    **Optional filters:** `shift_slot_id`, `emp_id` — apply to both modes.
+
+    **Sorting:** `sort_by` (`present`, `absent`, `check_in`, `check_out`) + `sort_order`
+    (`asc`/`desc`, default `asc`). `check_in`/`check_out` are only valid for
+    `period=daily` — weekly/monthly/custom rows have no per-day timestamps.
     """
-    if period == "daily":
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date cannot be greater than end_date")
+
+    is_daily = period == "daily" and start_date is None and end_date is None
+    if sort_by in ("check_in", "check_out") and not is_daily:
+        raise HTTPException(
+            status_code=422,
+            detail="sort_by=check_in/check_out is only valid for period=daily.",
+        )
+
+    if start_date is not None or end_date is not None:
+        response = await report_service.get_range_report(
+            db, start_date=start_date, end_date=end_date,
+            shift_slot_id=shift_slot_id, emp_id=emp_id,
+        )
+
+    elif period == "daily":
         if not date:
             raise HTTPException(status_code=422, detail="`date` is required for period=daily.")
-        return await report_service.get_daily_report(
+        response = await report_service.get_daily_report(
             db, report_date=date, shift_slot_id=shift_slot_id, emp_id=emp_id
         )
 
     elif period == "weekly":
         if not week_start:
             raise HTTPException(status_code=422, detail="`week_start` is required for period=weekly.")
-        return await report_service.get_weekly_report(
+        response = await report_service.get_weekly_report(
             db, week_start=week_start, shift_slot_id=shift_slot_id, emp_id=emp_id
         )
 
     elif period == "monthly":
         if not year or not month:
             raise HTTPException(status_code=422, detail="`year` and `month` are required for period=monthly.")
-        return await report_service.get_monthly_report(
+        response = await report_service.get_monthly_report(
             db, year=year, month=month, shift_slot_id=shift_slot_id, emp_id=emp_id
         )
 
-    raise HTTPException(status_code=422, detail="Invalid period.")
+    elif not period:
+        raise HTTPException(
+            status_code=422,
+            detail="`period` is required unless start_date and/or end_date is provided.",
+        )
+    else:
+        raise HTTPException(status_code=422, detail="Invalid period.")
+
+    if sort_by:
+        response.employees = report_service.sort_report_rows(
+            response.employees, response.period, sort_by, sort_order
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
