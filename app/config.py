@@ -90,6 +90,18 @@ class Settings(BaseSettings):
                                                 # good margin on both sides. Previously 0.60 (too close to same-person
                                                 # p25=0.537, rejected valid cross-angle embeddings).
 
+    # ── Anti-spoofing (liveness detection) ─────────────────────────────────
+    # When enabled, InsightFace's MiniFASNet model scores each face crop:
+    # 0 = real live person, 1 = spoof/attack.
+    # Requires the antispoofing.onnx file which ships with the buffalo_l model pack.
+    # The model is loaded separately from the main FaceAnalysis app.
+    ANTISPOOF_ENABLED: bool = False            # Set True to enable liveness checks
+    ANTISPOOF_THRESHOLD: float = 0.70           # Faces with score > this are rejected as spoofs
+    ANTISPOOF_REQUIRE_FRAME_COUNT: int = 3      # Number of consecutive non-spoof frames required before accepting
+    # When True, a spoofed face rejection is logged but does NOT prevent identity
+    # matching / attendance marking (audit-only mode for calibration).
+    ANTISPOOF_AUDIT_ONLY: bool = False
+
     FACE_IDENTITY_MIN_SCORE: float = 0.60     # Minimum face quality score required to create a new PersonIdentity
     FACE_IDENTITY_MIN_DETECTIONS: int = 2     # Minimum good face detections across track lifetime required for identity creation
     MAX_FACE_EMBEDDINGS_PER_PERSON: int = 5   # Maximum face embeddings stored per person identity (multi-angle)

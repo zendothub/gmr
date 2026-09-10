@@ -1341,6 +1341,40 @@ class CameraWorker:
                             f"(frontality={face_result.frontality_score:.2f})"
                         )
 
+                    # ── Anti-spoofing gate (liveness detection) ──────────────
+                    # InsightFace MiniFASNet scores the face crop: 0 = real, 1 = spoof.
+                    # When enabled, faces with spoof_score > threshold are rejected
+                    # to prevent printed photos / phone screen attacks.
+                    if face_frontal and self.settings.ANTISPOOF_ENABLED:
+                        _spoof = face_result.antispoof_score
+                        if _spoof > self.settings.ANTISPOOF_THRESHOLD:
+                            if self.settings.ANTISPOOF_AUDIT_ONLY:
+                                # Audit-only: log but do NOT reject the face.
+                                logger.warning(
+                                    f"Track {track.local_track_id}: ANTI-SPOOF AUDIT — "
+                                    f"spoof_score={_spoof:.3f} > threshold={self.settings.ANTISPOOF_THRESHOLD:.2f} "
+                                    f"(would reject, but ANTISPOOF_AUDIT_ONLY=True)"
+                                )
+                            else:
+                                face_frontal = False
+                                rejection_reason = (
+                                    f"spoof detected (score={_spoof:.3f} > "
+                                    f"threshold={self.settings.ANTISPOOF_THRESHOLD:.2f})"
+                                )
+                                logger.warning(
+                                    f"Track {track.local_track_id}: SPOOF REJECTED — "
+                                    f"spoof_score={_spoof:.3f} emp_id={track.person_identity_id} "
+                                    f"cam={self.camera_id}"
+                                )
+                    elif face_frontal and not self.settings.ANTISPOOF_ENABLED:
+                        # Anti-spoofing disabled — spoof_score still computed by
+                        # insightface_analyzer. Log at TRACE level for calibration.
+                        if face_result.antispoof_score > 0.70:
+                            logger.debug(
+                                f"Track {track.local_track_id}: Potential spoof ignored "
+                                f"(ANTISPOOF_ENABLED=False) score={face_result.antispoof_score:.3f}"
+                            )
+
                     # ── Gender: mean SigLIP2 margin, female-biased δ ─────
                     # Per-frame gender still recorded for debug; decision uses
                     # mean(male_best − female_best) > SIGLIP2_GENDER_MARGIN_DELTA.

@@ -1,4 +1,4 @@
-"""InsightFace analyzer module for demographic classification (age/gender)."""
+"""InsightFace analyzer module for demographic classification (age/gender) and anti-spoofing."""
 
 import threading
 from dataclasses import dataclass
@@ -39,6 +39,7 @@ class InsightFaceResult:
     face_quality: float = 0.0      # composite quality (det_score × frontality)
     frontality_score: float = 0.0  # 0 = profile, 1 = perfectly frontal
     eye_spread: float = 0.0        # normalised eye-to-eye horizontal distance
+    antispoof_score: float = 0.0   # 0 = real live person, 1 = spoof/attack
 
 
 class InsightFaceAnalyzer:
@@ -53,7 +54,9 @@ class InsightFaceAnalyzer:
         except Exception:
             self.det_size = (640, 640)
         self.app = None
+        self._spoof_model = None  # Anti-spoofing model (loaded lazily)
         self._load_model()
+        self._load_spoof_model()
 
     def _load_model(self):
         """Lazy load InsightFace app."""
@@ -77,6 +80,9 @@ class InsightFaceAnalyzer:
             # genderage supplies age (product gender still uses SigLIP2 face+margin)
             self.app = FaceAnalysis(
                 name=self.model_name,
+                # Include antispoofing so the model file gets downloaded with the
+                # rest of the buffalo_l pack. The model is loaded separately in
+                # _load_spoof_model() to avoid interfering with face detection.
                 allowed_modules=["detection", "recognition", "genderage"],
                 providers=providers,
             )
@@ -85,9 +91,117 @@ class InsightFaceAnalyzer:
                 f"InsightFace FaceAnalysis prepared successfully "
                 f"(model={self.model_name}, modules={list(self.app.models.keys())})"
             )
+
+            # ── Force-download the anti-spoofing model if not present ─────
+            # The antispoofing model ships inside the buffalo_l zip but is not
+            # extracted by FaceAnalysis unless explicitly requested.  We trigger
+            # its download here so _load_spoof_model() finds it on disk.
+            if get_settings().ANTISPOOF_ENABLED:
+                try:
+                    import os
+                    home = os.path.expanduser("~")
+                    spoof_path = os.path.join(home, ".insightface", "models", self.model_name, "antispoofing.onnx")
+                    if not os.path.exists(spoof_path):
+                        logger.info("Anti-spoofing model not found — triggering download ...")
+                        # Force InsightFace to download the missing file by loading it
+                        from insightface.model_zoo import model_zoo
+                        _dummy = model_zoo.get_model(
+                            os.path.join(home, ".insightface", "models", self.model_name, "antispoofing")
+                        )
+                        logger.info("Anti-spoofing model downloaded successfully.")
+                except Exception as dl_err:
+                    logger.warning(f"Could not auto-download anti-spoofing model: {dl_err}")
+                    logger.info(
+                        "To download manually:\n"
+                        "  1. Find buffalo_l.zip at https://github.com/deepinsight/insightface/releases\n"
+                        "  2. Extract antispoofing.onnx to ~/.insightface/models/buffalo_l/\n"
+                        "  3. Or just restart the service — InsightFace may auto-download on retry"
+                    )
         except Exception as e:
             logger.error(f"Failed to initialize InsightFace analyzer: {e}")
             self.app = None
+
+    def _load_spoof_model(self):
+        """Load the anti-spoofing model separately if available.
+
+        The anti-spoofing ONNX model (antispoofing.onnx, ~2.7 MB) ships with
+        the InsightFace buffalo_l model pack.  It is a lightweight binary
+        classifier (MiniFASNet) scoring each face crop: 0 = real, 1 = spoof.
+        """
+        try:
+            import os
+            from pathlib import Path
+            from insightface.model_zoo import model_zoo
+            from app.utils.device import insightface_ctx_id, get_insightface_providers
+
+            settings = get_settings()
+            if not settings.ANTISPOOF_ENABLED:
+                self._spoof_model = None
+                return
+
+            providers = get_insightface_providers()
+            home = os.path.expanduser("~")
+            model_dir = os.path.join(home, ".insightface", "models", self.model_name)
+            spoof_path = os.path.join(model_dir, "antispoofing.onnx")
+
+            if not os.path.exists(spoof_path):
+                logger.warning(
+                    f"Anti-spoofing ONNX model not found at {spoof_path}. "
+                    "Download the buffalo_l model pack to enable: "
+                    "the antispoofing.onnx file ships with it."
+                )
+                self._spoof_model = None
+                return
+
+            self._spoof_model = model_zoo.get_model(str(spoof_path), providers=providers)
+            ctx_id = insightface_ctx_id()
+            self._spoof_model.prepare(ctx_id=ctx_id)
+            logger.info(
+                f"Anti-spoofing model loaded (path={spoof_path}, ctx_id={ctx_id})"
+            )
+            print("=" * 60)
+            print("  ✅ ANTI-SPOOFING ACTIVATED — Liveness detection enabled")
+            print(f"  📍 Model: {spoof_path}")
+            print(f"  🔧 Threshold: {settings.ANTISPOOF_THRESHOLD}")
+            print(f"  👁️  Audit-only: {settings.ANTISPOOF_AUDIT_ONLY}")
+            print(f"  🛡️  Spoofed faces will be blocked from attendance")
+            print("=" * 60)
+        except Exception as e:
+            logger.warning(f"Failed to load anti-spoofing model: {e}")
+            self._spoof_model = None
+
+    def detect_spoof(self, face_crop: np.ndarray) -> float:
+        """Run anti-spoofing inference on a face crop.
+
+        Args:
+            face_crop: BGR face crop image.
+
+        Returns:
+            spoof_score: float between 0.0 (real) and 1.0 (spoof).
+                         0.5 is returned if the anti-spoofing model is unavailable.
+        """
+        if self._spoof_model is None or face_crop is None or face_crop.size == 0:
+            return 0.5  # neutral / unknown
+
+        try:
+            # The antispoofing model expects RGB input
+            rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            score = self._spoof_model.get(rgb)
+
+            # InsightFace antispoofing returns a float or (sometimes) a list.
+            # Normalise to a plain float 0-1.
+            if isinstance(score, (list, tuple, np.ndarray)):
+                score = float(np.mean(score))
+            elif isinstance(score, (int, float, np.floating)):
+                score = float(score)
+            else:
+                score = 0.5
+
+            # Clamp to [0, 1]
+            return max(0.0, min(1.0, score))
+        except Exception as e:
+            logger.warning(f"Anti-spoofing inference failed: {e}")
+            return 0.5
 
     def detect_all_faces(self, frame: np.ndarray) -> list[dict]:
         """Run SCRFD detection + ArcFace embedding on the FULL frame (not a body crop).
@@ -295,11 +409,21 @@ class InsightFaceAnalyzer:
             else:
                 result_obj.frontality_score = 0.5  # unknown
 
+            # ── Anti-spoofing inference ──────────────────────────────────
+            if face_crop is not None and face_crop.size > 0:
+                result_obj.antispoof_score = self.detect_spoof(face_crop)
+                if get_settings().ANTISPOOF_ENABLED:
+                    logger.debug(
+                        f"Anti-spoof: score={result_obj.antispoof_score:.3f} "
+                        f"(0=real, 1=spoof)"
+                    )
+
             logger.debug(
                 f"InsightFace: det={result_obj.face_score:.2f}  "
                 f"eye_spread={result_obj.eye_spread:.2f}  "
                 f"frontality={result_obj.frontality_score:.2f}  "
-                f"quality={result_obj.face_quality:.2f}"
+                f"quality={result_obj.face_quality:.2f}  "
+                f"spoof={result_obj.antispoof_score:.3f}"
             )
             return result_obj
 
