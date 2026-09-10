@@ -66,12 +66,12 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Periodic person-identity deduplication every 6 minutes.
+    # Periodic person-identity deduplication every 3 minutes.
     # Merges cross-camera duplicates that the real-time matcher missed
     # (cross-angle face similarity just below FACE_MATCH_THRESHOLD).
     _scheduler.add_job(
         deduplicate_persons,
-        IntervalTrigger(minutes=6),
+        IntervalTrigger(minutes=3),
         id="deduplicate_persons",
         replace_existing=True,
     )

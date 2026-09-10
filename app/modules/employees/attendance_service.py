@@ -17,7 +17,7 @@ Design constraints:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, date, timedelta, time
+from datetime import datetime, date, timedelta, time, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -37,6 +37,10 @@ from app.utils.time_utils import utc_now
 
 # How many minutes after shift start before someone is marked "late".
 LATE_THRESHOLD_MINUTES = 15
+
+# IST timezone (UTC+5:30) — shift times in the DB are stored in IST.
+# All comparisons with shift windows must convert UTC detected_at → IST first.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,15 @@ async def _upsert_attendance(
     camera_id: UUID,
     detected_at: datetime,
 ) -> None:
+    # ── Timezone: shift times are stored in IST, but detected_at comes from
+    # the camera worker as UTC (utc_now()). Convert to IST for all shift-window
+    # comparisons, but store the UTC timestamps in the DB for consistency.
+    # ────────────────────────────────────────────────────────────────────────
+    _dt_utc = detected_at
+    if _dt_utc.tzinfo is None:
+        _dt_utc = _dt_utc.replace(tzinfo=timezone.utc)
+    detected_at_ist = _dt_utc.astimezone(IST)
+
     # 1. Find the employee linked to this person_identity
     employee: Optional[Employee] = (
         await db.execute(
@@ -93,11 +106,12 @@ async def _upsert_attendance(
             )
         ).scalar_one_or_none()
 
-    # 3. Compute the attendance_date
-    attendance_date = _compute_attendance_date(detected_at, shift)
+    # 3. Compute the attendance_date (use IST time so the date is correct in local time)
+    attendance_date = _compute_attendance_date(detected_at_ist, shift)
 
     # 4. Check if detection is within the shift window (if shift defined)
-    if shift and not _is_within_shift(detected_at, shift, attendance_date):
+    #    Use detected_at_ist so shift start/end (stored in IST) are compared correctly.
+    if shift and not _is_within_shift(detected_at_ist, shift, attendance_date):
         logger.debug(
             f"[Attendance] Detection for emp={employee.emp_id} at {detected_at} "
             f"is outside shift window '{shift.label}' — skipping."
@@ -116,7 +130,7 @@ async def _upsert_attendance(
 
     if existing is None:
         # ── First detection today — create record ────────────────────────
-        status = _compute_status(detected_at, shift, attendance_date)
+        status = _compute_status(detected_at_ist, shift, attendance_date)
         record = AttendanceRecord(
             employee_id=employee.id,
             attendance_date=attendance_date,

@@ -1744,6 +1744,21 @@ class CameraWorker:
                     from app.core.db.models.tracking import TrackSession
                     from app.core.db.models.event import Event
 
+                    # Guard: verify person still exists before FK-dependent UPDATE.
+                    # The dedup job may have deleted it between decide_identity and here.
+                    if person_id:
+                        _person_still_exists = await self.identity_engine._person_exists(db, person_id)
+                        if not _person_still_exists:
+                            logger.warning(
+                                f"Track {track.local_track_id}: person={str(person_id)[:8]} "
+                                f"deleted by dedup before track_session UPDATE — clearing assignment"
+                            )
+                            person_id = None
+                            track.person_identity_id = None
+                            track.reid_score = 0.0
+                            track.reid_confident = False
+                            track.reid_resolved = False
+
                     await db.execute(
                         update(TrackSession)
                         .where(TrackSession.id == track.track_session_id)

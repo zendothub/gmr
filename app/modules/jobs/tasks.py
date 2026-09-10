@@ -184,7 +184,7 @@ async def deduplicate_persons():
          • DELETE loser (cascades to person_embeddings / person_face_embeddings)
     4. Log a summary.
 
-    This job runs every 6 minutes.  It does NOT modify any config or realtime
+    This job runs every 3 minutes.  It does NOT modify any config or realtime
     state — only the PostgreSQL person tables.
     """
     from app.config import get_settings
@@ -413,6 +413,7 @@ async def deduplicate_persons():
                                     ("events",              "person_identity_id"),
                                     ("billing_interactions","person_identity_id"),
                                     ("storage_objects",     "person_identity_id"),
+                                    ("employees",           "person_identity_id"),
                                 ]:
                                     await db.execute(text(
                                         f"UPDATE {tbl} SET {col} = :winner WHERE {col}::text = :loser"
