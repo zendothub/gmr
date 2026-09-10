@@ -31,6 +31,133 @@ class IdentityDecisionEngine:
     def __init__(self):
         self.settings = get_settings()
         self.match_threshold = self.settings.REID_MATCH_THRESHOLD
+        # ── Attendance mode cache ───────────────────────────────────────
+        # Set of employee person_identity_ids (UUID) refreshed lazily.
+        self._employee_person_ids_cache: set | None = None
+        self._employee_cache_ts: float = 0.0
+        _EMPLOYEE_CACHE_TTL = 30.0  # seconds
+
+    # ── Attendance-mode fast path ───────────────────────────────────────
+    async def _refresh_employee_person_ids(self, db: AsyncSession) -> set:
+        """Return set of person_identity_id UUIDs linked to active employees.
+
+        Cached for _EMPLOYEE_CACHE_TTL seconds to avoid repeated DB hits on
+        every frame.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if (
+            self._employee_person_ids_cache is not None
+            and (now - self._employee_cache_ts) < 30.0
+        ):
+            return self._employee_person_ids_cache
+
+        from app.core.db.models.attendance import Employee
+        result = await db.execute(
+            select(Employee.person_identity_id).where(
+                Employee.is_active.is_(True),
+                Employee.person_identity_id.isnot(None),
+            )
+        )
+        pids = {row[0] for row in result.fetchall()}
+        self._employee_person_ids_cache = pids
+        self._employee_cache_ts = now
+        logger.debug(f"[Attendance] refreshed employee person_ids cache: {len(pids)} employees")
+        return pids
+
+    async def decide_identity_attendance(
+        self,
+        db: AsyncSession,
+        face_embedding: np.ndarray,
+        camera_id: uuid.UUID,
+        face_score: float = 0.0,
+        face_crop_path: Optional[str] = None,
+    ) -> Optional[uuid.UUID]:
+        """Fast attendance-mode identity resolution — face-only, employee-only.
+
+        Flow:
+          1. Search face embeddings via pgvector (same as _search_similar_face).
+          2. Filter: only keep candidates whose person_identity_id is linked
+             to an active Employee row.
+          3. If best employee match ≥ FACE_MATCH_THRESHOLD → return person_id.
+          4. NO new PersonIdentity creation for unknown faces.
+          5. Optionally store face embedding to improve future matching.
+
+        Returns the matched person_identity_id or None.
+        """
+        try:
+            await db.execute(text(f"SELECT pg_advisory_xact_lock({IDENTITY_ADVISORY_LOCK_KEY})"))
+
+            employee_pids = await self._refresh_employee_person_ids(db)
+            if not employee_pids:
+                logger.debug("[Attendance] No active employees with person_identity — skip")
+                return None
+
+            # Search all face embeddings
+            embedding_list = face_embedding.tolist()
+            await db.execute(text("SET LOCAL ivfflat.probes = 50"))
+            result = await db.execute(
+                text("""
+                    SELECT pfe.person_identity_id,
+                           pfe.embedding <=> :embedding AS distance
+                    FROM person_face_embeddings pfe
+                    JOIN person_identities pi ON pfe.person_identity_id = pi.id
+                    ORDER BY pfe.embedding <=> :embedding
+                    LIMIT 50
+                """),
+                {"embedding": str(embedding_list)},
+            )
+            rows = result.fetchall()
+            if not rows:
+                logger.debug("[Attendance] No face embeddings in DB")
+                return None
+
+            # Best per-person, filtered to employees only
+            best_by_employee: dict = {}
+            for row in rows:
+                pid = row[0]
+                if pid not in employee_pids:
+                    continue
+                sim = 1.0 - float(row[1])
+                if pid not in best_by_employee or sim > best_by_employee[pid]:
+                    best_by_employee[pid] = sim
+
+            if not best_by_employee:
+                logger.debug("[Attendance] No employee face match found")
+                return None
+
+            best_pid = max(best_by_employee, key=best_by_employee.get)
+            best_sim = best_by_employee[best_pid]
+
+            if best_sim < self.settings.FACE_MATCH_THRESHOLD:
+                logger.info(
+                    f"[Attendance] Best employee match sim={best_sim:.3f} "
+                    f"< threshold={self.settings.FACE_MATCH_THRESHOLD} — ignored"
+                )
+                return None
+
+            # Update last_seen on the person identity
+            async with db.begin_nested():
+                await self._update_person(db, best_pid)
+                # Store face embedding to improve future matching
+                if face_score > 0 and face_embedding is not None:
+                    try:
+                        await self._store_face_embedding(
+                            db, best_pid, face_embedding, camera_id,
+                            face_score, face_crop_path,
+                        )
+                    except IdentityStoreError:
+                        pass  # non-critical
+
+            logger.info(
+                f"[Attendance MATCH] person={str(best_pid)[:8]} "
+                f"sim={best_sim:.3f} cam={str(camera_id)[:8]}"
+            )
+            return best_pid
+
+        except Exception as e:
+            logger.error(f"[Attendance] decide_identity_attendance failed: {e}")
+            return None
 
     @staticmethod
     def _face_sim(a: np.ndarray, b: np.ndarray) -> float:

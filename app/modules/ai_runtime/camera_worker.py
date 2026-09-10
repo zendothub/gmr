@@ -1341,6 +1341,40 @@ class CameraWorker:
                             f"(frontality={face_result.frontality_score:.2f})"
                         )
 
+                    # ── Anti-spoofing gate (liveness detection) ──────────────
+                    # InsightFace MiniFASNet scores the face crop: 0 = real, 1 = spoof.
+                    # When enabled, faces with spoof_score > threshold are rejected
+                    # to prevent printed photos / phone screen attacks.
+                    if face_frontal and self.settings.ANTISPOOF_ENABLED:
+                        _spoof = face_result.antispoof_score
+                        if _spoof > self.settings.ANTISPOOF_THRESHOLD:
+                            if self.settings.ANTISPOOF_AUDIT_ONLY:
+                                # Audit-only: log but do NOT reject the face.
+                                logger.warning(
+                                    f"Track {track.local_track_id}: ANTI-SPOOF AUDIT — "
+                                    f"spoof_score={_spoof:.3f} > threshold={self.settings.ANTISPOOF_THRESHOLD:.2f} "
+                                    f"(would reject, but ANTISPOOF_AUDIT_ONLY=True)"
+                                )
+                            else:
+                                face_frontal = False
+                                rejection_reason = (
+                                    f"spoof detected (score={_spoof:.3f} > "
+                                    f"threshold={self.settings.ANTISPOOF_THRESHOLD:.2f})"
+                                )
+                                logger.warning(
+                                    f"Track {track.local_track_id}: SPOOF REJECTED — "
+                                    f"spoof_score={_spoof:.3f} emp_id={track.person_identity_id} "
+                                    f"cam={self.camera_id}"
+                                )
+                    elif face_frontal and not self.settings.ANTISPOOF_ENABLED:
+                        # Anti-spoofing disabled — spoof_score still computed by
+                        # insightface_analyzer. Log at TRACE level for calibration.
+                        if face_result.antispoof_score > 0.70:
+                            logger.debug(
+                                f"Track {track.local_track_id}: Potential spoof ignored "
+                                f"(ANTISPOOF_ENABLED=False) score={face_result.antispoof_score:.3f}"
+                            )
+
                     # ── Gender: mean SigLIP2 margin, female-biased δ ─────
                     # Per-frame gender still recorded for debug; decision uses
                     # mean(male_best − female_best) > SIGLIP2_GENDER_MARGIN_DELTA.
@@ -1496,6 +1530,63 @@ class CameraWorker:
 
             if not should_accumulate:
                 logger.debug(f"Track {track.local_track_id}: quality too low ({quality:.2f}) and no valid frontal face. Skipping ReID accumulation.")
+                return
+
+            # ── ATTENDANCE MODE: immediate face-only matching ──────────────
+            # In attendance mode, as soon as we have a good face, we try to
+            # match it against employee face embeddings immediately — no 5-frame
+            # body accumulation delay.  Unknown faces are ignored (no new
+            # PersonIdentity creation). Body ReID is skipped entirely.
+            if self.settings.ATTENDANCE_MODE and face_embedding is not None and face_score >= self.settings.ATTENDANCE_FACE_MIN_SCORE:
+                if not track.reid_resolved:
+                    try:
+                        async with db.begin_nested():
+                            person_id = await self.identity_engine.decide_identity_attendance(
+                                db=db,
+                                face_embedding=face_embedding,
+                                camera_id=self.camera_id,
+                                face_score=face_score,
+                                face_crop_path=face_crop_path,
+                            )
+                    except Exception as e:
+                        logger.error(f"Track {track.local_track_id}: attendance match failed: {e}")
+                        person_id = None
+
+                    if person_id:
+                        track.person_identity_id = person_id
+                        track.reid_score = face_score
+                        track.reid_confident = True
+                        track.reid_resolved = True
+                        track.reid_attempted = True
+
+                        # Fire attendance record
+                        _att_pid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(str(person_id))
+                        asyncio.ensure_future(record_employee_detection(
+                            person_identity_id=_att_pid,
+                            camera_id=self.camera_id,
+                            detected_at=utc_now(),
+                        ))
+
+                        # Update track session
+                        if track.track_session_id:
+                            from sqlalchemy import update
+                            from app.core.db.models.tracking import TrackSession
+                            await db.execute(
+                                update(TrackSession)
+                                .where(TrackSession.id == track.track_session_id)
+                                .values(person_identity_id=person_id, last_seen_at=track.last_seen_at)
+                            )
+
+                        logger.info(
+                            f"[Attendance] Track {track.local_track_id}: matched employee "
+                            f"person={str(person_id)[:8]} score={face_score:.2f}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[Attendance] Track {track.local_track_id}: no employee match "
+                            f"(face_score={face_score:.2f}) — ignored"
+                        )
+                # In attendance mode, skip body accumulation entirely
                 return
 
             # Accumulate embedding
@@ -1709,6 +1800,21 @@ class CameraWorker:
                     from sqlalchemy import update
                     from app.core.db.models.tracking import TrackSession
                     from app.core.db.models.event import Event
+
+                    # Guard: verify person still exists before FK-dependent UPDATE.
+                    # The dedup job may have deleted it between decide_identity and here.
+                    if person_id:
+                        _person_still_exists = await self.identity_engine._person_exists(db, person_id)
+                        if not _person_still_exists:
+                            logger.warning(
+                                f"Track {track.local_track_id}: person={str(person_id)[:8]} "
+                                f"deleted by dedup before track_session UPDATE — clearing assignment"
+                            )
+                            person_id = None
+                            track.person_identity_id = None
+                            track.reid_score = 0.0
+                            track.reid_confident = False
+                            track.reid_resolved = False
 
                     await db.execute(
                         update(TrackSession)
