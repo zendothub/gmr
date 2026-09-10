@@ -10,7 +10,7 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import String, Date, Integer, ForeignKey, Enum as SAEnum
+from sqlalchemy import String, Date, Float, Boolean, ForeignKey, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -48,8 +48,11 @@ class LeaveRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # Working days in [date_from, date_to] excluding the employee's own
     # weekly-off days, snapshotted at apply/edit time so a later change to
     # the employee's weekend config never retroactively alters quota already
-    # consumed by this request.
-    days_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # consumed by this request. Half (0.5) when is_half_day.
+    days_count: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Only valid when date_from == date_to (a half day is inherently single-day).
+    is_half_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
