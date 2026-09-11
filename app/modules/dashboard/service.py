@@ -70,6 +70,11 @@ async def get_today_summary(db: AsyncSession) -> TodayDashboardResponse:
     present_employees = [
         _brief(row) for row in report.employees if row.status in _PRESENT_STATUSES
     ]
+    late_employees = [
+        _brief(row)
+        for row in report.employees
+        if row.status == AttendanceStatus.late.value
+    ]
     on_leave_employees = [
         _brief(row)
         for row in report.employees
@@ -91,6 +96,7 @@ async def get_today_summary(db: AsyncSession) -> TodayDashboardResponse:
         weekend_offs=report.summary.weekend_offs,
         gender=gender,
         present_employees=present_employees,
+        late_employees=late_employees,
         on_leave_employees=on_leave_employees,
         absent_employees=absent_employees,
     )
