@@ -32,5 +32,6 @@ class TodayDashboardResponse(BaseModel):
     gender: GenderCount    # breakdown of employees present today (present + late)
 
     present_employees: List[EmployeeBrief] = []
+    late_employees: List[EmployeeBrief] = []    # subset of present_employees who were late
     on_leave_employees: List[EmployeeBrief] = []
     absent_employees: List[EmployeeBrief] = []  # no leave AND no check-in today
