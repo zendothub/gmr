@@ -27,5 +27,9 @@ async def get_today_dashboard(
       definitions as `GET /employees/attendance/report?period=daily`
     - **gender** — breakdown (male/female/other/unspecified) of employees present
       today (present + late), not the total workforce
+    - **present_employees** / **on_leave_employees** / **absent_employees** —
+      name lists (emp_id, name, gender) for each bucket. `absent` means the
+      employee is on neither a weekly-off nor an approved leave today AND has
+      no camera check-in — it is distinct from `on_leave`.
     """
     return await dashboard_svc.get_today_summary(db)
