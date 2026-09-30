@@ -153,12 +153,15 @@ class Settings(BaseSettings):
     DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 10.0     # ignore brief split glitches
 
     # ------------------------------------------------------------------
-    # Staff detection — auto-classifies frequent visitors so purchase
-    # analytics exclude employees (who generate hundreds of billing events
-    # per shift).  Runs inside the periodic dedup job (every 6 min).
+    # Staff detection — live lazy check after decide_identity (API process).
+    # Face + (consec ≥5 calendar days OR ≥11 days in any 15-day window).
+    # No bulk backfill; in-memory cache empty on restart.
     # ------------------------------------------------------------------
-    STAFF_DURATION_THRESHOLD_SECONDS: int = 1800   # total visible time across all sessions (default 30 min)
-    STAFF_DISTINCT_DAYS_THRESHOLD: int = 3          # appeared on 3+ distinct calendar days
+    STAFF_CONSECUTIVE_DAYS: int = 5
+    STAFF_WINDOW_DAYS: int = 15
+    STAFF_WINDOW_MIN_DAYS: int = 11
+    STAFF_CUSTOMER_RECHECK_HOURS: int = 24
+    STAFF_REQUIRE_FACE: bool = True
 
     # ── Staff reattach (2026-07-10) ─────────────────────────────────────
     # When face match fails (blur/side face) but body strongly matches an is_staff

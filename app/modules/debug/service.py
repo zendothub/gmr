@@ -1,11 +1,14 @@
 """Debug detection service."""
 
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Any
 from uuid import UUID
 
 from sqlalchemy import select, func, or_, String, Date, exists
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# IST timezone (UTC+5:30) — mirrors app/modules/analytics/service.py
+IST = timezone(timedelta(hours=5, minutes=30))
 
 from app.core.db.models.camera import Camera
 from app.core.db.models.tracking import TrackSession
@@ -82,12 +85,47 @@ class DebugService:
         gender: Optional[str] = None,
         is_staff: Optional[bool] = None,
         has_purchase: Optional[bool] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> PaginatedUniquePersonsResponse:
         """Get all unique person identities with basic statistics (paginated)."""
         from app.core.db.models.person import PersonIdentity
         from app.core.db.models.tracking import TrackSession
         from app.core.db.models.billing import BillingInteraction
-        from sqlalchemy import Date, or_, String, func
+        from sqlalchemy import Date, or_, String, func, exists
+
+        # ── IST date-range filter (track-session day based) ─────────────
+        # Persons qualify if ≥1 track session started within the inclusive
+        # IST calendar-day range. EXISTS keeps per-person aggregates
+        # (total_tracks, total_days, purchases) as lifetime values and
+        # avoids join fan-out.
+        seen_subq = None
+        if start_date is not None or end_date is not None:
+            seen_clause = [TrackSession.person_identity_id == PersonIdentity.id]
+            if start_date is not None:
+                ist_start = datetime(
+                    start_date.year, start_date.month, start_date.day,
+                    0, 0, 0, tzinfo=IST,
+                )
+                seen_clause.append(TrackSession.started_at >= ist_start)
+            if end_date is not None:
+                ist_end_exclusive = datetime(
+                    end_date.year, end_date.month, end_date.day,
+                    0, 0, 0, tzinfo=IST,
+                ) + timedelta(days=1)
+                seen_clause.append(TrackSession.started_at < ist_end_exclusive)
+            seen_subq = (
+                select(TrackSession.id)
+                .where(*seen_clause)
+                .correlate(PersonIdentity)
+                .exists()
+            )
+
+        def _apply_seen(stmt):
+            if seen_subq is not None:
+                stmt = stmt.where(seen_subq)
+            return stmt
+
 
         # ── Purchase count subquery ──────────────────────────────────────
         purchase_subq = (
@@ -114,6 +152,7 @@ class DebugService:
             count_stmt = count_stmt.where(PersonIdentity.gender == gender)
         if is_staff is not None:
             count_stmt = count_stmt.where(PersonIdentity.is_staff.is_(is_staff))
+        count_stmt = _apply_seen(count_stmt)
         if has_purchase is not None:
             if has_purchase:
                 # Persons who have at least one BillingInteraction
@@ -153,6 +192,7 @@ class DebugService:
             stmt = stmt.where(PersonIdentity.gender == gender)
         if is_staff is not None:
             stmt = stmt.where(PersonIdentity.is_staff.is_(is_staff))
+        stmt = _apply_seen(stmt)
         if has_purchase is not None:
             if has_purchase:
                 stmt = stmt.where(

@@ -1,117 +1,53 @@
-# ============================
-# Environment / Secrets
-# ============================
+video_record/
+**/__pycache__/
+venv
+.venv
 .env
-.env.local
-.env.*.local
-deployment/.env.production
 
-# ============================
 # Python
-# ============================
 __pycache__/
 *.py[cod]
-*.pyo
-*.egg
 *.egg-info/
-dist/
-build/
-eggs/
-*.so
-.eggs/
-*.manifest
-*.spec
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# ============================
-# Virtual Environment
-# ============================
-.venv/
+# Virtual environments
 venv/
+.venv/
 env/
-.venv
 
-# ============================
-# IDE / Editor
-# ============================
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-.settings/
+# Environment and secrets
+.env
+.env.*
+!.env.example
 
-# ============================
-# OS generated files
-# ============================
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# ============================
-# Docker
-# ============================
-.docker/
-*.pid
-
-# ============================
 # Logs
-# ============================
 *.log
 logs/
 
-# ============================
-# Storage (runtime generated)
-# ============================
-storage/clips/
-storage/crops/
-storage/snapshots/
-storage/reports/
+# ML / AI model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
+*.tflite
 
-# Keep storage/.gitkeep tracked but ignore everything else
-!storage/.gitkeep
+# Generated runtime data
+runtime/device_info.json
+*.pid
+*.tmp
 
-# ============================
-# Models (large binary files)
-# ============================
-models/*
-!models/.gitkeep
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
 
-# ============================
-# Testing / Coverage
-# ============================
-.coverage
-.coverage.*
-htmlcov/
-.pytest_cache/
-.tox/
-.mypy_cache/
-.ruff_cache/
-.dmypy.json
-dmypy.json
-
-# ============================
-# Jupyter Notebooks
-# ============================
-.ipynb_checkpoints/
-*.ipynb
-
-# ============================
-# Alembic
-# ============================
-alembic/versions/*.pyc
-
-# ============================
-# Certificates / Keys
-# ============================
-*.pem
-*.key
-*.crt
-*.cerstorage/
-runtime/
+# Local video recordings
+video_record/
+models/
