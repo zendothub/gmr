@@ -1,6 +1,6 @@
 """Debug detection API routes."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 from uuid import UUID
 
@@ -46,6 +46,12 @@ async def get_unique_persons(
     gender: Optional[str] = Query(None, pattern="^(M|F)$"),
     is_staff: Optional[bool] = Query(None),
     has_purchase: Optional[bool] = Query(None),
+    start_date: Optional[date] = Query(
+        None, description="IST day; persons with a track session starting on/after this day"
+    ),
+    end_date: Optional[date] = Query(
+        None, description="IST day (inclusive); persons with a track session starting on/before this day"
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -56,10 +62,13 @@ async def get_unique_persons(
     - **gender**: filter by gender ("M" or "F"), default shows all
     - **is_staff**: filter by staff status (True/False), default shows all
     - **has_purchase**: show only persons with (True) or without (False) purchase events
+    - **start_date** / **end_date**: IST calendar days (inclusive); keep only persons
+      with at least one track session started within the range
     """
     return await DebugService.get_unique_persons(
         db, page=page, size=size, search=search, gender=gender,
         is_staff=is_staff, has_purchase=has_purchase,
+        start_date=start_date, end_date=end_date,
     )
 
 

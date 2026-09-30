@@ -564,41 +564,6 @@ async def deduplicate_persons():
             if swept > 0:
                 logger.info(f"MinIO sweep: removed {swept} unreferenced crop file(s).")
 
-            # ── Step 7: classify staff ────────────────────────────────────────
-            # A person is flagged as staff if their TOTAL visible session time
-            # across all cameras exceeds the configurable duration threshold
-            # (default 30 min) OR if they have appeared on 3+ distinct days.
-            # Staff persons are excluded from all purchase/billing analytics.
-            _dur = settings.STAFF_DURATION_THRESHOLD_SECONDS
-            _days = settings.STAFF_DISTINCT_DAYS_THRESHOLD
-            promote_result = await db.execute(text("""
-                UPDATE person_identities SET is_staff = TRUE WHERE is_staff = FALSE AND id IN (
-                    SELECT pi.id FROM person_identities pi
-                    LEFT JOIN track_sessions ts ON ts.person_identity_id = pi.id
-                    GROUP BY pi.id
-                    HAVING COALESCE(SUM(EXTRACT(epoch FROM COALESCE(ts.ended_at, ts.last_seen_at) - ts.started_at)), 0) > :dur
-                        OR COUNT(DISTINCT DATE(ts.started_at)) >= :days
-                )
-            """), {"dur": _dur, "days": _days})
-            # Demote persons who no longer meet criteria (e.g., after data reset)
-            # BUT only if they have NO active tracks — staff might be mid-shift.
-            demote_result = await db.execute(text("""
-                UPDATE person_identities SET is_staff = FALSE WHERE is_staff = TRUE AND id NOT IN (
-                    SELECT pi.id FROM person_identities pi
-                    LEFT JOIN track_sessions ts ON ts.person_identity_id = pi.id
-                    GROUP BY pi.id
-                    HAVING COALESCE(SUM(EXTRACT(epoch FROM COALESCE(ts.ended_at, ts.last_seen_at) - ts.started_at)), 0) > :dur
-                        OR COUNT(DISTINCT DATE(ts.started_at)) >= :days
-                )
-            """), {"dur": _dur, "days": _days})
-            await db.commit()
-            if promote_result.rowcount or demote_result.rowcount:
-                logger.info(
-                    f"Staff classification: +{promote_result.rowcount} promoted, "
-                    f"-{demote_result.rowcount} demoted "
-                    f"(dur>{_dur}s OR days>={_days})"
-                )
-
         except Exception as e:
             await db.rollback()
             logger.error(f"Dedup job failed: {e}")

@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** August 25, 2026 (camera full-res recording to Desktop/HDD; event snapshots off)  
+> **Last updated:** September 1, 2026 (staff rule: consec-5 or 70%/15d window; lazy live revalidation)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -90,8 +90,10 @@ Frame (2880×1620)
 | `FACE_MIN_EYE_SPREAD` | `0.25` | Frontal gate | 3/4-view accepted, profile rejected |
 | `FACE_IDENTITY_MIN_SCORE` | `0.60` | Person creation gate | Min face_quality (det_score × frontality) |
 | `FACE_IDENTITY_MIN_DETECTIONS` | `2` | Person creation gate | Good face count before identity created |
-| `STAFF_DURATION_THRESHOLD_SECONDS` | `1800` | Staff detection | Total visible session time >30 min |
-| `STAFF_DISTINCT_DAYS_THRESHOLD` | `3` | Staff detection | Appeared on 3+ distinct calendar days |
+| `STAFF_CONSECUTIVE_DAYS` | `5` | Staff detection | Max consecutive IST calendar days with a track |
+| `STAFF_WINDOW_DAYS` / `STAFF_WINDOW_MIN_DAYS` | `15` / `11` | Staff detection | 70% presence in any 15-day window (≥11 days) |
+| `STAFF_CUSTOMER_RECHECK_HOURS` | `24` | Staff detection | Customers rechecked at most once per 24h if seen |
+| `STAFF_REQUIRE_FACE` | `True` | Staff detection | No staff without a stored face embedding |
 | `MAX_FACE_EMBEDDINGS_PER_PERSON` | `5` | Face storage cap | Pruned when exceeded |
 | `MAX_EMBEDDINGS_PER_PERSON` (body) | `10` | Body storage cap | Pruned when exceeded |
 | `BODY_ONLY_CONFIDENCE_LIMIT` | `0.95` | Body-only match confidence | Body-only matches demoted to non-confident |
@@ -157,18 +159,24 @@ Frame N+4 (window fires):
 
 ## Staff Detection & Purchase Dedup
 
-**Staff auto-classification** (runs every 10 min in dedup job):
+**Staff auto-classification** (live, after `decide_identity` in the API/camera process — NOT the dedup job):
 - `PersonIdentity.is_staff` boolean, indexed
-- Duration > 30 min OR 3+ distinct days → promoted to staff
-- If BOTH signals fall below → demoted
+- Face required AND (consecutive ≥5 IST calendar days OR ≥11 days present in any 15-day window)
+- Lifetime 30 min / any-3-days removed (false merges accumulated 30 min)
+- No bulk backfill. Old `is_staff` rows revalidated lazily when that person is seen
+- In-memory cache (empty on every API restart, then refills):
+  - confirmed staff: never recheck this process life
+  - customers: skip 24h after a failed check
+  - fail on current staff → demote to customer
+  - pass on current customer → promote, then confirmed
 
-**Periodic dedup job** (every 10 min, in-process via APScheduler):
+**Periodic dedup job** (every 6 min, `retail-ai-worker`):
 1. Merge duplicate persons (face sim ≥ 0.40, union-find for connected components)
 2. Clean contaminated face embeddings (remove faces with sim < 0.35 to cluster)
-  3. Clean contaminated body embeddings (iterative median-based outlier removal, 0.50 threshold)
+3. Clean contaminated body embeddings (iterative median-based outlier removal, 0.50 threshold)
 4. Sweep orphaned MinIO crops
-5. Classify staff (duration + distinct days)
 - Steps 2-3 run numpy in `asyncio.to_thread()` to avoid blocking the event loop at 1k+ persons
+- Staff classification is NOT in this job
 
 **Face re-extraction / deletion** (every 20 min, SEPARATE PROCESS via systemd timer):
 - For persons left with 0 face embeddings after contamination cleanup:
@@ -451,6 +459,9 @@ All three share PostgreSQL + MinIO. The worker process handles the heavy dedup/s
 ---
 ## Current State (as of last update)
 
+- **FIXED: last_seen_at counting bug (2026-09-21)** — Person-based analytics previously keyed on `PersonIdentity.last_seen_at`, a moving attribute overwritten on every repeat visit: a Sep-1 visitor who returned Sep-10 was retroactively REMOVED from Sep-1 counts and re-attributed (this is why past-day counts changed and the accuracy table showed week-1 under-counts). All person-based counts switched to **"has ≥1 track session started within the IST window"** (track-start / first-seen semantics — same methodology as the debug date filter and the accuracy tables). Changed sites in `app/modules/analytics/service.py`: `get_dashboard_summary` (unique_persons + demographics), `get_demographics_table`, `get_dashboard_v2` (footfall `_ff_q`, demographics, Footfall-Over-Time + Gender-Trend hourly buckets), `get_analytics_metrics` (`_unique_persons_q`, hourly/daily slot maps, per-camera breakdown → track-based, period comparison, purchase-tab conversion denominator). Bucketing via `_ist_slot_expr()` = `date_trunc(slot, timezone('Asia/Kolkata', started_at))`. Event-based metrics (entry/exit, billing, dwell, zones) were already correct and unchanged. Migration `0009` adds `track_sessions(started_at)` index. Verified: Sep-14 summary unique=195 (incl. staff, grown slightly since Sep-16 snapshot due to dedup track re-attribution), footfall 184 = gender sum 141+43+0 ✓. **API restart required.**
+- **Debug date filter (2026-09-17):** `GET /api/v2/debug/unique-persons` accepts optional `start_date`/`end_date` (IST calendar days, inclusive). Semantics: person qualifies if ≥1 track session STARTED within the IST day window (first-seen based — matches the store-reported accuracy methodology; NOT `last_seen_at`-based like dashboard footfall). Implemented as EXISTS subquery with explicit `.correlate(PersonIdentity)` (auto-correlation bug: with the outer `outerjoin(TrackSession)`, TrackSession was stripped from the EXISTS inner FROM → "no FROM clauses" error). Aggregates (total_tracks/days/purchases) stay lifetime values. Frontend: From/To date inputs on Debug → Unique Persons tab + Clear button. orval client regenerated from spec (old `debug/track-sessions.ts` + `debug/audit-events.ts` merged into `debug/debug.ts`; `TError` now `HTTPValidationError` on 422-declaring endpoints → `errMessage()` helper in `_app.debug.tsx`). Validated: 01/09 → 187, 01–15/09 → 1824, from-14/09 → 705 (matches raw SQL exactly). **Note:** API restart required to serve the new params.
+- **Accuracy audit (2026-09-17):** System "unique persons per IST day (track-start)" vs store-reported+60 staff, Sep 1–15 2026: week 1 within ±21% (mostly under-count), week 2 persistent over-count +26% to +39% (growing) → suspected identity fragmentation / staff misclassification. Under investigation.
 - **Gender:** SigLIP2 face-only, 7+7 prompts, `SIGLIP2_GENDER_MARGIN_DELTA=0.5`, `SIGLIP2_USE_BODY_FOR_GENDER=False`. Track mean margin across faces → gender. Dedup merge still re-votes person gender from track-level genders.
 - **Age:** InsightFace buffalo_l `genderage` (modules: detection+recognition+genderage); track `age_samples` → median. IF under-reports true young children (often 22–28); accepted limitation for now (no FairFace / geometry child gate without recalibration).
 - **Backfill (applied 2026-07-11):** `danger/fix_demographics_oneshot.py` — re-aged all face IDs via IF median; set 8 known F→M ids to F. Dry-run default; `--apply` writes.

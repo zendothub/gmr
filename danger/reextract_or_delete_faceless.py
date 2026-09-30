@@ -21,6 +21,7 @@ Usage:
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 import numpy as np
 from sqlalchemy import text
 from loguru import logger
@@ -124,7 +125,10 @@ async def run():
                             embedding=emb.tolist(),
                             face_score=result.face_quality,
                             face_crop_path=None,
-                            captured_at=crop_row[0],
+                            # BUG FIX (2026-09-29): was crop_row[0] — the track UUID
+                            # string, not a timestamp — PendingRollbackError killed
+                            # every run. Use the re-extraction moment instead.
+                            captured_at=datetime.now(timezone.utc),
                         )
                         db.add(face_emb)
                         await db.commit()
