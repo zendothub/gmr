@@ -59,6 +59,8 @@ class CameraResponse(BaseModel):
     id: UUID
     name: str
     rtsp_url: str
+    mac_address: Optional[str] = None
+    onvif_id: Optional[str] = None
     area_id: Optional[UUID] = None
     store_id: Optional[UUID] = None
     store_name: Optional[str] = None
@@ -119,6 +121,17 @@ class CameraCreateV2(BaseModel):
     rtsp_url: str
     store_id: UUID = Field(..., description="Store chosen from dropdown — camera is linked to this store")
     zone_id: Optional[UUID] = Field(None, description="Zone / position within the store (Entry, Checkout, Aisle 3, …)")
+    mac_address: Optional[str] = Field(
+        None,
+        description="Camera's physical MAC address (e.g. AA:BB:CC:DD:EE:FF). "
+                    "Used to auto-recover rtsp_url if the camera's IP changes (DHCP renewal, power cycle).",
+    )
+    onvif_id: Optional[str] = Field(
+        None,
+        description="Camera's ONVIF device endpoint UUID. Fallback identity used for IP "
+                    "auto-recovery when the camera's MAC has changed (Wi-Fi privacy addressing) "
+                    "- auto-detected via WS-Discovery if not provided.",
+    )
     skip_rtsp_test: bool = Field(default=False, description="Skip the RTSP connectivity probe (use when camera is offline)")
 
 
@@ -128,6 +141,14 @@ class CameraUpdateV2(BaseModel):
     rtsp_url: Optional[str] = None
     store_id: Optional[UUID] = Field(None, description="Re-link camera to a different store")
     zone_id: Optional[UUID] = Field(None, description="Zone / position within the store (Entry, Checkout, Aisle 3, …)")
+    mac_address: Optional[str] = Field(
+        None,
+        description="Camera's physical MAC address — used for automatic IP recovery.",
+    )
+    onvif_id: Optional[str] = Field(
+        None,
+        description="Camera's ONVIF device endpoint UUID — fallback IP-recovery identity.",
+    )
     is_active: Optional[bool] = None
     burnin_enabled: Optional[bool] = None
     skip_rtsp_test: bool = Field(default=True, description="Skip the RTSP connectivity probe on update (use when camera is offline)")

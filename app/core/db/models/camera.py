@@ -63,6 +63,17 @@ class Camera(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Source RTSP the backend pulls from (camera/NVR).
     rtsp_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    # Physical NIC identity, stable across DHCP lease/IP changes. Used to
+    # re-resolve rtsp_url automatically when the camera's IP drifts
+    # (power cycle, Ethernet renegotiation, router reboot, etc.) - see
+    # app/modules/cameras/discovery.py.
+    mac_address: Mapped[Optional[str]] = mapped_column(String(17), nullable=True, index=True)
+    # ONVIF device endpoint UUID (urn:uuid:... from WS-Discovery), assigned at
+    # the camera's firmware/hardware level - unlike mac_address, this survives
+    # a Wi-Fi camera rotating its MAC for privacy (MAC randomization). Used as
+    # a fallback identity when MAC-based re-discovery finds nothing; only
+    # populated for cameras that actually speak ONVIF.
+    onvif_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     # MediaMTX path the backend republishes into; the browser pulls the feed back
     # (WebRTC/HLS) from this path. Stable & deterministic per camera id.
     stream_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

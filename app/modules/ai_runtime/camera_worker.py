@@ -54,7 +54,17 @@ class CameraWorker:
 
         # Components — YOLO detector is per-camera (not shared) to isolate ByteTrack state
         rotation = camera_config.get("frame_rotation")
-        self.frame_buffer = LatestFrameBuffer(camera_config["rtsp_url"], frame_rotation=rotation)
+        # Capture the loop we're constructed on so the frame buffer's capture
+        # thread (no event loop of its own) can safely hand a DB write back
+        # to it via run_coroutine_threadsafe when it auto-recovers an IP change.
+        self._loop = asyncio.get_event_loop()
+        self.frame_buffer = LatestFrameBuffer(
+            camera_config["rtsp_url"],
+            frame_rotation=rotation,
+            mac_address=camera_config.get("mac_address"),
+            onvif_id=camera_config.get("onvif_id"),
+            on_ip_resolved=self._on_ip_resolved,
+        )
         
         self.detector = get_camera_detector(
             camera_id=str(self.camera_id),
@@ -208,6 +218,42 @@ class CameraWorker:
                 logger.debug(f"Error destroying GUI window: {e}")
 
         logger.info(f"Camera worker stopped: {self.camera_id}")
+
+    # ------------------------------------------------------------------
+    # IP auto-recovery (camera's MAC found at a new IP after DHCP/outage)
+    # ------------------------------------------------------------------
+
+    def _on_ip_resolved(self, new_rtsp_url: str) -> None:
+        """Called from the frame buffer's capture thread (no event loop) when
+        it re-locates this camera's MAC at a new IP. Hands the DB write back
+        to this worker's own event loop via run_coroutine_threadsafe.
+        """
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._persist_resolved_rtsp_url(new_rtsp_url), self._loop
+            )
+        except Exception as e:
+            logger.error(f"Failed to schedule rtsp_url persist for camera {self.camera_id}: {e}")
+
+    async def _persist_resolved_rtsp_url(self, new_rtsp_url: str) -> None:
+        """Persist the auto-recovered rtsp_url so it survives a worker restart.
+
+        Only rtsp_url changes - the camera row's id/zones/store stay exactly
+        as they were, so the camera's zone assignment is never affected.
+        """
+        from sqlalchemy import update
+        from app.core.db.models.camera import Camera
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    update(Camera).where(Camera.id == self.camera_id).values(rtsp_url=new_rtsp_url)
+                )
+                await db.commit()
+            self.camera_config["rtsp_url"] = new_rtsp_url
+            logger.info(f"Camera {self.camera_id}: rtsp_url auto-updated after IP change -> {new_rtsp_url}")
+        except Exception as e:
+            logger.error(f"Failed to persist auto-recovered rtsp_url for camera {self.camera_id}: {e}")
 
     def apply_runtime_config(self, runtime_config: dict):
         """Apply (or re-apply) runtime configuration loaded from PostgreSQL."""

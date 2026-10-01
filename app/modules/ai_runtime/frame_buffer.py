@@ -14,11 +14,13 @@ os.environ["OPENCV_FFMPEG_LOG_LEVEL"] = "-8"
 
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import cv2
 import numpy as np
 from loguru import logger
+
+from app.modules.cameras import discovery
 
 
 class LatestFrameBuffer:
@@ -30,11 +32,26 @@ class LatestFrameBuffer:
         reconnect_delay: float = 5.0,
         max_reconnect_delay: float = 60.0,
         frame_rotation: Optional[int] = None,
+        mac_address: Optional[str] = None,
+        onvif_id: Optional[str] = None,
+        on_ip_resolved: Optional[Callable[[str], None]] = None,
     ):
         self.rtsp_url = rtsp_url
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
         self.frame_rotation = frame_rotation  # None, 90, 180, 270 (degrees)
+        # Camera's physical MAC - stable across DHCP/IP changes. When set, a
+        # reconnect failure triggers a subnet scan to re-locate the camera by
+        # MAC instead of endlessly retrying a dead IP. `on_ip_resolved` is
+        # called (from this capture thread) with the corrected rtsp_url so the
+        # caller can persist it (e.g. back to the DB) - this class already
+        # keeps using the corrected URL itself regardless of the callback.
+        self.mac_address = mac_address
+        # ONVIF device endpoint UUID - fallback identity for when the MAC
+        # itself has changed (a Wi-Fi camera rotating its MAC for privacy).
+        # Tried only after a MAC-based search comes up empty.
+        self.onvif_id = onvif_id
+        self.on_ip_resolved = on_ip_resolved
 
         self._frame: Optional[np.ndarray] = None
         self._frame_ts: float = 0.0
@@ -132,6 +149,10 @@ class LatestFrameBuffer:
                 self.last_error = str(e)
                 self.reconnect_count += 1
                 logger.warning(f"RTSP capture error ({self.rtsp_url}): {e}")
+                if self._try_resolve_new_ip():
+                    # Camera found at a new IP - retry immediately instead of
+                    # riding out whatever backoff had already built up.
+                    current_delay = self.reconnect_delay
             finally:
                 if cap is not None:
                     cap.release()
@@ -141,3 +162,72 @@ class LatestFrameBuffer:
                 self._stop_event.wait(current_delay)
                 # Exponential backoff to be gentle on flaky NVRs/cameras
                 current_delay = min(current_delay * 2, self.max_reconnect_delay)
+
+    def _find_new_ip(self, current_host: str) -> Optional[str]:
+        """Try to locate the camera's current IP: MAC-based search first
+        (fast, works for any wired camera), then - only if that comes up
+        empty and an ONVIF id is on file - a WS-Discovery probe. The ONVIF
+        fallback exists specifically for the case MAC-based search can't
+        handle at all: a Wi-Fi camera that rotates its MAC on every
+        reconnect (privacy addressing) still keeps the same ONVIF endpoint
+        UUID, assigned at the firmware/hardware level.
+        """
+        if self.mac_address:
+            subnet = discovery.local_subnet_for_ip(current_host)
+            try:
+                new_ip = discovery.resolve_ip_by_mac_sync(self.mac_address, subnet)
+            except Exception as e:
+                logger.error(f"MAC-based IP re-discovery failed for {self.rtsp_url}: {e}")
+                new_ip = None
+            if new_ip:
+                return new_ip
+
+        if self.onvif_id:
+            try:
+                new_ip = discovery.resolve_ip_by_onvif_id_sync(self.onvif_id)
+            except Exception as e:
+                logger.error(f"ONVIF-based IP re-discovery failed for {self.rtsp_url}: {e}")
+                new_ip = None
+            if new_ip:
+                logger.info(
+                    f"Camera found via ONVIF fallback (MAC search found nothing - "
+                    f"MAC may have rotated): {current_host} -> {new_ip}"
+                )
+                return new_ip
+
+        return None
+
+    def _try_resolve_new_ip(self) -> bool:
+        """On stream failure, check whether the camera moved to a new IP.
+
+        Runs synchronously - this executes on the dedicated capture thread,
+        never the asyncio event loop, so a plain blocking call is safe (and
+        required: this method is called on every failed reconnect, and
+        creating a fresh asyncio event loop per call here used to leak file
+        descriptors on macOS until the whole process ran out - see
+        resolve_ip_by_mac_sync). If the camera is found at a new IP,
+        rtsp_url is patched in place so the next connect attempt uses the
+        corrected address. If it isn't found anywhere (by MAC or ONVIF), the
+        camera is genuinely offline (not just IP drift) and normal
+        backoff/retry proceeds unchanged - this never touches which
+        zone/location the camera row represents, only how we reach it.
+        """
+        if not self.mac_address and not self.onvif_id:
+            return False
+        current_host = discovery.extract_host(self.rtsp_url)
+        if not current_host:
+            return False
+
+        new_ip = self._find_new_ip(current_host)
+        if not new_ip or new_ip == current_host:
+            return False
+
+        new_url = discovery.rebuild_rtsp_url(self.rtsp_url, new_ip)
+        logger.warning(f"Camera IP changed ({current_host} -> {new_ip}); reconnecting with updated URL.")
+        self.rtsp_url = new_url
+        if self.on_ip_resolved:
+            try:
+                self.on_ip_resolved(new_url)
+            except Exception as e:
+                logger.error(f"on_ip_resolved callback failed: {e}")
+        return True

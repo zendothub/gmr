@@ -47,6 +47,8 @@ async def load_camera_config(db: AsyncSession, camera_id: uuid.UUID) -> Optional
         "id": camera.id,
         "name": camera.name,
         "rtsp_url": camera.rtsp_url,
+        "mac_address": camera.mac_address,
+        "onvif_id": camera.onvif_id,
         "status": _enum_value(camera.status),
         "fps_target": camera.fps_target,
         "resolution": camera.resolution,

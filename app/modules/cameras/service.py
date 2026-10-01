@@ -17,6 +17,7 @@ from app.modules.cameras.schemas import (
 from app.modules.streaming.mediamtx import MediaMTXManager, camera_path
 from app.modules.streaming.manager import StreamManager
 from app.modules.rule_engine.config_loader import load_camera_config
+from app.modules.cameras import discovery
 import anyio
 
 
@@ -102,6 +103,39 @@ class CameraService:
                 cap.release()
 
     @staticmethod
+    async def _auto_resolve_mac(rtsp_url: str) -> Optional[str]:
+        """Best-effort: derive the camera's MAC from the IP already in its
+        rtsp_url, so mac_address gets populated without the installer typing
+        it in separately. Never raises - a lookup failure just means the
+        camera won't have IP auto-recovery until its MAC is set some other way.
+        """
+        host = discovery.extract_host(rtsp_url)
+        if not host:
+            return None
+        try:
+            return await discovery.resolve_mac_by_ip(host)
+        except Exception as e:
+            logger.warning(f"MAC auto-resolve failed for {rtsp_url}: {e}")
+            return None
+
+    @staticmethod
+    async def _auto_resolve_onvif_id(rtsp_url: str) -> Optional[str]:
+        """Best-effort: derive the camera's ONVIF device UUID via a
+        WS-Discovery probe, matching on the IP already in its rtsp_url. Only
+        cameras that actually speak ONVIF will have one - most commercial IP
+        cameras do. Never raises; a miss just means no ONVIF fallback for
+        that camera if its MAC ever rotates.
+        """
+        host = discovery.extract_host(rtsp_url)
+        if not host:
+            return None
+        try:
+            return await discovery.resolve_onvif_id_by_ip(host)
+        except Exception as e:
+            logger.warning(f"ONVIF id auto-resolve failed for {rtsp_url}: {e}")
+            return None
+
+    @staticmethod
     async def create_camera_v2(db: AsyncSession, data: "CameraCreateV2") -> Camera:
         """Create a new camera linked to a store (V2).
 
@@ -130,6 +164,20 @@ class CameraService:
         }
         if data.zone_id:
             camera_kwargs["zone_id"] = data.zone_id
+        if data.mac_address:
+            camera_kwargs["mac_address"] = data.mac_address
+        else:
+            auto_mac = await CameraService._auto_resolve_mac(data.rtsp_url)
+            if auto_mac:
+                camera_kwargs["mac_address"] = auto_mac
+                logger.info(f"Camera MAC auto-resolved: {auto_mac} for {data.rtsp_url}")
+        if data.onvif_id:
+            camera_kwargs["onvif_id"] = data.onvif_id
+        else:
+            auto_onvif = await CameraService._auto_resolve_onvif_id(data.rtsp_url)
+            if auto_onvif:
+                camera_kwargs["onvif_id"] = auto_onvif
+                logger.info(f"Camera ONVIF id auto-resolved: {auto_onvif} for {data.rtsp_url}")
         if resolution:
             camera_kwargs["resolution"] = resolution
         camera = Camera(**camera_kwargs)
@@ -190,6 +238,14 @@ class CameraService:
         # Auto-detected resolution from RTSP probe (overrides model default).
         if resolution:
             camera_kwargs["resolution"] = resolution
+        auto_mac = await CameraService._auto_resolve_mac(data.rtsp_url)
+        if auto_mac:
+            camera_kwargs["mac_address"] = auto_mac
+            logger.info(f"Camera MAC auto-resolved: {auto_mac} for {data.rtsp_url}")
+        auto_onvif = await CameraService._auto_resolve_onvif_id(data.rtsp_url)
+        if auto_onvif:
+            camera_kwargs["onvif_id"] = auto_onvif
+            logger.info(f"Camera ONVIF id auto-resolved: {auto_onvif} for {data.rtsp_url}")
         camera = Camera(**camera_kwargs)
 
         db.add(camera)

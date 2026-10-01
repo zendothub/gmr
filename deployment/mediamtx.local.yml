@@ -13,3 +13,9 @@ authInternalUsers:
       - action: api
       - action: metrics
       - action: pprof
+
+# Without this, MediaMTX rejects any path name it hasn't seen explicitly
+# listed here ("path '...' is not configured") - camera paths are named
+# dynamically per camera id (cam_<uuid>), so a wildcard is required.
+paths:
+  all_others:
