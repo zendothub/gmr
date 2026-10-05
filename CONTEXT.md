@@ -159,7 +159,16 @@ Frame N+4 (window fires):
 
 ## Staff Detection & Purchase Dedup
 
-**Staff auto-classification** (live, after `decide_identity` in the API/camera process — NOT the dedup job):
+**Staff registration (NEW 2026-10-05 — replaces auto-classification):**
+- `POST /api/staff/register` (multipart: `images` 1–5 photos, optional `name`, optional `person_identity_id`). Code: `app/modules/staff/`.
+- One face per photo (InsightFace `detect_all_faces`, largest face; reject if 2nd face ≥50% area or det_score < `FACE_IDENTITY_MIN_SCORE`). Multiple photos must agree (sim ≥ `FACE_CONTAMINATION_THRESHOLD`).
+- Global face search: best sim ≥ `FACE_MATCH_THRESHOLD` (0.40) → existing identity marked `is_staff` (history kept, action=`linked`); else new identity `is_staff=TRUE` (action=`created`). Registration faces stored in `person_face_embeddings` (camera_id NULL, crops under MinIO `staff/` prefix, outside `crops/` sweep). Takes `IDENTITY_ADVISORY_LOCK_KEY`.
+- `metadata_json.staff_registered=true` marks registered staff. Dedup winner prefers registered staff; merge propagates `is_staff` from loser to winner.
+- `GET /api/staff` lists staff; `DELETE /api/staff/{id}` demotes to customer (identity kept).
+- Live pipeline unchanged: face search in `decide_identity` is global (no time window), so CCTV tracks match the registered identity → excluded from analytics, eligible for staff reattach.
+- **Registration faces are pinned** (`person_face_embeddings.is_registration`, migration `0010_staff_reg`): excluded from the `MAX_FACE_EMBEDDINGS_PER_PERSON` cap (live `_prune_face_embeddings` + dedup absorb prune), never removed by `_clean_contaminated_face_embeddings` / `danger/clean_contaminated_embeddings.py` (they still vote in medians), always moved (never dropped) in `_absorb_face_embeddings`. Registration set itself capped at 5 (best face_score). So a staff identity = up to 5 registration faces + up to 5 CCTV faces. Why: the registration photo is the only verified sample; phone-vs-CCTV sim can be <0.35 so the median cleanup would otherwise delete it.
+
+**Staff auto-classification — DISABLED 2026-10-05** (code kept in `staff_classifier.py`; `schedule_staff_check` calls commented out in `camera_worker.py`). Previous behaviour, live, after `decide_identity` in the API/camera process — NOT the dedup job:
 - `PersonIdentity.is_staff` boolean, indexed
 - Face required AND (consecutive ≥5 IST calendar days OR ≥11 days present in any 15-day window)
 - Lifetime 30 min / any-3-days removed (false merges accumulated 30 min)
@@ -222,7 +231,7 @@ Frame N+4 (window fires):
 | Rule engine | `rule_evaluator.py`, `zone_event_detector.py` |
 | Analytics queries | `analytics/service.py` |
 | Background jobs | `jobs/tasks.py`, `jobs/scheduler.py` |
-| Staff detection | `jobs/tasks.py` (deduplicate_persons) |
+| Staff registration | `modules/staff/` (auto classifier `reid/staff_classifier.py` disabled) |
 | MinIO sweep | `jobs/tasks.py` (_sweep_orphaned_crops) |
 | Crop helpers | `image_utils.py` |
 | Config/Thresholds | `config.py` |

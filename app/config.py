@@ -332,6 +332,19 @@ class Settings(BaseSettings):
         "https://retaileye.bluecloudsoftech.com"
     )
 
+    # Anti-spoofing (liveness check on face crops) — not yet wired into any
+    # module; staged here so .env can carry these ahead of that work.
+    ANTISPOOF_ENABLED: bool = True
+    ANTISPOOF_THRESHOLD: float = 0.70
+    ANTISPOOF_AUDIT_ONLY: bool = False
+    ANTISPOOF_REQUIRE_FRAME_COUNT: int = 3
+
+    # Attendance mode — not yet wired into any module; staged here so .env
+    # can carry these ahead of that work.
+    ATTENDANCE_MODE: bool = True
+    ATTENDANCE_FACE_MIN_SCORE: float = 0.50
+    ATTENDANCE_MATCH_COOLDOWN_SECONDS: float = 30.0
+
     @property
     def yolo_allowed_classes_list(self) -> List[int]:
         return [int(c.strip()) for c in self.YOLO_ALLOWED_CLASSES.split(",") if c.strip()]

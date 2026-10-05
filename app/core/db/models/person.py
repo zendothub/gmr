@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, func
+from sqlalchemy import Boolean, String, Integer, Float, ForeignKey, DateTime, func, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
@@ -60,6 +60,11 @@ class PersonFaceEmbedding(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     captured_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Staff registration photo (POST /api/staff/register). Pinned: never pruned by the
+    # per-person face cap and never removed by contamination cleanup / dedup absorb.
+    is_registration: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
     )
 
     person_identity: Mapped["PersonIdentity"] = relationship(

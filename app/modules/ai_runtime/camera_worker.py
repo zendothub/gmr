@@ -29,7 +29,9 @@ from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.siglip2_analyzer import get_shared_siglip2
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
-from app.modules.reid.staff_classifier import schedule_staff_check
+# Auto staff classification (consec-5 / 11-of-15 days) DISABLED — staff are now
+# registered explicitly via POST /api/staff/register (app/modules/staff/router.py).
+# from app.modules.reid.staff_classifier import schedule_staff_check
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
 from app.utils.image_utils import extract_crop, save_image, save_image_async, resize_pad_square
@@ -901,7 +903,8 @@ class CameraWorker:
                     close_resolved = True
                     if is_new:
                         self.temporary_person_ids.add(person_id)
-                    schedule_staff_check(person_id)
+                    # Auto staff classification disabled — see staff registration API.
+                    # schedule_staff_check(person_id)
 
                     # Store ALL accumulated good faces (skip the best, already stored by decide_identity)
                     person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
@@ -1649,8 +1652,9 @@ class CameraWorker:
                 track.reid_confident = is_confident
                 track.reid_resolved = True
                 track.reid_attempted = True
-                if person_id is not None:
-                    schedule_staff_check(person_id)
+                # Auto staff classification disabled — see staff registration API.
+                # if person_id is not None:
+                #     schedule_staff_check(person_id)
 
                 # Store ALL accumulated good faces (different angles) once identity is resolved.
                 # decide_identity already stored the best face, so skip the one that matches it

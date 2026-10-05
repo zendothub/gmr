@@ -344,7 +344,8 @@ async def deduplicate_persons():
                 id_list = list(all_ids)
                 meta_result = await db.execute(text("""
                     SELECT id::text, best_face_score, first_seen_at, last_seen_at,
-                           visit_count, face_crop_path
+                           visit_count, face_crop_path, is_staff,
+                           COALESCE((metadata_json->>'staff_registered')::boolean, FALSE)
                     FROM   person_identities
                     WHERE  id::text = ANY(:ids)
                 """), {"ids": id_list})
@@ -355,6 +356,8 @@ async def deduplicate_persons():
                         "last_seen": r[3],
                         "visits": r[4] or 0,
                         "face_crop": r[5],
+                        "is_staff": bool(r[6]),
+                        "staff_registered": bool(r[7]),
                     }
                     for r in meta_result.fetchall()
                 }
@@ -381,7 +384,9 @@ async def deduplicate_persons():
                     root = find(pid)
                     components.setdefault(root, []).append(pid)
 
-                # For each component pick the winner = highest face score, tie-break by earliest first_seen
+                # For each component pick the winner = registered staff first (keeps the
+                # staff registration identity/label), then highest face score, tie-break
+                # by earliest first_seen
                 merges: list[tuple[str, str]] = []  # (winner_id, loser_id)
                 for root, members in components.items():
                     if len(members) < 2:
@@ -389,6 +394,7 @@ async def deduplicate_persons():
                     winner = max(
                         members,
                         key=lambda pid: (
+                            meta.get(pid, {}).get("staff_registered", False),
                             meta.get(pid, {}).get("score", 0.0),
                             -(meta.get(pid, {}).get("first_seen") or utc_now()).timestamp(),
                         )
@@ -426,6 +432,10 @@ async def deduplicate_persons():
 
                                 update_parts = ["visit_count = visit_count + :extra_visits"]
                                 params: dict = {"extra_visits": extra_visits, "winner": winner_id}
+
+                                # Staff is now set only by registration — never lose the flag in a merge.
+                                if loser_meta.get("is_staff") and not winner_meta.get("is_staff"):
+                                    update_parts.append("is_staff = TRUE")
 
                                 if loser_first and winner_first and loser_first < winner_first:
                                     update_parts.append("first_seen_at = :loser_first")
@@ -1532,7 +1542,7 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
     person_data = []
     for pid in person_ids:
         r2 = await db.execute(text("""
-            SELECT id, embedding, face_score FROM person_face_embeddings
+            SELECT id, embedding, face_score, is_registration FROM person_face_embeddings
             WHERE person_identity_id = :pid AND embedding IS NOT NULL
             ORDER BY face_score DESC
         """), {"pid": str(pid)})
@@ -1546,14 +1556,16 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
                 embs.append(np.array(eval(row[1]), dtype=np.float32))
             else:
                 embs.append(np.array(row[1], dtype=np.float32))
-        person_data.append((str(pid), ids, embs))
+        # Staff registration faces are pinned: they vote in the medians but are never removed
+        pinned = {i for i, row in enumerate(rows) if row[3]}
+        person_data.append((str(pid), ids, embs, pinned))
 
     threshold = settings.FACE_CONTAMINATION_THRESHOLD
 
     # Run the numpy-heavy iterative median computation in a thread
     def _compute_face_removals():
         results = []
-        for pid, ids, embs in person_data:
+        for pid, ids, embs, pinned in person_data:
             N = len(embs)
             # Normalize each embedding (InsightFace embeddings are NOT L2-normalized)
             for emb in embs:
@@ -1567,6 +1579,8 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
             while len(active) >= 2:
                 medians = []
                 for i in active:
+                    if i in pinned:
+                        continue
                     sims = []
                     for j in active:
                         if i != j:
@@ -1576,6 +1590,8 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
                     # borderline-bridge edge.
                     medians.append((i, float(np.median(sims)) if sims else 0.0))
 
+                if not medians:
+                    break
                 worst_idx, worst_median = min(medians, key=lambda x: x[1])
 
                 if worst_median >= threshold:
@@ -1740,7 +1756,7 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
 
     # Get loser's face embeddings
     loser_faces = await db.execute(text("""
-        SELECT id, embedding, face_score FROM person_face_embeddings
+        SELECT id, embedding, face_score, is_registration FROM person_face_embeddings
         WHERE person_identity_id::text = :pid AND embedding IS NOT NULL
         ORDER BY face_score DESC
     """), {"pid": loser_id})
@@ -1758,6 +1774,16 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
             loser_emb_norm = loser_emb / _n
         else:
             loser_emb_norm = loser_emb
+
+        # Staff registration faces are pinned: always moved, never dropped by the gates
+        if row[3]:
+            await db.execute(text("""
+                UPDATE person_face_embeddings SET person_identity_id = :winner
+                WHERE id = :row_id
+            """), {"winner": winner_id, "row_id": row[0]})
+            winner_embs.append(loser_emb_norm)
+            moved += 1
+            continue
 
         # Gate 1: duplicate angle
         is_dup = False
@@ -1801,7 +1827,7 @@ async def _absorb_face_embeddings(db, winner_id: str, loser_id: str, max_faces: 
         await db.execute(text("""
             DELETE FROM person_face_embeddings WHERE id IN (
                 SELECT id FROM person_face_embeddings
-                WHERE person_identity_id = :pid
+                WHERE person_identity_id = :pid AND NOT is_registration
                 ORDER BY face_score DESC OFFSET :keep
             )
         """), {"pid": winner_id, "keep": max_faces})
