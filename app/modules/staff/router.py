@@ -10,6 +10,7 @@ from app.core.db.models.user import User
 from app.dependencies import get_current_user, get_db
 from app.modules.staff import service
 from app.modules.staff.schemas import (
+    StaffImageCheckResponse,
     StaffListResponse,
     StaffRegisterResponse,
     StaffResponse,
@@ -19,6 +20,39 @@ router = APIRouter(prefix="/api/staff", tags=["Staff"])
 
 MAX_IMAGES = 5
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+async def _read_images(images: List[UploadFile]) -> list:
+    if not images or len(images) > MAX_IMAGES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Upload 1-{MAX_IMAGES} images")
+    decoded = []
+    for img in images:
+        data = await img.read()
+        if len(data) > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"{img.filename} exceeds 10 MB"
+            )
+        decoded.append(service.decode_image(data))
+    return decoded
+
+
+@router.post("/check-image", response_model=StaffImageCheckResponse)
+async def check_staff_images(
+    images: List[UploadFile] = File(..., description="1-5 photos to check before registering"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Check registration photo quality without registering (nothing is stored).
+
+    Per image: face found, single face, detection confidence, sharpness (blur). Any
+    failed check means register rejects the photo with the same message. Also reports whether all photos show the same person and which existing identity,
+    if any, registration would link to.
+    """
+    decoded = await _read_images(images)
+    result = await service.check_images(db, decoded)
+    for report, upload in zip(result["images"], images):
+        report["filename"] = upload.filename
+    return StaffImageCheckResponse(**result)
 
 
 @router.post("/register", response_model=StaffRegisterResponse)
@@ -36,16 +70,7 @@ async def register_staff(
     If the face matches an existing identity (face sim >= FACE_MATCH_THRESHOLD) that
     identity is marked staff; otherwise a new staff identity is created.
     """
-    if not images or len(images) > MAX_IMAGES:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Upload 1-{MAX_IMAGES} images")
-    decoded = []
-    for img in images:
-        data = await img.read()
-        if len(data) > MAX_IMAGE_BYTES:
-            raise HTTPException(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"{img.filename} exceeds 10 MB"
-            )
-        decoded.append(service.decode_image(data))
+    decoded = await _read_images(images)
     result = await service.register_staff(
         db, decoded, name.strip() if name else None, person_identity_id
     )

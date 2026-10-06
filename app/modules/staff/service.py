@@ -41,6 +41,11 @@ SECOND_FACE_AREA_RATIO = 0.5
 # best N across repeated registrations so they can't grow unbounded.
 MAX_REGISTRATION_FACES = 5
 
+# Photo quality gate for registration (POST /api/staff/check-image + register):
+# blur only (size / distance / pose / lighting are reported in metrics, not enforced).
+# Laplacian variance of the 112x112 grey face; first real photos: blurry=39, clear=100-370.
+MIN_BLUR_SCORE = 50.0
+
 
 def _normalize(emb: np.ndarray) -> np.ndarray:
     emb = np.asarray(emb, dtype=np.float32)
@@ -55,15 +60,45 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-def _extract_registration_face(img: np.ndarray) -> Tuple[Optional[dict], Optional[str]]:
-    """Return (face_dict, None) or (None, reason). Runs in a worker thread."""
+def _frontality(kps, bbox: dict) -> float:
+    """0 = profile, 1 = frontal. Same formula as InsightFaceAnalyzer.analyze()."""
+    if kps is None or len(kps) < 2:
+        return 0.5  # unknown
+    face_w = max(bbox["x2"] - bbox["x1"], 1.0)
+    face_h = max(bbox["y2"] - bbox["y1"], 1.0)
+    eye_spread = abs(float(kps[1][0]) - float(kps[0][0])) / face_w
+    spread_score = min(1.0, eye_spread / 0.35)
+    if len(kps) < 5:
+        return spread_score
+    face_cx = (bbox["x1"] + bbox["x2"]) / 2.0
+    nose_score = max(0.0, 1.0 - abs(float(kps[2][0]) - face_cx) / (face_w / 2.0))
+    sym_score = max(0.0, 1.0 - abs(float(kps[1][1]) - float(kps[0][1])) / face_h * 4.0)
+    return 0.55 * spread_score + 0.30 * nose_score + 0.15 * sym_score
+
+
+def assess_image(img: np.ndarray) -> dict:
+    """Quality report for one registration photo. Runs in a worker thread.
+
+    Every check is pass/fail; any "fail" blocks registration. Returns
+    {"ok", "face_count", "metrics", "checks", "face"} — "face" is the internal
+    extracted face (embedding/crop) when ok, else None.
+    """
     from app.modules.reid.insightface_analyzer import get_shared_analyzer
 
     settings = get_settings()
+    checks: List[dict] = []
+    metrics: dict = {}
+
+    def check(name: str, state: str, message: str) -> None:
+        checks.append({"name": name, "status": state, "message": message})
+
     faces = get_shared_analyzer().detect_all_faces(img)
     faces = [f for f in faces if f.get("embedding") is not None]
+    result = {"ok": False, "face_count": len(faces), "metrics": metrics, "checks": checks, "face": None}
     if not faces:
-        return None, "no face detected"
+        check("face_detected", "fail",
+              "No face detected — the whole face must be visible, well lit and facing the camera")
+        return result
 
     def _area(f):
         b = f["bbox"]
@@ -71,32 +106,68 @@ def _extract_registration_face(img: np.ndarray) -> Tuple[Optional[dict], Optiona
 
     faces.sort(key=_area, reverse=True)
     main = faces[0]
-    if len(faces) > 1 and _area(faces[1]) >= SECOND_FACE_AREA_RATIO * _area(main):
-        return None, f"{len(faces)} faces detected — use a photo with only the staff member"
-    if main["det_score"] < settings.FACE_IDENTITY_MIN_SCORE:
-        return None, (
-            f"face quality too low ({main['det_score']:.2f} < "
-            f"{settings.FACE_IDENTITY_MIN_SCORE})"
-        )
-
     b = main["bbox"]
     h, w = img.shape[:2]
+    face_w = int(b["x2"] - b["x1"])
     pad_x = (b["x2"] - b["x1"]) * 0.30
     pad_y = (b["y2"] - b["y1"]) * 0.30
     x1, y1 = max(0, int(b["x1"] - pad_x)), max(0, int(b["y1"] - pad_y))
     x2, y2 = min(w, int(b["x2"] + pad_x)), min(h, int(b["y2"] + pad_y))
-    return {
-        "embedding": _normalize(main["embedding"]),
-        "det_score": float(main["det_score"]),
-        "age": main.get("age"),
-        "crop": img[y1:y2, x1:x2].copy(),
-    }, None
+    crop = img[y1:y2, x1:x2]
+    # Blur/brightness on the face only, resized so the score doesn't depend on photo size.
+    gray = cv2.cvtColor(
+        cv2.resize(img[int(b["y1"]):int(b["y2"]), int(b["x1"]):int(b["x2"])], (112, 112)),
+        cv2.COLOR_BGR2GRAY,
+    )
+    metrics.update(
+        {
+            "det_score": round(float(main["det_score"]), 3),
+            "face_width_px": face_w,
+            "blur_score": round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 1),
+            "frontality": round(_frontality(main.get("kps"), b), 3),
+            "brightness": round(float(gray.mean()), 1),
+        }
+    )
+
+    if len(faces) > 1 and _area(faces[1]) >= SECOND_FACE_AREA_RATIO * _area(main):
+        check("single_face", "fail", f"{len(faces)} faces detected — use a photo with only the staff member")
+    else:
+        check("single_face", "pass", "One face")
+
+    if metrics["det_score"] < settings.FACE_IDENTITY_MIN_SCORE:
+        check("detection_confidence", "fail",
+              f"Face detection confidence too low ({metrics['det_score']:.2f} < {settings.FACE_IDENTITY_MIN_SCORE})")
+    else:
+        check("detection_confidence", "pass", f"Confidence {metrics['det_score']:.2f}")
+
+    if metrics["blur_score"] < MIN_BLUR_SCORE:
+        check("sharpness", "fail", "Photo is blurry — hold the camera steady and retake")
+    else:
+        check("sharpness", "pass", f"Sharpness {metrics['blur_score']}")
+
+    result["ok"] = not any(c["status"] == "fail" for c in checks)
+    if result["ok"]:
+        result["face"] = {
+            "embedding": _normalize(main["embedding"]),
+            "det_score": float(main["det_score"]),
+            "age": main.get("age"),
+            "crop": crop.copy(),
+        }
+    return result
+
+
+def _extract_registration_face(img: np.ndarray) -> Tuple[Optional[dict], Optional[str]]:
+    """Return (face_dict, None) or (None, reason). Runs in a worker thread."""
+    report = assess_image(img)
+    if report["face"] is None:
+        return None, "; ".join(c["message"] for c in report["checks"] if c["status"] == "fail")
+    return report["face"], None
 
 
 async def extract_faces(images: List[np.ndarray]) -> Tuple[List[dict], List[str]]:
-    """Extract one face per image and drop faces that don't agree with the rest.
+    """Extract one face per image; all photos must pass quality and show one person.
 
-    Returns (faces, rejection_reasons).
+    Raises 422 listing every problem if any photo is rejected — nothing is stored.
     """
     settings = get_settings()
     faces: List[dict] = []
@@ -129,11 +200,14 @@ async def extract_faces(images: List[np.ndarray]) -> Tuple[List[dict], List[str]
     elif len(faces) == 2:
         sim = float(faces[0]["embedding"] @ faces[1]["embedding"])
         if sim < settings.FACE_CONTAMINATION_THRESHOLD:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"The two photos look like different people (face sim {sim:.2f})",
-            )
+            rejected.append(f"the two photos look like different people (face sim {sim:.2f})")
+    if rejected:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, _reject_message(rejected))
     return faces, rejected
+
+
+def _reject_message(reasons: List[str]) -> str:
+    return "Photo not accepted: " + "; ".join(r[0].upper() + r[1:] for r in reasons)
 
 
 async def _find_matching_person(
@@ -164,6 +238,45 @@ async def _find_matching_person(
     return None, best_sim
 
 
+async def check_images(db: AsyncSession, images: List[np.ndarray]) -> dict:
+    """Pre-registration quality check. Read-only: stores nothing."""
+    settings = get_settings()
+    reports = []
+    for i, img in enumerate(images):
+        report = await asyncio.to_thread(assess_image, img)
+        report["index"] = i + 1
+        reports.append(report)
+
+    faces = [r["face"] for r in reports if r["face"] is not None]
+    same_person: Optional[bool] = None
+    if len(faces) >= 2:
+        embs = np.stack([f["embedding"] for f in faces])
+        sims = embs @ embs.T
+        same_person = bool(sims[np.triu_indices(len(faces), 1)].min() >= settings.FACE_CONTAMINATION_THRESHOLD)
+
+    existing_match = None
+    if faces:
+        pid, sim = await _find_matching_person(db, faces)
+        if pid is not None:
+            person = await db.get(PersonIdentity, pid)
+            existing_match = {
+                "person_identity_id": pid,
+                "similarity": round(sim, 3),
+                "name": person.label if person else None,
+                "is_staff": bool(person.is_staff) if person else False,
+            }
+        await db.rollback()  # release SET LOCAL / read transaction
+
+    for r in reports:
+        r.pop("face", None)
+    return {
+        "ok": bool(faces) and all(r["ok"] for r in reports) and same_person is not False,
+        "images": reports,
+        "same_person": same_person,
+        "existing_match": existing_match,
+    }
+
+
 async def _upload_crop(person_id: uuid.UUID, crop: np.ndarray) -> Optional[str]:
     from app.modules.storage.minio_client import upload_image
 
@@ -178,12 +291,7 @@ async def register_staff(
     name: Optional[str],
     person_identity_id: Optional[uuid.UUID] = None,
 ) -> dict:
-    faces, rejected = await extract_faces(images)
-    if not faces:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            {"message": "No usable face in the uploaded image(s)", "rejected": rejected},
-        )
+    faces, rejected = await extract_faces(images)  # raises 422 on any bad photo
 
     now = utc_now()
     # Same lock as live decide_identity / faceless delete — no race with identity create/delete.
@@ -203,6 +311,35 @@ async def register_staff(
         else:
             person = None
             action = "created"
+
+    # Same-angle duplicate guard (as live face storage): skip a face > 0.95 sim to one
+    # already stored on this identity, e.g. the same photo registered twice.
+    existing = []
+    if person is not None:
+        existing = [
+            _normalize(np.array(json.loads(r[0]) if isinstance(r[0], str) else r[0], dtype=np.float32))
+            for r in (
+                await db.execute(
+                    text("SELECT embedding FROM person_face_embeddings WHERE person_identity_id = :pid"),
+                    {"pid": person.id},
+                )
+            ).fetchall()
+        ]
+    new_faces = []
+    for f in faces:
+        if any(float(f["embedding"] @ e) > 0.95 for e in existing):
+            rejected.append(f"image {f['index'] + 1}: duplicate of an already stored face")
+            continue
+        existing.append(f["embedding"])
+        new_faces.append(f)
+    # Nothing new and already staff → nothing to do. (Not yet staff, e.g. after
+    # DELETE /api/staff/{id}: re-registering with the same photo re-marks them.)
+    if not new_faces and person is not None and person.is_staff:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Already registered as staff ({person.label or str(person.id)[:8]}) with "
+            f"{'this photo' if len(faces) == 1 else 'these photos'} — upload a different photo",
+        )
 
     best = max(faces, key=lambda f: f["det_score"])
     if person is None:
@@ -233,23 +370,8 @@ async def register_staff(
     )
     person.metadata_json = meta
 
-    # Same-angle duplicate guard (as live face storage): skip a face > 0.95 sim to one
-    # already stored on this identity, e.g. the same photo registered twice.
-    existing = [
-        _normalize(np.array(json.loads(r[0]) if isinstance(r[0], str) else r[0], dtype=np.float32))
-        for r in (
-            await db.execute(
-                text("SELECT embedding FROM person_face_embeddings WHERE person_identity_id = :pid"),
-                {"pid": person.id},
-            )
-        ).fetchall()
-    ]
     stored = 0
-    for f in faces:
-        if any(float(f["embedding"] @ e) > 0.95 for e in existing):
-            rejected.append(f"image {f['index'] + 1}: duplicate of an already stored face")
-            continue
-        existing.append(f["embedding"])
+    for f in new_faces:
         crop_path = await _upload_crop(person.id, f["crop"])
         db.add(
             PersonFaceEmbedding(

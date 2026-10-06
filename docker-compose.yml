@@ -19,23 +19,23 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # postgres:
-  #   image: pgvector/pgvector:pg16
-  #   container_name: retail_ai_postgres
-  #   environment:
-  #     POSTGRES_USER: retail_user
-  #     POSTGRES_PASSWORD: retail_pass
-  #     POSTGRES_DB: retail_ai_db
-  #   ports:
-  #     - "5433:5432"  # host 5433 -> container 5432 (avoids clashing with a local PostgreSQL)
-  #   volumes:
-  #     - pgdata:/var/lib/postgresql/data
-  #     - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U retail_user -d retail_ai_db"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
+  postgres:
+     image: pgvector/pgvector:pg16
+     container_name: retail_ai_postgres
+     environment:
+       POSTGRES_USER: retail_user
+       POSTGRES_PASSWORD: retail_pass
+       POSTGRES_DB: retail_ai_db
+     ports:
+       - "5433:5432"  # host 5433 -> container 5432 (avoids clashing with a local PostgreSQL)
+     volumes:
+       - pgdata:/var/lib/postgresql/data
+       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+     healthcheck:
+       test: ["CMD-SHELL", "pg_isready -U retail_user -d retail_ai_db"]
+       interval: 5s
+       timeout: 5s
+       retries: 5
 
   # MediaMTX media server: ingests RTSP (pushed by the app via ffmpeg) and
   # serves it back to browsers as WebRTC (WHEP) / HLS for the zone-binding UI.
@@ -44,7 +44,7 @@ services:
     container_name: retail_ai_mediamtx
     environment:
       MTX_RTSPTRANSPORTS: tcp                # v1.19+ correct parameter name (replaces deprecated MTX_PROTOCOLS)
-      MTX_WEBRTCADDITIONALHOSTS: "192.168.1.104,127.0.0.1,3.110.196.52,feed-retaileye.bluecloudsoftech.com"
+      MTX_WEBRTCADDITIONALHOSTS: "192.168.1.35,192.168.1.7,127.0.0.1,3.110.196.52,feed-retaileye.bluecloudsoftech.com"
       MTX_WEBRTCLOCALUDPADDRESS: ":8189"
       MTX_WEBRTCLOCALTCPADDRESS: ":8189"
       MTX_RTSPTIMEOUT: 1h                    # Keep path alive 1 hour with zero readers (Go duration format)
@@ -95,5 +95,5 @@ services:
   #   restart: unless-stopped
 
 volumes:
-  # pgdata:
+  pgdata:
   minio_data:
