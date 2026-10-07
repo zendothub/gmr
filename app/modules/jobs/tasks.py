@@ -199,7 +199,13 @@ async def deduplicate_persons():
             # ── Step 1: efficient duplicate-pair discovery ──────────────────
             # LATERAL lets pgvector's IVFFlat index handle each probe in
             # O(log N) instead of a full O(N²) cross-join.
-            await db.execute(text("SET LOCAL ivfflat.probes = 50"))
+            #
+            # CRITICAL: probes must be << lists.  Index rebuilt 2026-10-07
+            # with lists=150 (≈ sqrt(22826)).  probes=10 → ~6.7% coverage,
+            # fast ANN search with adequate recall for dedup threshold 0.40.
+            # DO NOT raise probes to match lists — that turns ANN into a full
+            # sequential scan (e.g. probes=50 with old lists=50 ran 36 min+).
+            await db.execute(text("SET LOCAL ivfflat.probes = 10"))
 
             pairs_result = await db.execute(text("""
                 SELECT DISTINCT
