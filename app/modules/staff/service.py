@@ -46,6 +46,9 @@ MAX_REGISTRATION_FACES = 5
 # Laplacian variance of the 112x112 grey face; first real photos: blurry=39, clear=100-370.
 MIN_BLUR_SCORE = 50.0
 
+# GET /api/staff/{id}: most recent N purchase days returned in purchase_history.
+PURCHASE_HISTORY_DAYS = 60
+
 
 def _normalize(emb: np.ndarray) -> np.ndarray:
     emb = np.asarray(emb, dtype=np.float32)
@@ -426,39 +429,147 @@ async def register_staff(
     }
 
 
+_STAFF_SELECT = """
+    SELECT pi.id, pi.label, pi.is_staff,
+           COALESCE((pi.metadata_json->>'staff_registered')::boolean, FALSE),
+           (SELECT COUNT(*) FROM person_face_embeddings fe
+            WHERE fe.person_identity_id = pi.id),
+           (SELECT COUNT(*) FROM person_face_embeddings fe
+            WHERE fe.person_identity_id = pi.id AND fe.is_registration),
+           pi.first_seen_at, pi.last_seen_at, pi.face_crop_path,
+           pi.visit_count, pi.gender, pi.estimated_age, pi.metadata_json,
+           bi.interactions, bi.purchase_days, bi.first_at, bi.last_at
+    FROM person_identities pi
+    LEFT JOIN LATERAL (
+        -- Analytics count purchases as DISTINCT person per range (daily trend: per IST
+        -- day), so purchase_days = how many purchases converting to customer would add.
+        SELECT COUNT(*) AS interactions,
+               COUNT(DISTINCT (b.entered_at AT TIME ZONE 'Asia/Kolkata')::date) AS purchase_days,
+               MIN(b.entered_at) AS first_at,
+               MAX(b.entered_at) AS last_at
+        FROM billing_interactions b
+        WHERE b.person_identity_id = pi.id
+    ) bi ON TRUE
+"""
+
+
+def _staff_row(r) -> dict:
+    meta = r[12] or {}
+    return {
+        "person_identity_id": r[0],
+        "name": r[1],
+        "is_staff": r[2],
+        "registered": r[3],
+        "face_count": int(r[4]),
+        "registration_face_count": int(r[5]),
+        "first_seen_at": r[6],
+        "last_seen_at": r[7],
+        "face_crop_path": r[8],
+        "visit_count": r[9],
+        "gender": r[10],
+        "estimated_age": r[11],
+        "staff_registered_at": meta.get("staff_registered_at"),
+        "staff_unregistered_at": meta.get("staff_unregistered_at"),
+        "billing_interactions": int(r[13] or 0),
+        "purchase_days": int(r[14] or 0),
+        "first_purchase_at": r[15],
+        "last_purchase_at": r[16],
+    }
+
+
 async def list_staff(db: AsyncSession) -> List[dict]:
     rows = (
         await db.execute(
             text(
-                """
-                SELECT pi.id, pi.label, pi.is_staff,
-                       COALESCE((pi.metadata_json->>'staff_registered')::boolean, FALSE),
-                       (SELECT COUNT(*) FROM person_face_embeddings fe
-                        WHERE fe.person_identity_id = pi.id),
-                       (SELECT COUNT(*) FROM person_face_embeddings fe
-                        WHERE fe.person_identity_id = pi.id AND fe.is_registration),
-                       pi.first_seen_at, pi.last_seen_at, pi.face_crop_path
-                FROM person_identities pi
+                _STAFF_SELECT
+                + """
                 WHERE pi.is_staff = TRUE
                 ORDER BY pi.label NULLS LAST, pi.first_seen_at
                 """
             )
         )
     ).fetchall()
-    return [
+    return [_staff_row(r) for r in rows]
+
+
+async def get_staff(db: AsyncSession, person_identity_id: uuid.UUID) -> dict:
+    """One identity by id — returned even if no longer staff (is_staff tells which)."""
+    row = (
+        await db.execute(text(_STAFF_SELECT + " WHERE pi.id = :pid"), {"pid": person_identity_id})
+    ).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person identity not found")
+    result = _staff_row(row)
+
+    # Per-day breakdown so a false-positive staff can be verified before converting:
+    # each day listed adds +1 to that day's purchase count once is_staff=False.
+    days = (
+        await db.execute(
+            text(
+                """
+                SELECT (b.entered_at AT TIME ZONE 'Asia/Kolkata')::date AS day,
+                       COUNT(*), SUM(b.dwell_seconds), MIN(b.entered_at), MAX(b.entered_at)
+                FROM billing_interactions b
+                WHERE b.person_identity_id = :pid
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT :limit
+                """
+            ),
+            {"pid": person_identity_id, "limit": PURCHASE_HISTORY_DAYS},
+        )
+    ).fetchall()
+    result["purchase_history"] = [
         {
-            "person_identity_id": r[0],
-            "name": r[1],
-            "is_staff": r[2],
-            "registered": r[3],
-            "face_count": int(r[4]),
-            "registration_face_count": int(r[5]),
-            "first_seen_at": r[6],
-            "last_seen_at": r[7],
-            "face_crop_path": r[8],
+            "day": d[0],
+            "interactions": int(d[1]),
+            "total_dwell_seconds": round(float(d[2]), 1) if d[2] is not None else None,
+            "first_at": d[3],
+            "last_at": d[4],
         }
-        for r in rows
+        for d in days
     ]
+    return result
+
+
+def _set_staff_flag(person: PersonIdentity, is_staff: bool) -> None:
+    person.is_staff = is_staff
+    meta = dict(person.metadata_json or {})
+    now = utc_now().isoformat()
+    if is_staff:
+        # Manual re-promote (e.g. undo a wrong conversion). Not a photo registration,
+        # so staff_registered stays as is.
+        meta["staff_marked_at"] = now
+    else:
+        meta["staff_registered"] = False
+        meta["staff_unregistered_at"] = now
+    person.metadata_json = meta
+
+
+async def update_staff(
+    db: AsyncSession,
+    person_identity_id: uuid.UUID,
+    name: Optional[str] = None,
+    is_staff: Optional[bool] = None,
+) -> dict:
+    """Edit name and/or staff status. is_staff=False converts a false-positive staff
+    (e.g. from the old attendance classifier) back to a customer; identity, faces and
+    history are kept, and analytics count the person as a customer from then on
+    (staff exclusion reads the live flag, so past visits are re-included too).
+    """
+    person = await db.get(PersonIdentity, person_identity_id)
+    if person is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person identity not found")
+    if name is not None:
+        person.label = name or None
+    if is_staff is not None and is_staff != person.is_staff:
+        _set_staff_flag(person, is_staff)
+    await db.commit()
+    logger.info(
+        f"Staff updated: person={str(person_identity_id)[:8]} "
+        f"is_staff={person.is_staff} name={person.label!r}"
+    )
+    return await get_staff(db, person_identity_id)
 
 
 async def unregister_staff(db: AsyncSession, person_identity_id: uuid.UUID) -> None:
@@ -466,10 +577,6 @@ async def unregister_staff(db: AsyncSession, person_identity_id: uuid.UUID) -> N
     person = await db.get(PersonIdentity, person_identity_id)
     if person is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Person identity not found")
-    person.is_staff = False
-    meta = dict(person.metadata_json or {})
-    meta["staff_registered"] = False
-    meta["staff_unregistered_at"] = utc_now().isoformat()
-    person.metadata_json = meta
+    _set_staff_flag(person, False)
     await db.commit()
     logger.info(f"Staff unregistered: person={str(person_identity_id)[:8]}")

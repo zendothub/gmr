@@ -1,6 +1,6 @@
 """Staff module Pydantic schemas."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 from uuid import UUID
 
@@ -29,6 +29,37 @@ class StaffResponse(BaseModel):
     first_seen_at: datetime
     last_seen_at: datetime
     face_crop_path: Optional[str] = None
+    visit_count: Optional[int] = None
+    gender: Optional[str] = None
+    estimated_age: Optional[int] = None
+    staff_registered_at: Optional[str] = None
+    staff_unregistered_at: Optional[str] = None
+    # Billing rows linked to this identity (staff are excluded from purchase analytics).
+    billing_interactions: int = 0
+    # Distinct IST days with billing = purchases added to analytics if converted to customer
+    purchase_days: int = 0
+    first_purchase_at: Optional[datetime] = None
+    last_purchase_at: Optional[datetime] = None
+
+
+class PurchaseDay(BaseModel):
+    day: date
+    interactions: int
+    total_dwell_seconds: Optional[float] = None
+    first_at: datetime
+    last_at: datetime
+
+
+class StaffDetailResponse(StaffResponse):
+    # Most recent days first (capped at PURCHASE_HISTORY_DAYS)
+    purchase_history: List[PurchaseDay] = []
+
+
+class StaffUpdateRequest(BaseModel):
+    # Omit a field to leave it unchanged. Empty string clears the name.
+    name: Optional[str] = None
+    # False = convert to customer (false-positive staff); True = mark as staff again
+    is_staff: Optional[bool] = None
 
 
 class StaffListResponse(BaseModel):

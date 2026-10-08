@@ -10,10 +10,12 @@ from app.core.db.models.user import User
 from app.dependencies import get_current_user, get_db
 from app.modules.staff import service
 from app.modules.staff.schemas import (
+    StaffDetailResponse,
     StaffImageCheckResponse,
     StaffListResponse,
     StaffRegisterResponse,
     StaffResponse,
+    StaffUpdateRequest,
 )
 
 router = APIRouter(prefix="/api/staff", tags=["Staff"])
@@ -85,6 +87,38 @@ async def list_staff(
     """List all identities with is_staff = TRUE."""
     items = await service.list_staff(db)
     return StaffListResponse(items=[StaffResponse(**i) for i in items], total=len(items))
+
+
+@router.get("/{person_identity_id}", response_model=StaffDetailResponse)
+async def get_staff(
+    person_identity_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get one identity by id (also works after conversion to customer — see is_staff)."""
+    return StaffDetailResponse(**await service.get_staff(db, person_identity_id))
+
+
+@router.patch("/{person_identity_id}", response_model=StaffDetailResponse)
+async def update_staff(
+    person_identity_id: UUID,
+    body: StaffUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update name and/or staff status.
+
+    Send {"is_staff": false} to convert a false-positive staff (e.g. marked by the old
+    attendance logic) to a customer. Identity, faces and history are kept; analytics
+    count the person as a customer, including past visits.
+    """
+    result = await service.update_staff(
+        db,
+        person_identity_id,
+        name=body.name.strip() if body.name is not None else None,
+        is_staff=body.is_staff,
+    )
+    return StaffDetailResponse(**result)
 
 
 @router.delete("/{person_identity_id}", status_code=status.HTTP_204_NO_CONTENT)
