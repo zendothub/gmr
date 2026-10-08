@@ -14,6 +14,7 @@ from app.modules.jobs.tasks import (
     probe_camera_statuses,
     deduplicate_persons,
     cleanup_stale_sessions,
+    minio_sweep_job,
 )
 
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -69,10 +70,39 @@ def start_scheduler() -> AsyncIOScheduler:
     # Periodic person-identity deduplication every 6 minutes.
     # Merges cross-camera duplicates that the real-time matcher missed
     # (cross-angle face similarity just below FACE_MATCH_THRESHOLD).
+    # Incremental: only probes embeddings created in DEDUP_PROBE_WINDOW_MINUTES
+    # against the full pgvector index (2026-10-08 — full-DB probing was the
+    # 5.5-6 min bottleneck). The daily full sweep below covers the rest.
     _scheduler.add_job(
         deduplicate_persons,
         IntervalTrigger(minutes=6),
         id="deduplicate_persons",
+        replace_existing=True,
+    )
+
+    # Daily whole-DB dedup pair scan (safety net for the incremental window):
+    # catches pairs skipped during worker downtime, IVFFlat recall misses, and
+    # pairs unblocked when the same-camera overlap lookback expires.
+    from app.config import get_settings
+    _settings = get_settings()
+    _scheduler.add_job(
+        deduplicate_persons,
+        CronTrigger(
+            hour=int(_settings.DEDUP_FULL_SWEEP_HOUR_IST),
+            minute=30,
+        ),
+        kwargs={"full": True},
+        id="deduplicate_persons_full_sweep",
+        replace_existing=True,
+    )
+
+    # MinIO orphan-crop sweep (decoupled from the dedup cycle 2026-10-08 —
+    # it used to hold the dedup DB transaction open through the bucket listing
+    # and could stretch a cycle to 47 min on a delete backlog).
+    _scheduler.add_job(
+        minio_sweep_job,
+        IntervalTrigger(minutes=int(_settings.MINIO_SWEEP_INTERVAL_MINUTES)),
+        id="minio_sweep",
         replace_existing=True,
     )
 
@@ -85,7 +115,7 @@ def start_scheduler() -> AsyncIOScheduler:
     )
 
     _scheduler.start()
-    logger.info("Background job scheduler started (6 jobs registered)")
+    logger.info("Background job scheduler started (8 jobs registered)")
     return _scheduler
 
 

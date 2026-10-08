@@ -1063,15 +1063,25 @@ class CameraWorker:
 
     @staticmethod
     def _minio_cleanup(full_path: str) -> None:
-        """Queue a MinIO object for *deferred* deletion by the next dedup-job sweep.
+        """Queue a MinIO object for *deferred* deletion by the periodic sweep.
 
         The object key is extracted from the full bucket/key path and added to the
         class-level ``_pending_minio_deletes`` set.  Actual deletion happens in
-        ``deduplicate_persons()`` (every 10 min) after verifying no DB row still
-        references this path.
+        ``minio_sweep_job()`` (every MINIO_SWEEP_INTERVAL_MINUTES, worker process)
+        after verifying no DB row still references this path — the sweep deletes
+        unreferenced crops even if their hint is gone, so the set is advisory.
+
+        The set is capped: the sweep runs in a SEPARATE process and cannot drain
+        this API-side set, so without a cap it would grow unboundedly.
         """
         if full_path:
-            CameraWorker._pending_minio_deletes.add(full_path)
+            pending = CameraWorker._pending_minio_deletes
+            if len(pending) >= 20000:
+                # Drop an arbitrary batch; those objects are still swept via the
+                # DB cross-reference (not-in-known) path.
+                for _ in range(5000):
+                    pending.pop()
+            pending.add(full_path)
 
     async def _run_reid(self, db, frame, track: ActiveTrack):
         """Run ReID pipeline: crop -> quality -> embedding -> accumulation -> decision."""

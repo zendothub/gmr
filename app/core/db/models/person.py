@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import Boolean, String, Integer, Float, ForeignKey, DateTime, func, text
+from sqlalchemy import Boolean, String, Integer, Float, ForeignKey, DateTime, Index, func, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
@@ -47,6 +47,11 @@ class PersonIdentity(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 class PersonFaceEmbedding(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "person_face_embeddings"
+    __table_args__ = (
+        # Dedup pair discovery (incremental, 2026-10-08) probes only embeddings
+        # created within DEDUP_PROBE_WINDOW_MINUTES as the outer side.
+        Index("ix_person_face_embeddings_created_at", "created_at"),
+    )
 
     person_identity_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("person_identities.id", ondelete="CASCADE"),

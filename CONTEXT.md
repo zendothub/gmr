@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** September 1, 2026 (staff rule: consec-5 or 70%/15d window; lazy live revalidation)  
+> **Last updated:** October 8, 2026 (dedup job performance rework — incremental pair probing, sweep decoupled; see #31)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -451,20 +451,28 @@ Frame N+4 (window fires):
 ## Process Architecture
 
 ```
-+-----------------------------+   +------------------------------+   +------------------------------+
-| retail-ai.service           |   | retail-ai-worker.service     |   | reextract-faces.timer        |
-| (API Server, ~3.4 GB GPU)   |   | (Background Jobs, ~100 MB)   |   | (GPU Worker, oneshot)        |
-|                             |   |                              |   |                              |
-| - FastAPI HTTP endpoints    |   | - deduplicate_persons (10m)  |   | - Re-extract face from crops |
-| - Camera workers (YOLO,     |   | - close_stale_tracks (5m)    |   | - Delete faceless persons    |
-|   InsightFace, OSNet, etc.) |   | - probe_cameras (2m)         |   | - Every 20 min               |
-| - Stream broadcasters       |   | - daily_analytics (00:15)    |   | - Loads InsightFace (1.5GB)  |
-| - In-memory track state     |   | - storage_cleanup (02:00)    |   | - Frees GPU on exit          |
-| - NO background jobs        |   | - NO GPU, NO camera          |   |                              |
-+-----------------------------+   +------------------------------+   +------------------------------+
++-----------------------------+   +----------------------------------------+   +------------------------------+
+| retail-ai.service           |   | retail-ai-worker.service               |   | reextract-faces.timer        |
+| (API Server, ~3.4 GB GPU)   |   | (Background Jobs scheduler, ~100 MB)   |   | (GPU Worker, oneshot)        |
+|                             |   |                                        |   |                              |
+| - FastAPI HTTP endpoints    |   | - deduplicate_persons (6m, incremental)|   | - Re-extract face from crops |
+| - Camera workers (YOLO,     |   | - minio_sweep (30m, orphan crops)      |   | - Delete faceless persons    |
+|   InsightFace, OSNet, etc.) |   | - close_stale_tracks (5m)              |   | - Every 20 min               |
+| - Stream broadcasters       |   | - probe_cameras (2m)                   |   | - Loads InsightFace (1.5GB)  |
+| - In-memory track state     |   | - daily_analytics (00:15)              |   | - Frees GPU on exit          |
+| - NO background jobs        |   | - storage_cleanup (02:00)              |   |                              |
+|                             |   | - dedup FULL sweep (03:30)             |   |                              |
+|                             |   |                                        |   |                              |
+|                             |   |  Heavy job bodies run in a spawn       |   |                              |
+|                             |   |  process pool (3 workers) — see        |   |                              |
+|                             |   |  app/modules/jobs/process_pool.py:     |   |                              |
+|                             |   |  dedup cycle + minio_sweep + stitch    |   |                              |
+|                             |   |  model loads happen in pool children,  |   |                              |
+|                             |   |  never on the scheduler event loop.    |   |                              |
++-----------------------------+   +----------------------------------------+   +------------------------------+
 ```
 
-All three share PostgreSQL + MinIO. The worker process handles the heavy dedup/sweep so the API server never freezes. The face re-extraction script loads InsightFace as a separate process to avoid GPU memory contention.
+All three share PostgreSQL + MinIO. The worker process schedules jobs and offloads the heavy bodies (dedup cycle, MinIO sweep, stitch model inference) to spawn children so the scheduler event loop never freezes. The face re-extraction script loads InsightFace as a separate process to avoid GPU memory contention.
 
 ---
 ## Current State (as of last update)
@@ -491,7 +499,7 @@ All three share PostgreSQL + MinIO. The worker process handles the heavy dedup/s
 - **Body contamination gate (store-time):** Median cosine sim to existing cluster, >=3 embeddings, 0.50 threshold
 - **Face/body contamination cleanup (dedup job + danger script):** Both use iterative median-outlier removal (face 0.35, body 0.50). Aggressive-reject. Previously face used greedy single-linkage that chained contamination through bridges — FIXED (issue #18).
 - **Dedup absorb (contamination-gated):** `_absorb_face_embeddings`/`_absorb_body_embeddings` now DROP a loser embedding if its median similarity to the winner's existing cluster is below threshold (was: moved ALL with no check — issue #17). Stops false-merge contamination injection.
-- **Dedup job:** 0.40 merge threshold + face cleanup (0.35, median) + body cleanup (0.50, median). Per-merge SAVEPOINT isolation — one bad pair no longer aborts the batch (issue #19). Absorbs embeddings (contamination-gated) + re-votes gender. Runs in separate worker process. union-find `find()` recursive path compression (fixed).
+- **Dedup job:** 0.40 merge threshold + face cleanup (0.35, median) + body cleanup (0.50, median). Per-merge SAVEPOINT isolation — one bad pair no longer aborts the batch (issue #19). Absorbs embeddings (contamination-gated) + re-votes gender. Runs in the job **process pool** (spawn child, `process_pool.py`) — never on the scheduler event loop. union-find `find()` recursive path compression (fixed). **Incremental pair probing since 2026-10-08 (issue #31):** outer probe = embeddings created in `DEDUP_PROBE_WINDOW_MINUTES` (30) only; inner side full IVFFlat ANN; daily 03:30 full-DB sweep (`full=True`) as safety net. Phase timings logged per run (`Dedup job: done in Xs (...)`). MinIO orphan sweep moved OUT of the cycle (separate `minio_sweep_job`, 30 min).
 - **Recent-window matching:** Live engine, 5-min via `last_seen_at`. Face grey 0.35 + median cluster gate; body recent 0.55 median. `match_tier` drives CASE1/2 accept thr so grey face actually attaches (FIXED 2026-07-17). Outside: face 0.40 / body median 0.50 + ambiguity.
 - **SAME_CAM after reject:** No create-new (leave unassigned). Prevents staff/visitor clone factory when concurrent track blocks attach (FIXED 2026-07-17).
 - **MATCH STALE / store FK (P5 FIXED 2026-07-17):** Person may vanish between search and store (reextract delete). Exist check + `FOR SHARE` + SAVEPOINT attach; create suppressed on stale; no create-on-exception poison. `IDENTITY_ADVISORY_LOCK_KEY=1001` shared with `reextract_or_delete_faceless`.
@@ -650,6 +658,35 @@ Steps:
 **UI:** Debug page tabs **Merged Persons** | **Fragmented Tracks** (side-by-side on xl).
 
 **Migration:** `0007_identity_merge_and_fragment_events.py`
+
+---
+
+## 31. Dedup job performance rework (NEW 2026-10-08)
+
+**Symptom:** `deduplicate_persons` (6-min interval) ran 8–12+ min per cycle; journalctl showed `Execution of job "deduplicate_persons ... skipped: maximum number of running instances reached (1)` — effective cadence 12 min. Oct 7 one cycle spanned 48 min.
+
+**Measured phase breakdown (one run, 17:47:06→17:55):**
+1. **Pair discovery 5.5–6 min (~75%)** — IVFFlat index existed (`idx_person_face_embeddings_embedding`, lists=150) and was used for the INNER LATERAL, but the OUTER side was `Seq Scan on person_face_embeddings` probing ALL 20,837 embeddings per run while only ~66 new faces/hour arrive. Output pair sort spilled at `work_mem=4MB`. `shared_buffers=128MB` on a 31GB host.
+2. **MinIO sweep 1–47 min** — listed all 715k `crops/` objects (listing alone 59–72s) + one HTTP `remove_object` per orphan (466k-object backlog = 47 min); ran INSIDE the dedup DB transaction → observed `idle in transaction` 59s+ (autovacuum blocked).
+3. **Contamination cleanup** — N+1: one query per person with ≥2 faces (4,627 round-trips/run) even when removing 0.
+4. `repair_fragmented_billing_visits` ~1s (966 visits checked) — fine.
+
+**Fixes (this change):**
+- **Incremental pair probing:** outer side restricted to `created_at > now() - DEDUP_PROBE_WINDOW_MINUTES` (30 min, derived table — note `WHERE` cannot sit between `FROM` and `CROSS JOIN LATERAL`). Inner side stays unrestricted ANN → new-vs-old and new-vs-new both covered. Old-vs-old pairs were already probed when those embeddings were new. **Daily 03:30 `deduplicate_persons(full=True)`** full-DB sweep covers worker downtime, IVFFlat recall misses, and pairs unblocked when the 48h same-camera-overlap lookback expires. Probe query now <1–2s (59 probe rows vs 20,837).
+- **No-pair fall-through:** the old early `return` on zero pairs skipped contamination cleanup + billing repair — unacceptable now that empty windows are the common case. Falls through to cleanup/repair/summary.
+- **Heavy job bodies run in a spawn process pool (2026-10-08):** `app/modules/jobs/process_pool.py` — `run_in_subprocess()` dispatches the whole dedup cycle and the MinIO sweep to `ProcessPoolExecutor(max_workers=JOB_POOL_WORKERS=3, spawn context)` children. Rationale: minio-py is sync (715k-object listing ≈72s) and the numpy contamination cleanup holds the GIL — even `asyncio.to_thread` would have starved the worker's single process. The billing-visit stitch lazily loads **OSNet + InsightFace** (`_body_emb`/`_face_emb`) — now it loads in a child, not the worker. Children call `setup_logging()` (logs land in `logs/ai_processing.log`) and `_run_job_loop()` disposes the shared async engine before loop close (avoids `Event loop is closed` noise at child exit). **Spawn not fork** (forking a threaded asyncio process is unsafe). Entry points must be module-level + picklable (no lambdas — `run_in_executor` pickles the callable). **Break semantics:** one dead child poisons the whole pool (`BrokenProcessPool` fails all futures — more workers do NOT give failover); deaths come from native crashes in torch/cv2/pgvector, OOM-kills during model load, external kills, or spawn-time import failures. Policy: **rebuild + retry once** on a fresh worker (transient deaths), then **abort with RuntimeError** — the body is never re-run in a thread (a segfaulting body would take the worker with it). Job bodies must therefore be idempotent-safe to run at most twice (they are: SAVEPOINT merges, sweep only deletes unreferenced). `OSError` (pool can't spawn at all) → worker-thread fallback (body never ran in a child). **Proactive recycling:** pool rebuilt after `JOB_POOL_MAX_TASKS=20` jobs to bound child memory (stitch model loads). Timeout 30 min → pool reset, stuck child abandoned. `tests/test_process_pool.py` covers retry/abort/fallback/recycle.
+- **MinIO sweep decoupled:** own job `minio_sweep_job` every `MINIO_SWEEP_INTERVAL_MINUTES` (30), inside `retail-ai-worker.service` (no new service), body runs in the process pool. DB reference queries in a session **closed before** any MinIO I/O (kills idle-in-transaction). Batch `remove_objects()` (`MINIO_SWEEP_BATCH_SIZE=1000`) instead of per-object deletes (2,076 orphans deleted in seconds in smoke test). Listing 715k objects (~72s) remains — MinIO cannot filter by date server-side; accepted at 30-min cadence in a child process. Future option: `storage_objects` registry table (exists, unused) for an indexed DB-diff sweep.
+- **Batched contamination cleanup:** single grouped query per cleanup instead of 4.6k N+1 round-trips. Median-outlier math, thresholds (face 0.35 / body 0.50), registration-face pinning unchanged.
+- **Phase timing log:** `Dedup job: done in 30.4s (pair_query=… overlap_filter=… merges=… face_cleanup=… body_cleanup=… repair=…)`.
+- **PG memory config (ALTER SYSTEM, pending restart):** `shared_buffers=4GB`, `work_mem=64MB`, `effective_cache_size=12GB`, `maintenance_work_mem=512MB`, `max_wal_size=2GB` (was 128MB/4MB defaults on a 31GB host).
+- **Migration `0011`** `ix_person_face_embeddings_created_at` — outer probe becomes a range scan as the table grows. (API service runs `alembic upgrade head` on start.)
+- **`CameraWorker._pending_minio_deletes` capped at 20k** — the sweep runs in a separate process and can never drain the API-side class set (pre-existing unbounded growth; excess hints are still swept via the not-in-known path).
+
+**Post-change target:** cycle well under 1 min (measured 30.4s cold with 0 removals; pair query 0.1s empty / ~1–2s with pairs); true 6-min cadence; no more skipped triggers.
+
+**Still OPEN (not in this change):** false-merge guard — most merges in the Oct 8 logs had ALL loser faces rejected as contamination by the absorb gate (cluster_fit 0.11–0.34) yet the merge still completed and reassigns tracks/visits. Deferred for review.
+
+**Deploy:** restart `retail-ai-worker.service`; restart PostgreSQL for the ALTER SYSTEM memory settings. API restart (picks up migration 0011) at convenience.
 
 ---
 

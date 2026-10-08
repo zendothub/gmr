@@ -152,6 +152,33 @@ class Settings(BaseSettings):
     DEDUP_SAME_CAMERA_OVERLAP_LOOKBACK_HOURS: float = 48.0  # 0 = all history (legacy)
     DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 10.0     # ignore brief split glitches
 
+    # ── Dedup pair-discovery incremental probe (2026-10-08) ────────────
+    # The pair query only probes embeddings created within this window as
+    # the OUTER side (inner side stays full-index ANN). ~66 new faces/hour
+    # vs 20k+ total: probing all rows every 6-min run took 5.5-6 min.
+    # Old-vs-old pairs were already probed when they were new; a daily full
+    # sweep (DEDUP_FULL_SWEEP_HOUR) covers downtime / recall / overlap expiry.
+    DEDUP_PROBE_WINDOW_MINUTES: int = 30
+    DEDUP_FULL_SWEEP_HOUR_IST: int = 3        # daily whole-DB pair scan (03:30)
+    DEDUP_PAIR_QUERY_WORK_MEM: str = "64MB"   # SET LOCAL for the pair sort
+
+    # ── MinIO orphan-crop sweep (2026-10-08, decoupled from dedup) ────
+    # Sweep lists the crops/ bucket and deletes unreferenced objects. It ran
+    # inside the dedup cycle (held a DB txn open through the listing — idle-in-
+    # transaction 59s+; 466k-object backlogs ran 47 min). Now its own job.
+    MINIO_SWEEP_INTERVAL_MINUTES: int = 30
+    MINIO_SWEEP_BATCH_SIZE: int = 1000        # remove_objects() batch limit
+
+    # ── Job process pool (2026-10-08) ──────────────────────────────────
+    # Heavy job bodies (dedup cycle, MinIO sweep) run in spawn children —
+    # see app/modules/jobs/process_pool.py. WORKERS > job count so an
+    # overlapping dedup+sweep never queues behind the other. MAX_TASKS:
+    # proactive pool recycle (spawn fresh children) to bound child memory
+    # growth (stitch loads OSNet/InsightFace). A broken pool (one dead child
+    # poisons all — segfault/OOM/kill) is rebuilt and the job retried once.
+    JOB_POOL_WORKERS: int = 3
+    JOB_POOL_MAX_TASKS: int = 20
+
     # ------------------------------------------------------------------
     # Staff detection — live lazy check after decide_identity (API process).
     # Face + (consec ≥5 calendar days OR ≥11 days in any 15-day window).

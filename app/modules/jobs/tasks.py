@@ -167,7 +167,45 @@ async def cleanup_old_storage(retention_days: int = 30):
             logger.error(f"Storage cleanup job failed: {e}")
 
 
-async def deduplicate_persons():
+def _run_job_loop(coro_factory):
+    """Run a job coroutine in a fresh event loop, disposing the shared async
+    engine before the loop closes.
+
+    Job entry points (spawn process pool children) are sync and create their
+    own loop via asyncio.run(). Without engine disposal, pooled asyncpg
+    connections are garbage-collected AFTER the loop closes and raise
+    'RuntimeError: Event loop is closed' noise at child exit.
+    """
+
+    async def _runner():
+        try:
+            return await coro_factory()
+        finally:
+            from app.core.db.session import async_engine
+            await async_engine.dispose()
+
+    return asyncio.run(_runner())
+
+
+def _job_entry_dedup(full: bool) -> dict:
+    """Spawn-pool entry — blocking. Runs one dedup cycle in its own process."""
+    from app.logging_config import setup_logging
+    setup_logging()
+    return _run_job_loop(lambda: _deduplicate_persons_impl(full=full))
+
+
+async def deduplicate_persons(full: bool = False):
+    """Scheduler entry — runs the heavy dedup cycle in a spawn process pool.
+
+    The cycle (pair ANN search, merges, numpy contamination cleanup, billing
+    repair with optional model-based stitch) is CPU/IO heavy and must not run
+    on the worker's asyncio process; see app/modules/jobs/process_pool.py.
+    """
+    from app.modules.jobs.process_pool import run_in_subprocess
+    await run_in_subprocess(_job_entry_dedup, full)
+
+
+async def _deduplicate_persons_impl(full: bool = False) -> dict:
     """
     Merge duplicate PersonIdentity records created when two cameras register the
     same physical person separately (cross-angle face similarity just below the
@@ -184,15 +222,27 @@ async def deduplicate_persons():
          • DELETE loser (cascades to person_embeddings / person_face_embeddings)
     4. Log a summary.
 
+    Incremental probing (2026-10-08): unless ``full=True``, only embeddings
+    created within DEDUP_PROBE_WINDOW_MINUTES are used as the OUTER probe side.
+    The inner side stays an unrestricted IVFFlat ANN lookup, so new-vs-old and
+    new-vs-new pairs are both found. Probing all ~20k embeddings every run was
+    the 5.5-6 min bottleneck (outer Seq Scan + per-row ANN + spill-prone pair
+    sort). Old-vs-old pairs were already probed when those embeddings were new;
+    a daily full sweep covers downtime, ANN recall misses, and pairs unblocked
+    when the same-camera overlap lookback expires.
+
     This job runs every 6 minutes.  It does NOT modify any config or realtime
     state — only the PostgreSQL person tables.
     """
+    import time as _time
     from app.config import get_settings
     settings = get_settings()
     threshold = 0.40  # empirically determined from retail CCTV face distribution
     import uuid as _uuid_mod
     job_run_id = str(_uuid_mod.uuid4())
     job_run_at = utc_now()
+    t_job = _time.monotonic()
+    timings: dict[str, float] = {}
 
     async with AsyncSessionLocal() as db:
         try:
@@ -205,14 +255,30 @@ async def deduplicate_persons():
             # fast ANN search with adequate recall for dedup threshold 0.40.
             # DO NOT raise probes to match lists — that turns ANN into a full
             # sequential scan (e.g. probes=50 with old lists=50 ran 36 min+).
+            t0 = _time.monotonic()
             await db.execute(text("SET LOCAL ivfflat.probes = 10"))
+            # The pair sort spills to disk at 4MB work_mem (up to ~100k pair
+            # rows). Session-local override, only for this transaction.
+            await db.execute(text(f"SET LOCAL work_mem = '{settings.DEDUP_PAIR_QUERY_WORK_MEM}'"))
 
-            pairs_result = await db.execute(text("""
+            probe_window = int(settings.DEDUP_PROBE_WINDOW_MINUTES)
+            if full:
+                outer_filter = ""
+                params: dict = {"threshold": threshold}
+            else:
+                outer_filter = "WHERE created_at > now() - make_interval(mins => :win)"
+                params = {"threshold": threshold, "win": probe_window}
+
+            pairs_result = await db.execute(text(f"""
                 SELECT DISTINCT
                     LEAST(a.person_identity_id::text, b_near.person_identity_id::text)  AS pid_a,
                     GREATEST(a.person_identity_id::text, b_near.person_identity_id::text) AS pid_b,
                     MAX(1.0 - (b_near.dist)) AS max_sim
-                FROM person_face_embeddings a
+                FROM (
+                    SELECT person_identity_id, embedding
+                    FROM person_face_embeddings
+                    {outer_filter}
+                ) a
                 CROSS JOIN LATERAL (
                     SELECT pfe.person_identity_id,
                            pfe.embedding <=> a.embedding AS dist
@@ -224,17 +290,27 @@ async def deduplicate_persons():
                 ) b_near
                 GROUP  BY pid_a, pid_b
                 HAVING MAX(1.0 - (b_near.dist)) >= :threshold
-            """), {"threshold": threshold})
+            """), params)
 
             pairs = pairs_result.fetchall()
+            timings["pair_query"] = _time.monotonic() - t0
 
             if not pairs:
-                logger.debug("Dedup job: no duplicate pairs found.")
-                return
-
-            logger.info(f"Dedup job: found {len(pairs)} duplicate pair(s) — merging...")
+                # Do NOT return early — contamination cleanup and billing repair
+                # below must still run even when a (common, with incremental
+                # probing) window finds no new duplicate pairs.
+                logger.debug(
+                    f"Dedup job: no duplicate pairs found ({'full' if full else f'last {probe_window}m'})."
+                )
+            else:
+                logger.info(
+                    f"Dedup job: found {len(pairs)} duplicate pair(s) — merging... "
+                    f"(pair_query={timings['pair_query']:.1f}s, "
+                    f"probe={'full DB' if full else f'{probe_window}m window'})"
+                )
 
             # ── Same-camera temporal overlap gate (dedup) ─────────────────
+            t0 = _time.monotonic()
             # Drop face-similar pairs whose RECENT tracks overlap on the same
             # camera — those cannot be the same physical person.
             # Lookback + longer min_sec avoid permanent lock from brief
@@ -316,12 +392,15 @@ async def deduplicate_persons():
                 # Normalize row access to (a,b,sim) triples when gate off
                 pairs = [(str(r[0]), str(r[1]), float(r[2])) for r in pairs]
 
+            timings["overlap_filter"] = _time.monotonic() - t0
+
             if not pairs:
                 logger.debug("Dedup job: no mergeable pairs after overlap filter.")
             else:
                 logger.info(f"Dedup job: merging {len(pairs)} pair(s) after overlap filter...")
 
             # ── Step 2–3: merge only when pairs remain after filter ─────────
+            t0 = _time.monotonic()
             merged_count = 0
             failed_count = 0
             deferred_minio_paths: list[str] = []
@@ -550,6 +629,9 @@ async def deduplicate_persons():
                     # ── Deferred MinIO cleanup for merged losers ──────────────
                     if deferred_minio_paths:
                         from app.modules.storage.minio_client import delete_object as minio_del
+                        # Blocking minio-py calls are fine here — this whole job
+                        # body runs in the spawn process pool, not on the event
+                        # loop of the worker process (see process_pool.py).
                         for path in set(deferred_minio_paths):
                             try:
                                 key = path.split("/", 1)[1] if "/" in path else path
@@ -562,23 +644,29 @@ async def deduplicate_persons():
                         f"{f', {failed_count} failed (skipped)' if failed_count else ''}."
                     )
 
+            timings["merges"] = _time.monotonic() - t0
+
             # ── Step 4: clean contaminated face embeddings ──────────────────
+            t0 = _time.monotonic()
             face_removed = await _clean_contaminated_face_embeddings(db, settings)
+            timings["face_cleanup"] = _time.monotonic() - t0
 
             if face_removed > 0:
                 await db.commit()
                 logger.info(f"Face contamination cleanup: removed {face_removed} face embedding(s).")
 
             # ── Step 5: clean contaminated body embeddings ──────────────────
+            t0 = _time.monotonic()
             body_removed = await _clean_contaminated_body_embeddings(db, settings)
+            timings["body_cleanup"] = _time.monotonic() - t0
             if body_removed > 0:
                 await db.commit()
                 logger.info(f"Body contamination cleanup: removed {body_removed} body embedding(s).")
 
-            # ── Step 6: sweep orphaned MinIO objects ─────────────────────────
-            swept = await _sweep_orphaned_crops(db)
-            if swept > 0:
-                logger.info(f"MinIO sweep: removed {swept} unreferenced crop file(s).")
+            # NOTE: the MinIO orphan-crop sweep no longer runs here — it is a
+            # separate job (minio_sweep_job, every MINIO_SWEEP_INTERVAL_MINUTES).
+            # It used to hold this transaction open through the bucket listing
+            # (idle-in-transaction 59s+) and could stretch a cycle to 47 min.
 
         except Exception as e:
             await db.rollback()
@@ -587,12 +675,23 @@ async def deduplicate_persons():
     # After person merges stabilize FKs — repair fragmented counter dwell /
     # null-person BI that same-session live backfill cannot fix.
     try:
+        t0 = _time.monotonic()
         await repair_fragmented_billing_visits(
             job_run_id=job_run_id,
             job_run_at=job_run_at,
         )
+        timings["repair"] = _time.monotonic() - t0
     except Exception as e:
         logger.error(f"Billing visit repair after dedup failed: {e}")
+
+    timings["total"] = _time.monotonic() - t_job
+    logger.info(
+        "Dedup job: done in {:.1f}s ({})".format(
+            timings["total"],
+            " ".join(f"{k}={v:.1f}s" for k, v in timings.items() if k != "total"),
+        )
+    )
+    return timings
 
 
 def cluster_sessions_into_visits(
@@ -1537,34 +1636,35 @@ async def _clean_contaminated_face_embeddings(db, settings) -> int:
     """
     import numpy as np
 
+    # One batched fetch instead of per-person N+1 (was 4.6k round-trips/run).
     r = await db.execute(text("""
-        SELECT pi.id FROM person_identities pi
-        WHERE (SELECT COUNT(*) FROM person_face_embeddings
-               WHERE person_identity_id = pi.id) >= 2
+        SELECT person_identity_id, id, embedding, face_score, is_registration
+        FROM person_face_embeddings
+        WHERE embedding IS NOT NULL
+          AND person_identity_id IN (
+              SELECT person_identity_id FROM person_face_embeddings
+              GROUP BY person_identity_id HAVING count(*) >= 2
+          )
+        ORDER BY person_identity_id, face_score DESC
     """))
-    person_ids = [row[0] for row in r.fetchall()]
+    rows_by_pid: dict[str, list] = {}
+    for row in r.fetchall():
+        rows_by_pid.setdefault(str(row[0]), []).append(row)
 
-    # Fetch all embeddings upfront (avoids interleaving DB + numpy work)
     person_data = []
-    for pid in person_ids:
-        r2 = await db.execute(text("""
-            SELECT id, embedding, face_score, is_registration FROM person_face_embeddings
-            WHERE person_identity_id = :pid AND embedding IS NOT NULL
-            ORDER BY face_score DESC
-        """), {"pid": str(pid)})
-        rows = r2.fetchall()
+    for pid, rows in rows_by_pid.items():
         if len(rows) < 2:
             continue
-        ids = [r[0] for r in rows]
+        ids = [r2[1] for r2 in rows]
         embs = []
         for row in rows:
-            if isinstance(row[1], str):
-                embs.append(np.array(eval(row[1]), dtype=np.float32))
+            if isinstance(row[2], str):
+                embs.append(np.array(eval(row[2]), dtype=np.float32))
             else:
-                embs.append(np.array(row[1], dtype=np.float32))
+                embs.append(np.array(row[2], dtype=np.float32))
         # Staff registration faces are pinned: they vote in the medians but are never removed
-        pinned = {i for i, row in enumerate(rows) if row[3]}
-        person_data.append((str(pid), ids, embs, pinned))
+        pinned = {i for i, row in enumerate(rows) if row[4]}
+        person_data.append((pid, ids, embs, pinned))
 
     threshold = settings.FACE_CONTAMINATION_THRESHOLD
 
@@ -1644,32 +1744,34 @@ async def _clean_contaminated_body_embeddings(db, settings) -> int:
     """
     import numpy as np
 
+    # One batched fetch instead of per-person N+1 (same pattern as face cleanup).
     r = await db.execute(text("""
-        SELECT pi.id FROM person_identities pi
-        WHERE (SELECT COUNT(*) FROM person_embeddings
-               WHERE person_identity_id = pi.id) >= 3
+        SELECT person_identity_id, id, embedding, crop_quality
+        FROM person_embeddings
+        WHERE embedding IS NOT NULL
+          AND person_identity_id IN (
+              SELECT person_identity_id FROM person_embeddings
+              GROUP BY person_identity_id HAVING count(*) >= 3
+          )
+        ORDER BY person_identity_id, crop_quality DESC
     """))
-    person_ids = [row[0] for row in r.fetchall()]
+    rows_by_pid: dict[str, list] = {}
+    for row in r.fetchall():
+        rows_by_pid.setdefault(str(row[0]), []).append(row)
 
     # Fetch all embeddings upfront
     person_data = []
-    for pid in person_ids:
-        r2 = await db.execute(text("""
-            SELECT id, embedding, crop_quality FROM person_embeddings
-            WHERE person_identity_id = :pid AND embedding IS NOT NULL
-            ORDER BY crop_quality DESC
-        """), {"pid": str(pid)})
-        rows = r2.fetchall()
+    for pid, rows in rows_by_pid.items():
         if len(rows) < 3:
             continue
-        ids = [r[0] for r in rows]
+        ids = [r2[1] for r2 in rows]
         embs = []
         for row in rows:
-            if isinstance(row[1], str):
-                embs.append(np.array(eval(row[1]), dtype=np.float32))
+            if isinstance(row[2], str):
+                embs.append(np.array(eval(row[2]), dtype=np.float32))
             else:
-                embs.append(np.array(row[1], dtype=np.float32))
-        person_data.append((str(pid), ids, embs))
+                embs.append(np.array(row[2], dtype=np.float32))
+        person_data.append((pid, ids, embs))
 
     threshold = settings.BODY_CONTAMINATION_THRESHOLD
 
@@ -1997,7 +2099,7 @@ async def _revote_person_gender(db, person_id: str):
     )
 
 
-async def _sweep_orphaned_crops(db) -> int:
+async def _sweep_orphaned_crops() -> int:
     """
     Delete MinIO objects under the ``crops/`` prefix that are NOT referenced by
     any live DB row.
@@ -2009,63 +2111,70 @@ async def _sweep_orphaned_crops(db) -> int:
       • track_sessions.best_crop_path
       • track_sessions.bbox_history->>'best_face_crop_path' (debug object only)
 
-    When running in the same process as the API server, this also drains
-    ``CameraWorker._pending_minio_deletes``. When running in the separate
-    worker process, the pending set is not accessible — unreferenced crops
-    are still deleted by the DB cross-reference, just one sweep cycle later.
+    Timing/transaction notes (2026-10-08):
+      • Runs as its own scheduled job (minio_sweep_job), NOT inside the dedup
+        cycle — a 466k-object backlog once stretched dedup to 47 min.
+      • The DB session is CLOSED before any MinIO work. Previously the shared
+        dedup session stayed open through the bucket listing + deletes
+        (observed ``idle in transaction`` 59s+, holding autovacuum back).
+      • Deletes use batched ``remove_objects()`` (MINIO_SWEEP_BATCH_SIZE per
+        call) instead of one HTTP round-trip per object.
 
     Returns the number of objects removed from MinIO.
     """
+    import time as _time
     from app.config import get_settings
     from app.modules.storage.minio_client import get_client, BUCKET_PREFIX
 
     settings = get_settings()
     client = get_client()
     bucket = BUCKET_PREFIX
+    t0 = _time.monotonic()
 
-    # ── 1. Collect every known-referenced path from the DB ───────────────────
+    # ── 1. Collect every known-referenced path from the DB (own session) ──
     known: set[str] = set()
-
-    # face_crop_path (person_face_embeddings)
-    r = await db.execute(text(
-        "SELECT face_crop_path FROM person_face_embeddings WHERE face_crop_path IS NOT NULL"
-    ))
-    for row in r.fetchall():
-        known.add(row[0])
-
-    # face_crop_path (person_identities)
-    r = await db.execute(text(
-        "SELECT face_crop_path FROM person_identities WHERE face_crop_path IS NOT NULL"
-    ))
-    for row in r.fetchall():
-        known.add(row[0])
-
-    # crop_path (person_embeddings)
-    r = await db.execute(text(
-        "SELECT crop_path FROM person_embeddings WHERE crop_path IS NOT NULL"
-    ))
-    for row in r.fetchall():
-        known.add(row[0])
-
-    # best_crop_path (track_sessions)
-    r = await db.execute(text(
-        "SELECT best_crop_path FROM track_sessions WHERE best_crop_path IS NOT NULL"
-    ))
-    for row in r.fetchall():
-        known.add(row[0])
-
-    # best_face_crop_path nested in track_sessions.bbox_history debug object
-    # (legacy rows are a JSON array with no face key — COALESCE/jsonb skips them)
-    r = await db.execute(text("""
-        SELECT bbox_history->>'best_face_crop_path'
-        FROM track_sessions
-        WHERE jsonb_typeof(bbox_history) = 'object'
-          AND bbox_history ? 'best_face_crop_path'
-          AND NULLIF(bbox_history->>'best_face_crop_path', '') IS NOT NULL
-    """))
-    for row in r.fetchall():
-        if row[0]:
+    async with AsyncSessionLocal() as db:
+        # face_crop_path (person_face_embeddings)
+        r = await db.execute(text(
+            "SELECT face_crop_path FROM person_face_embeddings WHERE face_crop_path IS NOT NULL"
+        ))
+        for row in r.fetchall():
             known.add(row[0])
+
+        # face_crop_path (person_identities)
+        r = await db.execute(text(
+            "SELECT face_crop_path FROM person_identities WHERE face_crop_path IS NOT NULL"
+        ))
+        for row in r.fetchall():
+            known.add(row[0])
+
+        # crop_path (person_embeddings)
+        r = await db.execute(text(
+            "SELECT crop_path FROM person_embeddings WHERE crop_path IS NOT NULL"
+        ))
+        for row in r.fetchall():
+            known.add(row[0])
+
+        # best_crop_path (track_sessions)
+        r = await db.execute(text(
+            "SELECT best_crop_path FROM track_sessions WHERE best_crop_path IS NOT NULL"
+        ))
+        for row in r.fetchall():
+            known.add(row[0])
+
+        # best_face_crop_path nested in track_sessions.bbox_history debug object
+        # (legacy rows are a JSON array with no face key — COALESCE/jsonb skips them)
+        r = await db.execute(text("""
+            SELECT bbox_history->>'best_face_crop_path'
+            FROM track_sessions
+            WHERE jsonb_typeof(bbox_history) = 'object'
+              AND bbox_history ? 'best_face_crop_path'
+              AND NULLIF(bbox_history->>'best_face_crop_path', '') IS NOT NULL
+        """))
+        for row in r.fetchall():
+            if row[0]:
+                known.add(row[0])
+    # Session closed here — no transaction is held during MinIO I/O below.
 
     # ── 2. Drain the pending MinIO deletes queue (if in-process) ────────────
     # When running in the separate worker process, CameraWorker is not
@@ -2091,27 +2200,91 @@ async def _sweep_orphaned_crops(db) -> int:
 
     objects_to_check: set[str] = {_normalise(p) for p in pending}
 
-    removed = 0
-    try:
-        obj_list = client.list_objects(bucket, prefix="crops/", recursive=True)
-        for obj in obj_list:
-            key = obj.object_name
-            full_key = f"{bucket}/{key}"
-            objects_to_check.add(key)
+    batch_size = max(1, int(settings.MINIO_SWEEP_BATCH_SIZE))
 
-            if full_key not in known and key not in known:
-                try:
-                    client.remove_object(bucket, key)
-                    removed += 1
-                    logger.debug(f"MinIO sweep: deleted unreferenced object {full_key}")
-                except Exception as e:
-                    logger.warning(f"MinIO sweep: failed to delete {full_key}: {e}")
+    # ── 3. MinIO list + batch purge (blocking — runs in the job subprocess) ──
+    # minio-py is synchronous. Listing 715k objects takes ~60-72s; this whole
+    # function runs via the spawn process pool (see process_pool.py), so the
+    # worker's asyncio event loop is never touched. Batched remove_objects()
+    # replaces one HTTP round-trip per orphan.
+    def _minio_list_and_purge() -> tuple[int, int]:
+        removed = 0
+        listed = 0
+        orphan_batch: list = []
 
-    except Exception as e:
-        logger.error(f"MinIO sweep: failed to list/delete objects: {e}")
-        return removed
+        def _flush_batch():
+            nonlocal removed
+            if not orphan_batch:
+                return
+            from minio.deleteobjects import DeleteObject
+            try:
+                errors = client.remove_objects(
+                    bucket, [DeleteObject(k) for k in orphan_batch]
+                )
+                err_count = 0
+                for err in errors:
+                    err_count += 1
+                    logger.warning(
+                        f"MinIO sweep: batch delete error for {err.object_name}: {err}"
+                    )
+                removed += len(orphan_batch) - err_count
+            except Exception as e:
+                logger.warning(
+                    f"MinIO sweep: batch delete failed ({len(orphan_batch)} objects): {e}"
+                )
+            orphan_batch.clear()
 
+        try:
+            t_list = _time.monotonic()
+            obj_list = client.list_objects(bucket, prefix="crops/", recursive=True)
+            for obj in obj_list:
+                key = obj.object_name
+                full_key = f"{bucket}/{key}"
+                listed += 1
+                objects_to_check.add(key)
+
+                if full_key not in known and key not in known:
+                    orphan_batch.append(key)
+                    if len(orphan_batch) >= batch_size:
+                        _flush_batch()
+
+            _flush_batch()
+            logger.info(
+                f"MinIO sweep: listed {listed} objects in {_time.monotonic() - t_list:.1f}s"
+            )
+        except Exception as e:
+            logger.error(f"MinIO sweep: failed to list/delete objects: {e}")
+
+        return listed, removed
+
+    _listed, removed = _minio_list_and_purge()
+    logger.info(
+        f"MinIO sweep: removed {removed} unreferenced in "
+        f"{_time.monotonic() - t0:.1f}s total ({len(known)} referenced paths)"
+    )
     return removed
+
+
+def _job_entry_minio_sweep() -> int:
+    """Spawn-pool entry — blocking. Runs one orphan-crop sweep in its own process."""
+    from app.logging_config import setup_logging
+    setup_logging()
+    return _run_job_loop(_sweep_orphaned_crops)
+
+
+async def minio_sweep_job():
+    """Scheduled entry point for the orphan-crop sweep (separate from dedup).
+
+    Runs in the spawn process pool — the 715k-object listing (~72s) plus the
+    reference queries must not run on the worker's asyncio process.
+    """
+    from app.modules.jobs.process_pool import run_in_subprocess
+    try:
+        removed = await run_in_subprocess(_job_entry_minio_sweep)
+        if removed > 0:
+            logger.info(f"MinIO sweep job: removed {removed} unreferenced crop file(s).")
+    except Exception as e:
+        logger.error(f"MinIO sweep job failed: {e}")
 
 
 # ---------------------------------------------------------------------------
