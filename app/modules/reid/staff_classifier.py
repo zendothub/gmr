@@ -1,4 +1,10 @@
-"""Live staff classification: consec-5 or 70% of any 15-day window, lazy cache."""
+"""Live staff classification: consec-5 or 70% of any 15-day window, lazy cache.
+
+DISABLED (2026-10-05): no longer called from camera_worker. Staff are now registered
+explicitly with a photo via POST /api/staff/register (app/modules/staff/). The code
+is kept for reference / rollback — re-enable by uncommenting the
+schedule_staff_check() calls in app/modules/ai_runtime/camera_worker.py.
+"""
 
 from __future__ import annotations
 

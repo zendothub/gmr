@@ -1,0 +1,19 @@
+api: yes
+apiAddress: :9997
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+      - action: metrics
+      - action: pprof
+
+# Accept all stream paths (catch-all)
+paths:
+  all_others:
