@@ -1,7 +1,7 @@
 """Background job task implementations."""
 
 import asyncio
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 import anyio
 from loguru import logger
@@ -13,127 +13,101 @@ from app.core.db.models.event import Event
 from app.core.db.models.billing import BillingInteraction
 from app.core.db.models.tracking import TrackSession
 from app.core.db.models.person import PersonIdentity
-from app.core.db.models.analytics import DailyAnalyticsSummary
+from app.core.db.models.analytics import DailyAnalyticsSummary, DailyAnalyticsFrozen
 from app.modules.storage.service import cleanup_old_objects as s3_cleanup_old_objects
 from app.utils.time_utils import utc_now
 
 
-async def aggregate_daily_analytics():
-    """Aggregate yesterday's metrics into a single global daily_analytics_summary row."""
-    yesterday: date = (utc_now() - timedelta(days=1)).date()
-    day_start = datetime.combine(yesterday, datetime.min.time())
-    day_end = day_start + timedelta(days=1)
+_IST_FROZEN = timezone(timedelta(hours=5, minutes=30))
+
+
+async def _freeze_day_impl(day: date, *, source: str = "scheduled", write_legacy: bool = True) -> dict:
+    """Freeze one IST calendar day into daily_analytics_frozen (idempotent).
+
+    Immutability: INSERT ... ON CONFLICT (day) DO NOTHING — the scheduled
+    job never rewrites an existing row. Backfill/repair scripts pass
+    force=True via their own path.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from app.modules.analytics.day_metrics import compute_day_metrics
 
     async with AsyncSessionLocal() as db:
-        try:
-            # Footfall: entry line crossings (across all cameras)
-            total_footfall = (
-                await db.execute(
-                    select(func.count()).where(
-                        Event.event_type == "line_crossing",
-                        Event.occurred_at >= day_start,
-                        Event.occurred_at < day_end,
-                        Event.is_false_positive.is_(False),
-                    )
-                )
-            ).scalar() or 0
-
-            # Unique visitors via distinct person identities
-            unique_visitors = (
-                await db.execute(
-                    select(func.count(func.distinct(TrackSession.person_identity_id))).where(
-                        TrackSession.started_at >= day_start,
-                        TrackSession.started_at < day_end,
-                        TrackSession.person_identity_id.isnot(None),
-                    )
-                )
-            ).scalar() or 0
-
-            # Avg dwell
-            duration = func.extract("epoch", TrackSession.last_seen_at - TrackSession.started_at)
-            avg_dwell = (
-                await db.execute(
-                    select(func.avg(duration)).where(
-                        TrackSession.started_at >= day_start,
-                        TrackSession.started_at < day_end,
-                    )
-                )
-            ).scalar()
-
-            # Billing interactions (unique purchasers excl. staff)
-            total_billing = (
-                await db.execute(
-                    select(func.count(func.distinct(BillingInteraction.person_identity_id))).where(
-                        BillingInteraction.entered_at >= day_start,
-                        BillingInteraction.entered_at < day_end,
-                        BillingInteraction.person_identity_id.notin_(
-                            select(PersonIdentity.id).where(PersonIdentity.is_staff.is_(True))
-                        ),
-                    )
-                )
-            ).scalar() or 0
-
-            # Total events
-            total_events = (
-                await db.execute(
-                    select(func.count()).where(
-                        Event.occurred_at >= day_start,
-                        Event.occurred_at < day_end,
-                    )
-                )
-            ).scalar() or 0
-
-            # Hourly footfall breakdown
-            hourly_q = (
-                select(
-                    func.extract("hour", Event.occurred_at).label("hour"),
-                    func.count().label("count"),
-                )
-                .where(
-                    Event.event_type == "line_crossing",
-                    Event.occurred_at >= day_start,
-                    Event.occurred_at < day_end,
-                    Event.is_false_positive.is_(False),
-                )
-                .group_by("hour")
+        metrics = await compute_day_metrics(db, day, source=source)
+        stmt = pg_insert(DailyAnalyticsFrozen).values(
+            day=day,
+            computed_at=utc_now(),
+            source=source,
+            is_partial=False,
+            unique_total=metrics.unique_total,
+            unique_customers=metrics.unique_customers,
+            unique_staff=metrics.unique_staff,
+            night_only_persons=metrics.night_only_persons,
+            adjusted_unique=metrics.adjusted_unique,
+            adjustment_factor=metrics.adjustment_factor,
+            factor_model_version=metrics.factor_model_version,
+            purchases=metrics.purchases,
+            billing_interactions=metrics.billing_interactions,
+            total_events=metrics.total_events,
+            total_tracks=metrics.total_tracks,
+            avg_dwell_seconds=metrics.avg_dwell_seconds,
+            demographics=metrics.demographics,
+            hourly=metrics.hourly,
+            per_camera=metrics.per_camera,
+            zone_counts=metrics.zone_counts,
+            person_ids=metrics.person_ids,
+            meta=metrics.meta,
+        ).on_conflict_do_nothing(index_elements=["day"])
+        res = await db.execute(stmt)
+        inserted = (res.rowcount or 0) > 0
+        if write_legacy:
+            # Legacy compat: keep daily_analytics_summary filled.
+            # NOTE the old job froze D-2 (UTC-date bug) and ran at 00:15; the
+            # new canonical write lands here with the correct IST day.
+            existing = (await db.execute(
+                select(DailyAnalyticsSummary).where(DailyAnalyticsSummary.summary_date == day)
+            )).scalar_one_or_none()
+            row_data = dict(
+                total_footfall=metrics.unique_customers,
+                unique_visitors=metrics.unique_total,
+                avg_dwell_seconds=metrics.avg_dwell_seconds,
+                total_billing_interactions=metrics.purchases,
+                total_events=metrics.total_events,
+                hourly_footfall={h: v.get("persons", 0) for h, v in (metrics.hourly or {}).items()},
             )
-            hourly = {str(int(r.hour)): r.count for r in (await db.execute(hourly_q)).all()}
-
-            # Upsert the single daily summary row
-            existing = (
-                await db.execute(
-                    select(DailyAnalyticsSummary).where(
-                        DailyAnalyticsSummary.summary_date == yesterday,
-                    )
-                )
-            ).scalar_one_or_none()
-
             if existing:
-                existing.total_footfall = total_footfall
-                existing.unique_visitors = unique_visitors
-                existing.avg_dwell_seconds = float(avg_dwell) if avg_dwell else None
-                existing.total_billing_interactions = total_billing
-                existing.total_events = total_events
-                existing.hourly_footfall = hourly
+                for k, v in row_data.items():
+                    setattr(existing, k, v)
             else:
-                db.add(
-                    DailyAnalyticsSummary(
-                        summary_date=yesterday,
-                        total_footfall=total_footfall,
-                        unique_visitors=unique_visitors,
-                        avg_dwell_seconds=float(avg_dwell) if avg_dwell else None,
-                        total_billing_interactions=total_billing,
-                        total_events=total_events,
-                        hourly_footfall=hourly,
-                    )
-                )
+                db.add(DailyAnalyticsSummary(summary_date=day, **row_data))
+        await db.commit()
+        logger.info(f"Daily analytics frozen for {day} (inserted={inserted}, source={source})")
+        return {"day": str(day), "inserted": inserted, "unique_total": metrics.unique_total,
+                "adjusted_unique": metrics.adjusted_unique, "source": source}
 
-            await db.commit()
-            logger.info(f"Daily analytics aggregated for {yesterday}")
-        except Exception as e:
-            await db.rollback()
-            logger.error(f"Daily analytics aggregation failed: {e}")
 
+def _job_entry_freeze(day_iso: str) -> dict:
+    """Spawn-pool entry — blocking. Freezes one IST day in its own process."""
+    from app.logging_config import setup_logging
+    setup_logging()
+    day = date.fromisoformat(day_iso)
+    return _run_job_loop(lambda: _freeze_day_impl(day))
+
+
+async def freeze_daily_analytics(day_iso: str | None = None):
+    """Scheduler entry — freeze the previous IST day (00:10 IST run)."""
+    from app.modules.jobs.process_pool import run_in_subprocess
+    target = day_iso or (datetime.now(_IST_FROZEN) - timedelta(days=1)).date().isoformat()
+    await run_in_subprocess(_job_entry_freeze, target, timeout=20 * 60)
+
+
+async def aggregate_daily_analytics():
+    """LEGACY shim — superseded by freeze_daily_analytics (00:10 IST).
+
+    Kept so older scheduler configs keep working; delegates to the freeze
+    implementation for the previous IST day (fixes the old UTC-date bug that
+    froze D-2 instead of D-1).
+    """
+    await _freeze_day_impl((datetime.now(_IST_FROZEN) - timedelta(days=1)).date(), write_legacy=True)
 
 
 async def close_stale_track_sessions():

@@ -242,6 +242,25 @@ class Settings(BaseSettings):
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
     YOLO_POSE_CONFIDENCE: float = 0.3  # Keypoint confidence threshold
 
+    # ── Frozen analytics person-count adjustment (2026-10-15) ──────────
+    # Applied ONLY to frozen past-day analytics (today stays raw/live).
+    # Display scale = CUSTOMERS vs GMR Actual. Swap PERSON_ADJUST_MODEL to
+    # compare scenarios without code changes:
+    #   bucket  threshold list PERSON_ADJUST_BUCKETS (default fit below)
+    #   linear  adjusted = A + B * raw
+    #   fixed   adjusted = raw * K
+    #   none    adjusted = raw
+    # c2 fit (40 clean days Sep–Oct, Oct 3–6 outage excluded):
+    # customers (total<210 → ×0.685, ≥210 → ×0.587; daily 86.3%, net 99.2%).
+    # total-scale buckets (internal GMR+40 report): <250 → ×0.741, ≥250 → ×0.661.
+    PERSON_ADJUST_MODEL: str = "bucket"
+    PERSON_ADJUST_BUCKETS: str = "250:0.741,999999:0.661"
+    PERSON_ADJUST_CUST_BUCKETS: str = "210:0.685,999999:0.587"
+    PERSON_ADJUST_A: float = 78.6
+    PERSON_ADJUST_B: float = 0.413
+    PERSON_ADJUST_K: float = 0.734
+    PERSON_ADJUST_VERSION: str = "2026-10-c2"
+
     # Runtime
     DEFAULT_FPS_TARGET: int = 10
     MAX_WORKERS: int = 10

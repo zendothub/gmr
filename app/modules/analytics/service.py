@@ -95,6 +95,18 @@ from app.utils.time_utils import utc_now
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+def _uses_frozen_days(start: datetime, end: datetime) -> bool:
+    """True if [start, end] touches any day strictly before today (IST).
+
+    Frozen strategy: past days read daily_analytics_frozen; today always
+    computes live. Ranges ending before today are fully frozen; ranges that
+    include today mix frozen past days + live today.
+    """
+    today = datetime.now(IST).date()
+    s = start.astimezone(IST) if start.tzinfo else start.replace(tzinfo=IST)
+    return s.date() < today
+
+
 def _default_range(start_time: Optional[datetime], end_time: Optional[datetime]):
     """Default to the last 24 hours if no range is given."""
     end = end_time or utc_now()
@@ -139,6 +151,9 @@ class AnalyticsService:
         """Footfall from entry-line crossing events (entry cameras)."""
         start, end = _default_range(start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_footfall(db, start, end, cam_ids, interval)
 
         query = select(Event).where(
             Event.event_type == "line_crossing",
@@ -202,6 +217,9 @@ class AnalyticsService:
         """Billing counter interaction analytics."""
         start, end = _default_range(start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_billing(db, start, end, cam_ids, interval)
 
         base = select(BillingInteraction).where(
             BillingInteraction.entered_at >= start,
@@ -260,6 +278,9 @@ class AnalyticsService:
         """Average dwell (track session duration) analytics."""
         start, end = _default_range(start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_dwell(db, start, end, cam_ids)
 
         duration = func.extract(
             "epoch", TrackSession.last_seen_at - TrackSession.started_at
@@ -300,6 +321,9 @@ class AnalyticsService:
     ) -> ZoneOccupancyResponse:
         """Event activity per zone in the given range."""
         start, end = _default_range(start_time, end_time)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_zone_occupancy(db, start, end)
 
         query = (
             select(
@@ -355,6 +379,10 @@ class AnalyticsService:
         """
         start, end = _default_range(start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
+
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_dashboard_summary(db, start, end, cam_ids)
 
         seen = _seen_in_window(start, end, cam_ids)
         unique_q = select(func.count(PersonIdentity.id)).where(seen)
@@ -475,6 +503,9 @@ class AnalyticsService:
         """
         start, end = _default_range(start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, camera_id=camera_id, store_id=store_id)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_demographics_table(db, start, end, cam_ids)
 
         rows_q = select(
             PersonIdentity.id,
@@ -668,6 +699,9 @@ class AnalyticsService:
 
         range_days = (end - start).total_seconds() / 86400
         resolved = AnalyticsService._resolve_group_by(group_by, range_days)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            return await fc.frozen_entry_exit(db, start, end, cam_ids, resolved)
 
         # -- build DB query with the appropriate PostgreSQL bucket -------
         # For week/month, date_trunc uses "week" / "month" in Postgres
@@ -840,6 +874,30 @@ class AnalyticsService:
         """
         start, end, prev_start, prev_end = cls._v2_resolve_range(time_range, start_time, end_time)
         cam_ids = await _resolve_camera_ids(db, store_id=store_id)
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            range_days0 = (end - start).total_seconds() / 86400
+            resolved0 = cls._resolve_group_by("auto", range_days0)
+            display_end0 = end
+            if resolved0 == "hour" and time_range in ("today", "weekly"):
+                display_end0 = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+            store_name0 = "All Stores"
+            if store_id:
+                store_row0 = await db.execute(select(Store.name).where(Store.id == store_id))
+                sn0 = store_row0.scalar_one_or_none()
+                if sn0:
+                    store_name0 = sn0
+            cam_base0 = select(func.count(Camera.id)).where(Camera.is_active.is_(True))
+            active_base0 = cam_base0.where(Camera.status == "active")
+            if store_id:
+                cam_base0 = cam_base0.where(Camera.store_id == store_id)
+                active_base0 = active_base0.where(Camera.store_id == store_id)
+            total_cameras0 = (await db.execute(cam_base0)).scalar() or 0
+            active_cameras0 = (await db.execute(active_base0)).scalar() or 0
+            return await fc.frozen_dashboard_v2(
+                db, start, end, prev_start, prev_end, cam_ids, store_id, store_name0,
+                time_range, total_cameras0, active_cameras0, resolved0, display_end0,
+            )
 
         # ── 1. Store name ────────────────────────────────────────────────
         store_name = "All Stores"
@@ -1136,6 +1194,18 @@ class AnalyticsService:
         range_days = (end - start).total_seconds() / 86400
         resolved = cls._resolve_group_by("auto", range_days)
         duration = end - start  # length of one period
+        if _uses_frozen_days(start, end):
+            from app.modules.analytics import frozen_composer as fc
+            store_name_m = "All Stores"
+            if store_id:
+                row_m = await db.execute(select(Store.name).where(Store.id == store_id))
+                sn_m = row_m.scalar_one_or_none()
+                if sn_m:
+                    store_name_m = sn_m
+            return await fc.frozen_metrics(
+                db, start, end, prev_start, prev_end, cam_ids, metric, resolved,
+                store_id, store_name_m, time_range,
+            )
 
         # ── store name ─────────────────────────────────────────────────
         store_name = "All Stores"

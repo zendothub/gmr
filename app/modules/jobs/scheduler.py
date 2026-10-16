@@ -15,6 +15,7 @@ from app.modules.jobs.tasks import (
     deduplicate_persons,
     cleanup_stale_sessions,
     minio_sweep_job,
+    freeze_daily_analytics,
 )
 
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -33,11 +34,15 @@ def start_scheduler() -> AsyncIOScheduler:
 
     _scheduler = AsyncIOScheduler()
 
-    # Daily analytics aggregation at 00:15 every day
+    # Daily analytics freeze at 00:10 IST (server local time): computes the
+    # previous IST day and stores an immutable row in daily_analytics_frozen.
+    # Dashboard/analytics past days read this table only; today stays live.
+    # Also upserts daily_analytics_summary for legacy compatibility, replacing
+    # the old 00:15 job (which had a UTC-date bug freezing D-2).
     _scheduler.add_job(
-        aggregate_daily_analytics,
-        CronTrigger(hour=0, minute=15),
-        id="daily_analytics_aggregation",
+        freeze_daily_analytics,
+        CronTrigger(hour=0, minute=10),
+        id="daily_analytics_freeze",
         replace_existing=True,
     )
 

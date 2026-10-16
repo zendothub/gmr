@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** October 8, 2026 (dedup job performance rework — incremental pair probing, sweep decoupled; see #31)  
+> **Last updated:** October 16, 2026 (customer-scale bucket adjustment wired into dashboard UI; see #34)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -690,7 +690,49 @@ Steps:
 
 ---
 
-## Dual-quality browser streams (2026-08-12)
+## 32. Daily analytics freeze (NEW 2026-10-15)
+
+**Problem:** every analytics number was recomputed live from mutable identity state — dedup merges + faceless deletion kept rewriting past days (e.g. Oct 8's count drifted 172→169→163 across snapshots; Sep frozen rows vs live now differ by up to −77). Meanwhile `daily_analytics_summary` (the old freeze) was write-only (no reader), froze **D-2 instead of D-1** (UTC-date bug: `(utc_now() - 1 day).date()` at 00:15 IST), and had gaps (2026-10-03..06).
+
+**Design:** `daily_analytics_frozen` (migration `0012`) — one immutable row per IST day. Past days served from this table only; **today stays live**. Written at **00:10 IST** by `freeze_daily_analytics` (spawn process pool, same `_job_entry_*` + `run_in_subprocess` pattern), which also upserts `daily_analytics_summary` for legacy compat (the old 00:15 job retired; legacy function kept as a delegating shim).
+
+**Row payload** (`app/modules/analytics/day_metrics.py::compute_day_metrics` — SHARED with the live path so frozen and live can never diverge in DEFINITION): scalar counts (unique total/customers/staff, night-only, purchases, BI rows, events, tracks, avg dwell), v1 demographics cross-tab JSON, v2 6-bin age/gender cards JSON, hourly×24 JSON (persons/male/female/unidentified/purchasers/BI dwell/line-cross rows/entry/exit/events/tracks), per-camera JSON (tracks/dwell/persons/purchasers/gender), zone counts, and a per-person JSON payload (uuid, raw gender/age_group/estimated_age/staff flag, cam ids, purchase rows `[hour, camera, dwell]`, track hours, billing cams). Calibration: `adjusted_unique` + `adjustment_factor` + `factor_model_version`.
+
+**Adjustment factor** (`app/modules/analytics/adjustment.py`): env-swappable — `PERSON_ADJUST_MODEL` = `linear` (default `78.6 + 0.413×raw`, fit frozen-vs-GMR+40 on Sep 15–Oct 13) | `fixed` (×K) | `bucket` (split) | `none`. Applied to FROZEN totals only; linear guards `raw<=0 → 0`. See `.env.example`. Recompute via the accuracy-table calibration queries; bump `PERSON_ADJUST_VERSION`.
+
+**Read path** (`daily_provider.py` + `frozen_composer.py`): `get_day_metrics` returns frozen for past days, live compute for today; missing/migrating table degrades to live (warns, never 500s). Range composition unions frozen person-UUID sets → true multi-day DISTINCT (repeat visitors counted once) + exact camera filters + partial-day hour clips. Endpoint hooks route past-touching ranges through the composer: `get_dashboard_v2`, `get_analytics_metrics`, `get_dashboard_summary`, `get_demographics_table`, v1 footfall/billing/dwell/zone-occupancy, entry-exit. Verified against frontend: dashboard + analytics pages + live-feeds bottom strip all consume only these two v2 endpoints. `live-viewers` + `person-journey` stay live. `tests/test_daily_freeze.py` (11 tests). Known approximation: v1 footfall camera-filtered `unique_visitors` uses filtered hour rows (single-cam exact; multi-cam tight bound) — v1 endpoints have zero frontend consumers.
+
+**Backfill:** `danger/backfill_daily_frozen.py` (dry-run default, `--apply` writes, `--force` replaces). Per day: recompute full metrics, prefer `unique_total` from `daily_analytics_summary` when present (`source=backfill_snapshot`), else live (`backfill_live`); repairs `daily_analytics_summary` gaps with the same recompute. Apply order after deploy: dry-run → review → `--apply` → spot-check.
+
+**Deploy:** migration auto-applies on API start (`alembic upgrade head` in ExecStartPre). Restart `retail-ai.service` (API read path + migration) AND `retail-ai-worker.service` (00:10 freeze job). Then run the backfill with `--apply`.
+
+---
+
+## 33. Staff cleanup + frozen backfill executed (2026-10-15)
+
+**Staff rule (user decision):** keep auto-classified staff with **>10 distinct lifetime IST days** of tracks; registered staff (`metadata_json.staff_registered`) always kept. Executed via `danger/demote_stale_staff.py` (dry-run first, then `--apply`): **238 → 102 staff** (136 demoted, all `days<=10`; 36 registered + 31 active kept). A further 39 auto-staff with >10 days but not seen in the last 5 days (Oct 11–15) were listed as `[REVIEW-stale]` and NOT demoted (possible monthly/seasonal staff — demote with `--apply --include-stale` after eyeballing). Demotion is history-preserving (`is_staff=false`; tracks/events/billing stay attached) so people re-count as customers in subsequent freezes.
+
+**Backfill executed:** `danger/backfill_daily_frozen.py --start 2026-07-10 --apply` — 97/97 days inserted, 0 errors: 89 `backfill_snapshot` (true day-close totals from `daily_analytics_summary`), 8 `backfill_live` (no summary row). Also repaired `daily_analytics_summary` gaps (now 98 rows, Jul 9–Oct 14, incl. missing 2026-10-03..06). Spot checks: Oct 8 → 286 total / 217 customers / 89 purchases; Oct 13 → 237 / 195 / 91; Oct 14 → 253 / 220 / 99. API verified serving frozen rows for past days (footfall union 393 clean across Oct 12–13) and live for today. Person-adjustment on frozen totals: `adjusted = 78.6 + 0.413×raw` (`PERSON_ADJUST_*`, version `2026-10-c1`).
+
+---
+
+**Dual-quality browser streams (2026-08-12)** is documented after the numbered items.
+
+---
+
+## 34. Customer-scale bucket adjustment in dashboard UI (2026-10-16)
+
+**Decision (user):** store comparison is **fitted customers vs GMR Actual only**; total-vs-total (+40/+60 staff) is internal. Ground truth committed at `danger/store_counts.csv` (Aug–Oct, incl. Shopware sponsorship data; `na` UI for Oct 12–14 kept as NULL).
+
+**Model `2026-10-c2`:** bucketed multiplier on estimated day-close customers (`unique_total − unique_staff`): `<210 → ×0.685`, `≥210 → ×0.587` (env: `PERSON_ADJUST_CUST_BUCKETS`). Total-scale buckets for the internal report: `<250 → ×0.741`, `≥250 → ×0.661`. Fit on 40 clean Sep–Oct days (Oct 3–6 server outage excluded; August excluded — its backfill_live totals are eroded, no snapshots). Achieved vs GMR: **daily 86.3%, net 99.2%**. Contrast: flat 0.653 gives 84.1%/97.5%; no factor gives 39.3%/43.1%.
+
+**Wiring:** frozen rows carry `adjusted_customers` + `customer_factor` (migration `0013`, model + day_metrics + provider). `frozen_dashboard_v2` / `frozen_metrics` footfall cards read the **stored** per-day value (sums across ranges); slots/charts keep raw shape. Today stays live/raw. UI sees adjusted counts; raw frozen columns stay immutable for audit.
+
+**Bugfix 2026-10-16:** `customer_factor` was keyed on `unique_total` while the approved fit buckets on the *customer estimate* (`unique_total − unique_staff`) — ~35 staff shifted 18/40 days into the wrong bucket and dropped net accuracy to 92.7%. Fixed in `adjustment.py` (`customer_factor(est)`), `day_metrics.py`, and `refit_person_adjust.py`, with a regression test (`test_adjust_customers_keys_on_est_not_total`). Refit re-run on all 98 rows. Stored rows now match the approved numbers exactly: Sep 86.5%/96.2%, Oct 85.5%/87.6%, ALL **86.3%/99.2%**.
+
+**Refit protocol:** `danger/refit_person_adjust.py --report` prints customers-vs-GMR + total-vs-GMR40 accuracy for the env model; `--apply` rewrites ONLY the four factor columns (+version) on all frozen rows. Refits must exclude outage/no-snapshot days from the fit (flag via the CSV / outage list), and out-of-observed-range buckets (singletons <170 / ≥270) are clamped to neighbor k until 5+ days of evidence exist.
+
+**Deploy:** restart `retail-ai.service` (migration 0013 auto-applies + read path), `retail-ai-worker.service` (freeze job writes new fields).
 
 Dashboard multi-cam grids were pulling full native-resolution burn-in feeds and saturating bandwidth.
 
