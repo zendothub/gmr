@@ -1666,6 +1666,9 @@ class IdentityDecisionEngine:
     async def _prune_face_embeddings(self, db: AsyncSession, person_id: uuid.UUID):
         """Keep only the best-quality K face embeddings per identity.
 
+        Staff registration faces (is_registration) are pinned: not counted toward K
+        and never deleted.
+
         Excess rows are deleted from the DB.  MinIO file deletion is deferred to
         the periodic sweep in ``deduplicate_persons()`` (every 10 min) which
         cross-references files against all live DB paths before deleting.
@@ -1673,7 +1676,7 @@ class IdentityDecisionEngine:
         try:
             query = text("""
                 SELECT id, face_crop_path FROM person_face_embeddings
-                WHERE person_identity_id = :pid
+                WHERE person_identity_id = :pid AND NOT is_registration
                 ORDER BY face_score DESC, captured_at DESC
                 OFFSET :keep
             """)

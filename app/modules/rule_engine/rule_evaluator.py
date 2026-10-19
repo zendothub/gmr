@@ -92,8 +92,19 @@ class RuleEvaluator:
                     event = self._evaluate_single(rule, track, camera_id,
                                                    frame_width, frame_height)
                     if event:
-                        # Check cooldown
-                        cooldown_key = f"{rule['id']}:{track.local_track_id}"
+                        # Check cooldown.
+                        # For billing_interaction rules: key on person_identity_id (not
+                        # track_id) so that track fragmentation (ByteTrack losing and
+                        # restarting the same person) does not produce multiple billing
+                        # events within the cooldown window for the same customer.
+                        # Fall back to track_id when the identity is not yet resolved.
+                        if (
+                            rule_type == "billing_interaction"
+                            and track.person_identity_id is not None
+                        ):
+                            cooldown_key = f"{rule['id']}:person:{track.person_identity_id}"
+                        else:
+                            cooldown_key = f"{rule['id']}:{track.local_track_id}"
                         cooldown_secs = rule.get("cooldown_seconds", 30)
                         if is_within_cooldown(self._cooldown_tracker.get(cooldown_key), cooldown_secs):
                             continue

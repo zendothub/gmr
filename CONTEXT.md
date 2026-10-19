@@ -1,6 +1,6 @@
 # CONTEXT.md — Retail Eye Insights Cross-Session Memory
 
-> **Last updated:** September 1, 2026 (staff rule: consec-5 or 70%/15d window; lazy live revalidation)  
+> **Last updated:** October 16, 2026 (customer-scale bucket adjustment wired into dashboard UI; see #34)  
 > **Purpose:** Every AI session MUST read this file first. It contains all architectural decisions, model choices, threshold values, known issues, and the reasoning behind every critical change made to the system.
 
 ---
@@ -159,7 +159,17 @@ Frame N+4 (window fires):
 
 ## Staff Detection & Purchase Dedup
 
-**Staff auto-classification** (live, after `decide_identity` in the API/camera process — NOT the dedup job):
+**Staff registration (NEW 2026-10-05 — replaces auto-classification):**
+- `POST /api/staff/register` (multipart: `images` 1–5 photos, optional `name`, optional `person_identity_id`). Code: `app/modules/staff/`.
+- One face per photo (InsightFace `detect_all_faces`, largest face; reject if 2nd face ≥50% area or det_score < `FACE_IDENTITY_MIN_SCORE`). Multiple photos must agree (sim ≥ `FACE_CONTAMINATION_THRESHOLD`).
+- Global face search: best sim ≥ `FACE_MATCH_THRESHOLD` (0.40) → existing identity marked `is_staff` (history kept, action=`linked`); else new identity `is_staff=TRUE` (action=`created`). Registration faces stored in `person_face_embeddings` (camera_id NULL, crops under MinIO `staff/` prefix, outside `crops/` sweep). Takes `IDENTITY_ADVISORY_LOCK_KEY`.
+- `metadata_json.staff_registered=true` marks registered staff. Dedup winner prefers registered staff; merge propagates `is_staff` from loser to winner.
+- `GET /api/staff` lists staff; `DELETE /api/staff/{id}` demotes to customer (identity kept).
+- `POST /api/staff/check-image` (2026-10-06): read-only pre-registration check, same `assess_image()` register uses. All checks are hard FAIL (register returns 422 with the message, nothing stored): no face, 2nd face ≥50% area, det_score < `FACE_IDENTITY_MIN_SCORE`, blur (Laplacian var of 112×112 grey face < 50; real photos: blurry 39, clear 100–370). Size / too-close / pose / lighting are reported in `metrics` only — removed as gates on request. Also returns `same_person` and `existing_match`. Re-registering an existing staff member with the same photo → 422.
+- Live pipeline unchanged: face search in `decide_identity` is global (no time window), so CCTV tracks match the registered identity → excluded from analytics, eligible for staff reattach.
+- **Registration faces are pinned** (`person_face_embeddings.is_registration`, migration `0010_staff_reg`): excluded from the `MAX_FACE_EMBEDDINGS_PER_PERSON` cap (live `_prune_face_embeddings` + dedup absorb prune), never removed by `_clean_contaminated_face_embeddings` / `danger/clean_contaminated_embeddings.py` (they still vote in medians), always moved (never dropped) in `_absorb_face_embeddings`. Registration set itself capped at 5 (best face_score). So a staff identity = up to 5 registration faces + up to 5 CCTV faces. Why: the registration photo is the only verified sample; phone-vs-CCTV sim can be <0.35 so the median cleanup would otherwise delete it.
+
+**Staff auto-classification — DISABLED 2026-10-05** (code kept in `staff_classifier.py`; `schedule_staff_check` calls commented out in `camera_worker.py`). Previous behaviour, live, after `decide_identity` in the API/camera process — NOT the dedup job:
 - `PersonIdentity.is_staff` boolean, indexed
 - Face required AND (consecutive ≥5 IST calendar days OR ≥11 days present in any 15-day window)
 - Lifetime 30 min / any-3-days removed (false merges accumulated 30 min)
@@ -222,7 +232,7 @@ Frame N+4 (window fires):
 | Rule engine | `rule_evaluator.py`, `zone_event_detector.py` |
 | Analytics queries | `analytics/service.py` |
 | Background jobs | `jobs/tasks.py`, `jobs/scheduler.py` |
-| Staff detection | `jobs/tasks.py` (deduplicate_persons) |
+| Staff registration | `modules/staff/` (auto classifier `reid/staff_classifier.py` disabled) |
 | MinIO sweep | `jobs/tasks.py` (_sweep_orphaned_crops) |
 | Crop helpers | `image_utils.py` |
 | Config/Thresholds | `config.py` |
@@ -441,20 +451,28 @@ Frame N+4 (window fires):
 ## Process Architecture
 
 ```
-+-----------------------------+   +------------------------------+   +------------------------------+
-| retail-ai.service           |   | retail-ai-worker.service     |   | reextract-faces.timer        |
-| (API Server, ~3.4 GB GPU)   |   | (Background Jobs, ~100 MB)   |   | (GPU Worker, oneshot)        |
-|                             |   |                              |   |                              |
-| - FastAPI HTTP endpoints    |   | - deduplicate_persons (10m)  |   | - Re-extract face from crops |
-| - Camera workers (YOLO,     |   | - close_stale_tracks (5m)    |   | - Delete faceless persons    |
-|   InsightFace, OSNet, etc.) |   | - probe_cameras (2m)         |   | - Every 20 min               |
-| - Stream broadcasters       |   | - daily_analytics (00:15)    |   | - Loads InsightFace (1.5GB)  |
-| - In-memory track state     |   | - storage_cleanup (02:00)    |   | - Frees GPU on exit          |
-| - NO background jobs        |   | - NO GPU, NO camera          |   |                              |
-+-----------------------------+   +------------------------------+   +------------------------------+
++-----------------------------+   +----------------------------------------+   +------------------------------+
+| retail-ai.service           |   | retail-ai-worker.service               |   | reextract-faces.timer        |
+| (API Server, ~3.4 GB GPU)   |   | (Background Jobs scheduler, ~100 MB)   |   | (GPU Worker, oneshot)        |
+|                             |   |                                        |   |                              |
+| - FastAPI HTTP endpoints    |   | - deduplicate_persons (6m, incremental)|   | - Re-extract face from crops |
+| - Camera workers (YOLO,     |   | - minio_sweep (30m, orphan crops)      |   | - Delete faceless persons    |
+|   InsightFace, OSNet, etc.) |   | - close_stale_tracks (5m)              |   | - Every 20 min               |
+| - Stream broadcasters       |   | - probe_cameras (2m)                   |   | - Loads InsightFace (1.5GB)  |
+| - In-memory track state     |   | - daily_analytics (00:15)              |   | - Frees GPU on exit          |
+| - NO background jobs        |   | - storage_cleanup (02:00)              |   |                              |
+|                             |   | - dedup FULL sweep (03:30)             |   |                              |
+|                             |   |                                        |   |                              |
+|                             |   |  Heavy job bodies run in a spawn       |   |                              |
+|                             |   |  process pool (3 workers) — see        |   |                              |
+|                             |   |  app/modules/jobs/process_pool.py:     |   |                              |
+|                             |   |  dedup cycle + minio_sweep + stitch    |   |                              |
+|                             |   |  model loads happen in pool children,  |   |                              |
+|                             |   |  never on the scheduler event loop.    |   |                              |
++-----------------------------+   +----------------------------------------+   +------------------------------+
 ```
 
-All three share PostgreSQL + MinIO. The worker process handles the heavy dedup/sweep so the API server never freezes. The face re-extraction script loads InsightFace as a separate process to avoid GPU memory contention.
+All three share PostgreSQL + MinIO. The worker process schedules jobs and offloads the heavy bodies (dedup cycle, MinIO sweep, stitch model inference) to spawn children so the scheduler event loop never freezes. The face re-extraction script loads InsightFace as a separate process to avoid GPU memory contention.
 
 ---
 ## Current State (as of last update)
@@ -481,7 +499,7 @@ All three share PostgreSQL + MinIO. The worker process handles the heavy dedup/s
 - **Body contamination gate (store-time):** Median cosine sim to existing cluster, >=3 embeddings, 0.50 threshold
 - **Face/body contamination cleanup (dedup job + danger script):** Both use iterative median-outlier removal (face 0.35, body 0.50). Aggressive-reject. Previously face used greedy single-linkage that chained contamination through bridges — FIXED (issue #18).
 - **Dedup absorb (contamination-gated):** `_absorb_face_embeddings`/`_absorb_body_embeddings` now DROP a loser embedding if its median similarity to the winner's existing cluster is below threshold (was: moved ALL with no check — issue #17). Stops false-merge contamination injection.
-- **Dedup job:** 0.40 merge threshold + face cleanup (0.35, median) + body cleanup (0.50, median). Per-merge SAVEPOINT isolation — one bad pair no longer aborts the batch (issue #19). Absorbs embeddings (contamination-gated) + re-votes gender. Runs in separate worker process. union-find `find()` recursive path compression (fixed).
+- **Dedup job:** 0.40 merge threshold + face cleanup (0.35, median) + body cleanup (0.50, median). Per-merge SAVEPOINT isolation — one bad pair no longer aborts the batch (issue #19). Absorbs embeddings (contamination-gated) + re-votes gender. Runs in the job **process pool** (spawn child, `process_pool.py`) — never on the scheduler event loop. union-find `find()` recursive path compression (fixed). **Incremental pair probing since 2026-10-08 (issue #31):** outer probe = embeddings created in `DEDUP_PROBE_WINDOW_MINUTES` (30) only; inner side full IVFFlat ANN; daily 03:30 full-DB sweep (`full=True`) as safety net. Phase timings logged per run (`Dedup job: done in Xs (...)`). MinIO orphan sweep moved OUT of the cycle (separate `minio_sweep_job`, 30 min).
 - **Recent-window matching:** Live engine, 5-min via `last_seen_at`. Face grey 0.35 + median cluster gate; body recent 0.55 median. `match_tier` drives CASE1/2 accept thr so grey face actually attaches (FIXED 2026-07-17). Outside: face 0.40 / body median 0.50 + ambiguity.
 - **SAME_CAM after reject:** No create-new (leave unassigned). Prevents staff/visitor clone factory when concurrent track blocks attach (FIXED 2026-07-17).
 - **MATCH STALE / store FK (P5 FIXED 2026-07-17):** Person may vanish between search and store (reextract delete). Exist check + `FOR SHARE` + SAVEPOINT attach; create suppressed on stale; no create-on-exception poison. `IDENTITY_ADVISORY_LOCK_KEY=1001` shared with `reextract_or_delete_faceless`.
@@ -643,7 +661,78 @@ Steps:
 
 ---
 
-## Dual-quality browser streams (2026-08-12)
+## 31. Dedup job performance rework (NEW 2026-10-08)
+
+**Symptom:** `deduplicate_persons` (6-min interval) ran 8–12+ min per cycle; journalctl showed `Execution of job "deduplicate_persons ... skipped: maximum number of running instances reached (1)` — effective cadence 12 min. Oct 7 one cycle spanned 48 min.
+
+**Measured phase breakdown (one run, 17:47:06→17:55):**
+1. **Pair discovery 5.5–6 min (~75%)** — IVFFlat index existed (`idx_person_face_embeddings_embedding`, lists=150) and was used for the INNER LATERAL, but the OUTER side was `Seq Scan on person_face_embeddings` probing ALL 20,837 embeddings per run while only ~66 new faces/hour arrive. Output pair sort spilled at `work_mem=4MB`. `shared_buffers=128MB` on a 31GB host.
+2. **MinIO sweep 1–47 min** — listed all 715k `crops/` objects (listing alone 59–72s) + one HTTP `remove_object` per orphan (466k-object backlog = 47 min); ran INSIDE the dedup DB transaction → observed `idle in transaction` 59s+ (autovacuum blocked).
+3. **Contamination cleanup** — N+1: one query per person with ≥2 faces (4,627 round-trips/run) even when removing 0.
+4. `repair_fragmented_billing_visits` ~1s (966 visits checked) — fine.
+
+**Fixes (this change):**
+- **Incremental pair probing:** outer side restricted to `created_at > now() - DEDUP_PROBE_WINDOW_MINUTES` (30 min, derived table — note `WHERE` cannot sit between `FROM` and `CROSS JOIN LATERAL`). Inner side stays unrestricted ANN → new-vs-old and new-vs-new both covered. Old-vs-old pairs were already probed when those embeddings were new. **Daily 03:30 `deduplicate_persons(full=True)`** full-DB sweep covers worker downtime, IVFFlat recall misses, and pairs unblocked when the 48h same-camera-overlap lookback expires. Probe query now <1–2s (59 probe rows vs 20,837).
+- **No-pair fall-through:** the old early `return` on zero pairs skipped contamination cleanup + billing repair — unacceptable now that empty windows are the common case. Falls through to cleanup/repair/summary.
+- **Heavy job bodies run in a spawn process pool (2026-10-08):** `app/modules/jobs/process_pool.py` — `run_in_subprocess()` dispatches the whole dedup cycle and the MinIO sweep to `ProcessPoolExecutor(max_workers=JOB_POOL_WORKERS=3, spawn context)` children. Rationale: minio-py is sync (715k-object listing ≈72s) and the numpy contamination cleanup holds the GIL — even `asyncio.to_thread` would have starved the worker's single process. The billing-visit stitch lazily loads **OSNet + InsightFace** (`_body_emb`/`_face_emb`) — now it loads in a child, not the worker. Children call `setup_logging()` (logs land in `logs/ai_processing.log`) and `_run_job_loop()` disposes the shared async engine before loop close (avoids `Event loop is closed` noise at child exit). **Spawn not fork** (forking a threaded asyncio process is unsafe). Entry points must be module-level + picklable (no lambdas — `run_in_executor` pickles the callable). **Break semantics:** one dead child poisons the whole pool (`BrokenProcessPool` fails all futures — more workers do NOT give failover); deaths come from native crashes in torch/cv2/pgvector, OOM-kills during model load, external kills, or spawn-time import failures. Policy: **rebuild + retry once** on a fresh worker (transient deaths), then **abort with RuntimeError** — the body is never re-run in a thread (a segfaulting body would take the worker with it). Job bodies must therefore be idempotent-safe to run at most twice (they are: SAVEPOINT merges, sweep only deletes unreferenced). `OSError` (pool can't spawn at all) → worker-thread fallback (body never ran in a child). **Proactive recycling:** pool rebuilt after `JOB_POOL_MAX_TASKS=20` jobs to bound child memory (stitch model loads). Timeout 30 min → pool reset, stuck child abandoned. `tests/test_process_pool.py` covers retry/abort/fallback/recycle.
+- **MinIO sweep decoupled:** own job `minio_sweep_job` every `MINIO_SWEEP_INTERVAL_MINUTES` (30), inside `retail-ai-worker.service` (no new service), body runs in the process pool. DB reference queries in a session **closed before** any MinIO I/O (kills idle-in-transaction). Batch `remove_objects()` (`MINIO_SWEEP_BATCH_SIZE=1000`) instead of per-object deletes (2,076 orphans deleted in seconds in smoke test). Listing 715k objects (~72s) remains — MinIO cannot filter by date server-side; accepted at 30-min cadence in a child process. Future option: `storage_objects` registry table (exists, unused) for an indexed DB-diff sweep.
+- **Batched contamination cleanup:** single grouped query per cleanup instead of 4.6k N+1 round-trips. Median-outlier math, thresholds (face 0.35 / body 0.50), registration-face pinning unchanged.
+- **Phase timing log:** `Dedup job: done in 30.4s (pair_query=… overlap_filter=… merges=… face_cleanup=… body_cleanup=… repair=…)`.
+- **PG memory config (ALTER SYSTEM, pending restart):** `shared_buffers=4GB`, `work_mem=64MB`, `effective_cache_size=12GB`, `maintenance_work_mem=512MB`, `max_wal_size=2GB` (was 128MB/4MB defaults on a 31GB host).
+- **Migration `0011`** `ix_person_face_embeddings_created_at` — outer probe becomes a range scan as the table grows. (API service runs `alembic upgrade head` on start.)
+- **`CameraWorker._pending_minio_deletes` capped at 20k** — the sweep runs in a separate process and can never drain the API-side class set (pre-existing unbounded growth; excess hints are still swept via the not-in-known path).
+
+**Post-change target:** cycle well under 1 min (measured 30.4s cold with 0 removals; pair query 0.1s empty / ~1–2s with pairs); true 6-min cadence; no more skipped triggers.
+
+**Still OPEN (not in this change):** false-merge guard — most merges in the Oct 8 logs had ALL loser faces rejected as contamination by the absorb gate (cluster_fit 0.11–0.34) yet the merge still completed and reassigns tracks/visits. Deferred for review.
+
+**Deploy:** restart `retail-ai-worker.service`; restart PostgreSQL for the ALTER SYSTEM memory settings. API restart (picks up migration 0011) at convenience.
+
+---
+
+## 32. Daily analytics freeze (NEW 2026-10-15)
+
+**Problem:** every analytics number was recomputed live from mutable identity state — dedup merges + faceless deletion kept rewriting past days (e.g. Oct 8's count drifted 172→169→163 across snapshots; Sep frozen rows vs live now differ by up to −77). Meanwhile `daily_analytics_summary` (the old freeze) was write-only (no reader), froze **D-2 instead of D-1** (UTC-date bug: `(utc_now() - 1 day).date()` at 00:15 IST), and had gaps (2026-10-03..06).
+
+**Design:** `daily_analytics_frozen` (migration `0012`) — one immutable row per IST day. Past days served from this table only; **today stays live**. Written at **00:10 IST** by `freeze_daily_analytics` (spawn process pool, same `_job_entry_*` + `run_in_subprocess` pattern), which also upserts `daily_analytics_summary` for legacy compat (the old 00:15 job retired; legacy function kept as a delegating shim).
+
+**Row payload** (`app/modules/analytics/day_metrics.py::compute_day_metrics` — SHARED with the live path so frozen and live can never diverge in DEFINITION): scalar counts (unique total/customers/staff, night-only, purchases, BI rows, events, tracks, avg dwell), v1 demographics cross-tab JSON, v2 6-bin age/gender cards JSON, hourly×24 JSON (persons/male/female/unidentified/purchasers/BI dwell/line-cross rows/entry/exit/events/tracks), per-camera JSON (tracks/dwell/persons/purchasers/gender), zone counts, and a per-person JSON payload (uuid, raw gender/age_group/estimated_age/staff flag, cam ids, purchase rows `[hour, camera, dwell]`, track hours, billing cams). Calibration: `adjusted_unique` + `adjustment_factor` + `factor_model_version`.
+
+**Adjustment factor** (`app/modules/analytics/adjustment.py`): env-swappable — `PERSON_ADJUST_MODEL` = `linear` (default `78.6 + 0.413×raw`, fit frozen-vs-GMR+40 on Sep 15–Oct 13) | `fixed` (×K) | `bucket` (split) | `none`. Applied to FROZEN totals only; linear guards `raw<=0 → 0`. See `.env.example`. Recompute via the accuracy-table calibration queries; bump `PERSON_ADJUST_VERSION`.
+
+**Read path** (`daily_provider.py` + `frozen_composer.py`): `get_day_metrics` returns frozen for past days, live compute for today; missing/migrating table degrades to live (warns, never 500s). Range composition unions frozen person-UUID sets → true multi-day DISTINCT (repeat visitors counted once) + exact camera filters + partial-day hour clips. Endpoint hooks route past-touching ranges through the composer: `get_dashboard_v2`, `get_analytics_metrics`, `get_dashboard_summary`, `get_demographics_table`, v1 footfall/billing/dwell/zone-occupancy, entry-exit. Verified against frontend: dashboard + analytics pages + live-feeds bottom strip all consume only these two v2 endpoints. `live-viewers` + `person-journey` stay live. `tests/test_daily_freeze.py` (11 tests). Known approximation: v1 footfall camera-filtered `unique_visitors` uses filtered hour rows (single-cam exact; multi-cam tight bound) — v1 endpoints have zero frontend consumers.
+
+**Backfill:** `danger/backfill_daily_frozen.py` (dry-run default, `--apply` writes, `--force` replaces). Per day: recompute full metrics, prefer `unique_total` from `daily_analytics_summary` when present (`source=backfill_snapshot`), else live (`backfill_live`); repairs `daily_analytics_summary` gaps with the same recompute. Apply order after deploy: dry-run → review → `--apply` → spot-check.
+
+**Deploy:** migration auto-applies on API start (`alembic upgrade head` in ExecStartPre). Restart `retail-ai.service` (API read path + migration) AND `retail-ai-worker.service` (00:10 freeze job). Then run the backfill with `--apply`.
+
+---
+
+## 33. Staff cleanup + frozen backfill executed (2026-10-15)
+
+**Staff rule (user decision):** keep auto-classified staff with **>10 distinct lifetime IST days** of tracks; registered staff (`metadata_json.staff_registered`) always kept. Executed via `danger/demote_stale_staff.py` (dry-run first, then `--apply`): **238 → 102 staff** (136 demoted, all `days<=10`; 36 registered + 31 active kept). A further 39 auto-staff with >10 days but not seen in the last 5 days (Oct 11–15) were listed as `[REVIEW-stale]` and NOT demoted (possible monthly/seasonal staff — demote with `--apply --include-stale` after eyeballing). Demotion is history-preserving (`is_staff=false`; tracks/events/billing stay attached) so people re-count as customers in subsequent freezes.
+
+**Backfill executed:** `danger/backfill_daily_frozen.py --start 2026-07-10 --apply` — 97/97 days inserted, 0 errors: 89 `backfill_snapshot` (true day-close totals from `daily_analytics_summary`), 8 `backfill_live` (no summary row). Also repaired `daily_analytics_summary` gaps (now 98 rows, Jul 9–Oct 14, incl. missing 2026-10-03..06). Spot checks: Oct 8 → 286 total / 217 customers / 89 purchases; Oct 13 → 237 / 195 / 91; Oct 14 → 253 / 220 / 99. API verified serving frozen rows for past days (footfall union 393 clean across Oct 12–13) and live for today. Person-adjustment on frozen totals: `adjusted = 78.6 + 0.413×raw` (`PERSON_ADJUST_*`, version `2026-10-c1`).
+
+---
+
+**Dual-quality browser streams (2026-08-12)** is documented after the numbered items.
+
+---
+
+## 34. Customer-scale bucket adjustment in dashboard UI (2026-10-16)
+
+**Decision (user):** store comparison is **fitted customers vs GMR Actual only**; total-vs-total (+40/+60 staff) is internal. Ground truth committed at `danger/store_counts.csv` (Aug–Oct, incl. Shopware sponsorship data; `na` UI for Oct 12–14 kept as NULL).
+
+**Model `2026-10-c2`:** bucketed multiplier on estimated day-close customers (`unique_total − unique_staff`): `<210 → ×0.685`, `≥210 → ×0.587` (env: `PERSON_ADJUST_CUST_BUCKETS`). Total-scale buckets for the internal report: `<250 → ×0.741`, `≥250 → ×0.661`. Fit on 40 clean Sep–Oct days (Oct 3–6 server outage excluded; August excluded — its backfill_live totals are eroded, no snapshots). Achieved vs GMR: **daily 86.3%, net 99.2%**. Contrast: flat 0.653 gives 84.1%/97.5%; no factor gives 39.3%/43.1%.
+
+**Wiring:** frozen rows carry `adjusted_customers` + `customer_factor` (migration `0013`, model + day_metrics + provider). `frozen_dashboard_v2` / `frozen_metrics` footfall cards read the **stored** per-day value (sums across ranges); slots/charts keep raw shape. Today stays live/raw. UI sees adjusted counts; raw frozen columns stay immutable for audit.
+
+**Bugfix 2026-10-16:** `customer_factor` was keyed on `unique_total` while the approved fit buckets on the *customer estimate* (`unique_total − unique_staff`) — ~35 staff shifted 18/40 days into the wrong bucket and dropped net accuracy to 92.7%. Fixed in `adjustment.py` (`customer_factor(est)`), `day_metrics.py`, and `refit_person_adjust.py`, with a regression test (`test_adjust_customers_keys_on_est_not_total`). Refit re-run on all 98 rows. Stored rows now match the approved numbers exactly: Sep 86.5%/96.2%, Oct 85.5%/87.6%, ALL **86.3%/99.2%**.
+
+**Refit protocol:** `danger/refit_person_adjust.py --report` prints customers-vs-GMR + total-vs-GMR40 accuracy for the env model; `--apply` rewrites ONLY the four factor columns (+version) on all frozen rows. Refits must exclude outage/no-snapshot days from the fit (flag via the CSV / outage list), and out-of-observed-range buckets (singletons <170 / ≥270) are clamped to neighbor k until 5+ days of evidence exist.
+
+**Deploy:** restart `retail-ai.service` (migration 0013 auto-applies + read path), `retail-ai-worker.service` (freeze job writes new fields).
 
 Dashboard multi-cam grids were pulling full native-resolution burn-in feeds and saturating bandwidth.
 

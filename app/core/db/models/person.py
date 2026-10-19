@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, func
+from sqlalchemy import Boolean, String, Integer, Float, ForeignKey, DateTime, Index, func, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
@@ -47,6 +47,11 @@ class PersonIdentity(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 class PersonFaceEmbedding(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "person_face_embeddings"
+    __table_args__ = (
+        # Dedup pair discovery (incremental, 2026-10-08) probes only embeddings
+        # created within DEDUP_PROBE_WINDOW_MINUTES as the outer side.
+        Index("ix_person_face_embeddings_created_at", "created_at"),
+    )
 
     person_identity_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("person_identities.id", ondelete="CASCADE"),
@@ -60,6 +65,11 @@ class PersonFaceEmbedding(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     face_crop_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     captured_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Staff registration photo (POST /api/staff/register). Pinned: never pruned by the
+    # per-person face cap and never removed by contamination cleanup / dedup absorb.
+    is_registration: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
     )
 
     person_identity: Mapped["PersonIdentity"] = relationship(

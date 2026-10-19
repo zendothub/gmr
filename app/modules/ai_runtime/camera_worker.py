@@ -29,7 +29,9 @@ from app.modules.reid.osnet_extractor import get_shared_extractor
 from app.modules.reid.insightface_analyzer import get_shared_analyzer
 from app.modules.reid.siglip2_analyzer import get_shared_siglip2
 from app.modules.reid.identity_decision_engine import IdentityDecisionEngine
-from app.modules.reid.staff_classifier import schedule_staff_check
+# Auto staff classification (consec-5 / 11-of-15 days) DISABLED — staff are now
+# registered explicitly via POST /api/staff/register (app/modules/staff/router.py).
+# from app.modules.reid.staff_classifier import schedule_staff_check
 from app.modules.rule_engine.rule_evaluator import RuleEvaluator, RuleEvent
 from app.modules.rule_engine.zone_event_detector import ZoneEventDetector, ZoneEvent
 from app.utils.image_utils import extract_crop, save_image, save_image_async, resize_pad_square
@@ -901,7 +903,8 @@ class CameraWorker:
                     close_resolved = True
                     if is_new:
                         self.temporary_person_ids.add(person_id)
-                    schedule_staff_check(person_id)
+                    # Auto staff classification disabled — see staff registration API.
+                    # schedule_staff_check(person_id)
 
                     # Store ALL accumulated good faces (skip the best, already stored by decide_identity)
                     person_id_uuid = person_id if isinstance(person_id, uuid.UUID) else uuid.UUID(person_id)
@@ -1060,15 +1063,25 @@ class CameraWorker:
 
     @staticmethod
     def _minio_cleanup(full_path: str) -> None:
-        """Queue a MinIO object for *deferred* deletion by the next dedup-job sweep.
+        """Queue a MinIO object for *deferred* deletion by the periodic sweep.
 
         The object key is extracted from the full bucket/key path and added to the
         class-level ``_pending_minio_deletes`` set.  Actual deletion happens in
-        ``deduplicate_persons()`` (every 10 min) after verifying no DB row still
-        references this path.
+        ``minio_sweep_job()`` (every MINIO_SWEEP_INTERVAL_MINUTES, worker process)
+        after verifying no DB row still references this path — the sweep deletes
+        unreferenced crops even if their hint is gone, so the set is advisory.
+
+        The set is capped: the sweep runs in a SEPARATE process and cannot drain
+        this API-side set, so without a cap it would grow unboundedly.
         """
         if full_path:
-            CameraWorker._pending_minio_deletes.add(full_path)
+            pending = CameraWorker._pending_minio_deletes
+            if len(pending) >= 20000:
+                # Drop an arbitrary batch; those objects are still swept via the
+                # DB cross-reference (not-in-known) path.
+                for _ in range(5000):
+                    pending.pop()
+            pending.add(full_path)
 
     async def _run_reid(self, db, frame, track: ActiveTrack):
         """Run ReID pipeline: crop -> quality -> embedding -> accumulation -> decision."""
@@ -1649,8 +1662,9 @@ class CameraWorker:
                 track.reid_confident = is_confident
                 track.reid_resolved = True
                 track.reid_attempted = True
-                if person_id is not None:
-                    schedule_staff_check(person_id)
+                # Auto staff classification disabled — see staff registration API.
+                # if person_id is not None:
+                #     schedule_staff_check(person_id)
 
                 # Store ALL accumulated good faces (different angles) once identity is resolved.
                 # decide_identity already stored the best face, so skip the one that matches it

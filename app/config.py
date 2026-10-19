@@ -152,6 +152,33 @@ class Settings(BaseSettings):
     DEDUP_SAME_CAMERA_OVERLAP_LOOKBACK_HOURS: float = 48.0  # 0 = all history (legacy)
     DEDUP_SAME_CAMERA_OVERLAP_MIN_SECONDS: float = 10.0     # ignore brief split glitches
 
+    # ── Dedup pair-discovery incremental probe (2026-10-08) ────────────
+    # The pair query only probes embeddings created within this window as
+    # the OUTER side (inner side stays full-index ANN). ~66 new faces/hour
+    # vs 20k+ total: probing all rows every 6-min run took 5.5-6 min.
+    # Old-vs-old pairs were already probed when they were new; a daily full
+    # sweep (DEDUP_FULL_SWEEP_HOUR) covers downtime / recall / overlap expiry.
+    DEDUP_PROBE_WINDOW_MINUTES: int = 30
+    DEDUP_FULL_SWEEP_HOUR_IST: int = 3        # daily whole-DB pair scan (03:30)
+    DEDUP_PAIR_QUERY_WORK_MEM: str = "64MB"   # SET LOCAL for the pair sort
+
+    # ── MinIO orphan-crop sweep (2026-10-08, decoupled from dedup) ────
+    # Sweep lists the crops/ bucket and deletes unreferenced objects. It ran
+    # inside the dedup cycle (held a DB txn open through the listing — idle-in-
+    # transaction 59s+; 466k-object backlogs ran 47 min). Now its own job.
+    MINIO_SWEEP_INTERVAL_MINUTES: int = 30
+    MINIO_SWEEP_BATCH_SIZE: int = 1000        # remove_objects() batch limit
+
+    # ── Job process pool (2026-10-08) ──────────────────────────────────
+    # Heavy job bodies (dedup cycle, MinIO sweep) run in spawn children —
+    # see app/modules/jobs/process_pool.py. WORKERS > job count so an
+    # overlapping dedup+sweep never queues behind the other. MAX_TASKS:
+    # proactive pool recycle (spawn fresh children) to bound child memory
+    # growth (stitch loads OSNet/InsightFace). A broken pool (one dead child
+    # poisons all — segfault/OOM/kill) is rebuilt and the job retried once.
+    JOB_POOL_WORKERS: int = 3
+    JOB_POOL_MAX_TASKS: int = 20
+
     # ------------------------------------------------------------------
     # Staff detection — live lazy check after decide_identity (API process).
     # Face + (consec ≥5 calendar days OR ≥11 days in any 15-day window).
@@ -214,6 +241,25 @@ class Settings(BaseSettings):
     # YOLO-Pose for enhanced ReID quality assessment
     YOLO_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
     YOLO_POSE_CONFIDENCE: float = 0.3  # Keypoint confidence threshold
+
+    # ── Frozen analytics person-count adjustment (2026-10-15) ──────────
+    # Applied ONLY to frozen past-day analytics (today stays raw/live).
+    # Display scale = CUSTOMERS vs GMR Actual. Swap PERSON_ADJUST_MODEL to
+    # compare scenarios without code changes:
+    #   bucket  threshold list PERSON_ADJUST_BUCKETS (default fit below)
+    #   linear  adjusted = A + B * raw
+    #   fixed   adjusted = raw * K
+    #   none    adjusted = raw
+    # c2 fit (40 clean days Sep–Oct, Oct 3–6 outage excluded):
+    # customers (total<210 → ×0.685, ≥210 → ×0.587; daily 86.3%, net 99.2%).
+    # total-scale buckets (internal GMR+40 report): <250 → ×0.741, ≥250 → ×0.661.
+    PERSON_ADJUST_MODEL: str = "bucket"
+    PERSON_ADJUST_BUCKETS: str = "250:0.741,999999:0.661"
+    PERSON_ADJUST_CUST_BUCKETS: str = "210:0.685,999999:0.587"
+    PERSON_ADJUST_A: float = 78.6
+    PERSON_ADJUST_B: float = 0.413
+    PERSON_ADJUST_K: float = 0.734
+    PERSON_ADJUST_VERSION: str = "2026-10-c2"
 
     # Runtime
     DEFAULT_FPS_TARGET: int = 10
@@ -331,6 +377,19 @@ class Settings(BaseSettings):
         "http://retaileye.bluecloudsoftech.com,"
         "https://retaileye.bluecloudsoftech.com"
     )
+
+    # Anti-spoofing (liveness check on face crops) — not yet wired into any
+    # module; staged here so .env can carry these ahead of that work.
+    ANTISPOOF_ENABLED: bool = True
+    ANTISPOOF_THRESHOLD: float = 0.70
+    ANTISPOOF_AUDIT_ONLY: bool = False
+    ANTISPOOF_REQUIRE_FRAME_COUNT: int = 3
+
+    # Attendance mode — not yet wired into any module; staged here so .env
+    # can carry these ahead of that work.
+    ATTENDANCE_MODE: bool = True
+    ATTENDANCE_FACE_MIN_SCORE: float = 0.50
+    ATTENDANCE_MATCH_COOLDOWN_SECONDS: float = 30.0
 
     @property
     def yolo_allowed_classes_list(self) -> List[int]:

@@ -17,7 +17,7 @@ from app.core.db.models.tracking import TrackSession, TrackObservation
 from app.core.db.models.person import PersonIdentity, PersonEmbedding
 from app.core.db.models.event import Event, EventSeverity
 from app.core.db.models.billing import BillingInteraction
-from app.core.db.models.analytics import DailyAnalyticsSummary
+from app.core.db.models.analytics import DailyAnalyticsSummary, DailyAnalyticsFrozen
 from app.core.db.models.feature_request import FeatureRequest, FeatureStatus
 from app.core.db.models.storage import StorageObject, StorageType
 from app.core.db.models.store import Store, StoreStatus
@@ -48,6 +48,7 @@ __all__ = [
     "EventSeverity",
     "BillingInteraction",
     "DailyAnalyticsSummary",
+    "DailyAnalyticsFrozen",
     "StorageObject",
     "StorageType",
     "FeatureRequest",

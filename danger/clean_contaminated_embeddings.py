@@ -43,7 +43,9 @@ def _parse_embedding(raw):
     return np.array(raw, dtype=np.float32)
 
 
-def _iterative_median_removals(embs: list[np.ndarray], threshold: float, min_cluster: int) -> list[int]:
+def _iterative_median_removals(
+    embs: list[np.ndarray], threshold: float, min_cluster: int, pinned: set[int] | None = None
+) -> list[int]:
     """Return indices of embeddings to remove, using iterative median outlier removal.
 
     Repeatedly removes the embedding with the lowest median similarity to the
@@ -51,6 +53,7 @@ def _iterative_median_removals(embs: list[np.ndarray], threshold: float, min_clu
     cluster drops below `min_cluster` size.
 
     `embs` MUST already be L2-normalized for the dot product to equal cosine sim.
+    Indices in `pinned` (staff registration faces) vote in medians but are never removed.
     """
     N = len(embs)
     remove_idx = set()
@@ -59,12 +62,16 @@ def _iterative_median_removals(embs: list[np.ndarray], threshold: float, min_clu
     while len(active) >= min_cluster:
         medians = []
         for i in active:
+            if pinned and i in pinned:
+                continue
             sims = []
             for j in active:
                 if i != j:
                     sims.append(float(np.dot(embs[i], embs[j])))
             medians.append((i, float(np.median(sims)) if sims else 0.0))
 
+        if not medians:
+            break
         worst_idx, worst_median = min(medians, key=lambda x: x[1])
 
         if worst_median >= threshold:
@@ -97,7 +104,7 @@ async def clean_faces(apply_fix: bool) -> int:
         persons_touched = 0
         for pid in person_ids:
             r2 = await db.execute(text("""
-                SELECT id::text, embedding, face_score FROM person_face_embeddings
+                SELECT id::text, embedding, face_score, is_registration FROM person_face_embeddings
                 WHERE person_identity_id = :pid AND embedding IS NOT NULL
                 ORDER BY face_score DESC
             """), {"pid": str(pid)})
@@ -114,7 +121,8 @@ async def clean_faces(apply_fix: bool) -> int:
                 if _n > 0:
                     emb /= _n
 
-            remove_idx = _iterative_median_removals(embs, threshold, min_cluster=2)
+            pinned = {i for i, r in enumerate(rows) if r[3]}
+            remove_idx = _iterative_median_removals(embs, threshold, min_cluster=2, pinned=pinned)
 
             if not remove_idx:
                 continue
