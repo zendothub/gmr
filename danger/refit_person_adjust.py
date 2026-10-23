@@ -58,13 +58,15 @@ def load_truth() -> dict[str, dict]:
     return out
 
 
-async def run(*, apply: bool, start: str | None, report: bool) -> int:
+async def run(*, apply: bool, start: str | None, report: bool, end: str | None = None) -> int:
     settings = get_settings()
     logger.info(f"refit: model={settings.PERSON_ADJUST_MODEL} version={model_version()} apply={apply}")
     async with AsyncSessionLocal() as db:
         q = select(DailyAnalyticsFrozen).order_by(DailyAnalyticsFrozen.day)
         if start:
             q = q.where(DailyAnalyticsFrozen.day >= date.fromisoformat(start))
+        if end:
+            q = q.where(DailyAnalyticsFrozen.day <= date.fromisoformat(end))
         rows = (await db.execute(q)).scalars().all()
         logger.info(f"refit: {len(rows)} frozen rows in scope")
 
@@ -127,8 +129,9 @@ def main() -> None:
     ap.add_argument("--report", action="store_true", help="accuracy vs store truth, then exit unless --apply")
     ap.add_argument("--dry-run", action="store_true", help="alias of default no-write mode")
     ap.add_argument("--start", default=None, help="only days >= this IST date")
+    ap.add_argument("--end", default=None, help="only days <= this IST date (inclusive)")
     args = ap.parse_args()
-    raise SystemExit(asyncio.run(run(apply=args.apply, start=args.start, report=args.report)))
+    raise SystemExit(asyncio.run(run(apply=args.apply, start=args.start, report=args.report, end=args.end)))
 
 
 if __name__ == "__main__":
